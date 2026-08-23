@@ -113,6 +113,26 @@ export const evaluationVersions = pgTable(
   ]
 );
 
+export const evaluationJobs = pgTable(
+  "evaluation_jobs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sessionId: uuid("session_id")
+      .references(() => interviewSessions.id, { onDelete: "cascade" })
+      .notNull(),
+    status: text("status").notNull().default("processing"),
+    error: text("error"),
+    resultId: uuid("result_id").references(() => evaluationVersions.id, { onDelete: "set null" }),
+    model: text("model"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("evaluation_jobs_session_idx").on(table.sessionId),
+    index("evaluation_jobs_status_idx").on(table.status),
+  ]
+);
+
 export const campaigns = pgTable("campaigns", {
   id: uuid("id").primaryKey().defaultRandom(),
   name: text("name").notNull(),

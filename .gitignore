@@ -29,6 +29,4 @@ kokoro-service/models/
 # Misc
 .DS_Store
 *.pem
-openspec/config.yaml
-openspec/changes/github-cleanup/proposal.md
-openspec/changes/github-cleanup/tasks.md
+openspec*

@@ -1,8 +1,8 @@
 import { Router } from "express";
 import { db } from "@/lib/db";
-import { interviewSessions, candidates, positions, messages, evaluationVersions } from "@/lib/schema";
+import { interviewSessions, candidates, positions, messages, evaluationVersions, evaluationJobs } from "@/lib/schema";
 import { eq, desc, sql } from "drizzle-orm";
-import { generateEvaluation } from "@/lib/evaluation";
+import { generateEvaluation, runEvaluationInBackground } from "@/lib/evaluation";
 import { OllamaError } from "@/lib/errors";
 
 const router = Router();
@@ -204,25 +204,70 @@ router.post("/:id/evaluate", async (req, res) => {
   try {
     const { id } = req.params;
     const { model } = req.body as { model?: string };
-    const evaluation = await generateEvaluation(id, model);
-    res.json(evaluation);
+
+    // Validate session exists and is completed before creating job
+    const sessionRows = await db
+      .select()
+      .from(interviewSessions)
+      .where(eq(interviewSessions.id, id));
+
+    if (sessionRows.length === 0) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+
+    const session = sessionRows[0];
+    if (session.status !== "completed") {
+      res.status(400).json({ error: "Interview must be completed before evaluation" });
+      return;
+    }
+
+    const messageRows = await db
+      .select()
+      .from(messages)
+      .where(eq(messages.sessionId, id));
+
+    if (messageRows.length === 0) {
+      res.status(400).json({ error: "No interview transcript found" });
+      return;
+    }
+
+    // Check for existing in-progress evaluation job
+    const existingJobs = await db
+      .select()
+      .from(evaluationJobs)
+      .where(eq(evaluationJobs.sessionId, id));
+
+    const processingJob = existingJobs.find((j) => j.status === "processing");
+    if (processingJob) {
+      res.status(202).json({
+        jobId: processingJob.id,
+        status: processingJob.status,
+      });
+      return;
+    }
+
+    // Create evaluation job
+    const [job] = await db
+      .insert(evaluationJobs)
+      .values({
+        sessionId: id,
+        status: "processing",
+        model: model || process.env.OLLAMA_MODEL || "llama3.1",
+      })
+      .returning();
+
+    // Fire-and-forget background evaluation
+    runEvaluationInBackground(job.id, id, model).catch((err) => {
+      console.error("[POST /api/sessions/:id/evaluate] Background evaluation error:", err);
+    });
+
+    res.status(202).json({
+      jobId: job.id,
+      status: job.status,
+    });
   } catch (err) {
     console.error("POST /api/sessions/:id/evaluate error:", err);
-
-    if (err instanceof Error) {
-      if (err.message === "Interview is not completed") {
-        res.status(400).json({ error: "Interview must be completed before evaluation" });
-        return;
-      }
-      if (err.message === "Session not found") {
-        res.status(404).json({ error: "Session not found" });
-        return;
-      }
-      if (err.message === "No messages found for session") {
-        res.status(400).json({ error: "No interview transcript found" });
-        return;
-      }
-    }
 
     if (err instanceof OllamaError) {
       res.status(err.statusCode || 503).json({ error: `Ollama error: ${err.message}` });

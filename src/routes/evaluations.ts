@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { db } from "@/lib/db";
-import { evaluationVersions } from "@/lib/schema";
+import { evaluationVersions, evaluationJobs } from "@/lib/schema";
 import { eq, desc } from "drizzle-orm";
 
 const router = Router({ mergeParams: true });
@@ -270,6 +270,73 @@ router.delete("/versions/:versionId", async (req, res) => {
   } catch (err) {
     console.error("DELETE /api/evaluations/versions/:versionId error:", err);
     res.status(500).json({ error: "Failed to delete evaluation version" });
+  }
+});
+
+/**
+ * GET /api/evaluations/jobs/:jobId
+ * Returns the status of an async evaluation job.
+ */
+router.get("/jobs/:jobId", async (req, res) => {
+  try {
+    const { jobId } = req.params;
+
+    const jobRows = await db
+      .select()
+      .from(evaluationJobs)
+      .where(eq(evaluationJobs.id, jobId));
+
+    if (jobRows.length === 0) {
+      res.status(404).json({ error: "Job not found" });
+      return;
+    }
+
+    const job = jobRows[0];
+
+    const response: Record<string, unknown> = {
+      id: job.id,
+      sessionId: job.sessionId,
+      status: job.status,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+    };
+
+    if (job.status === "completed") {
+      response.resultId = job.resultId;
+
+      // If resultId exists, fetch the evaluation result
+      if (job.resultId) {
+        const resultRows = await db
+          .select()
+          .from(evaluationVersions)
+          .where(eq(evaluationVersions.id, job.resultId));
+
+        if (resultRows.length > 0) {
+          const v = resultRows[0];
+          response.result = {
+            id: v.id,
+            aiScores: {
+              technicalDepth: v.aiTechnicalDepth,
+              communicationClarity: v.aiCommunicationClarity,
+              problemSolving: v.aiProblemSolving,
+              relevanceToRole: v.aiRelevanceToRole,
+            },
+            aiRecommendation: v.aiRecommendation,
+            confidence: v.aiConfidence,
+            strengths: v.strengths,
+            weaknesses: v.weaknesses,
+            createdAt: v.createdAt,
+          };
+        }
+      }
+    } else if (job.status === "failed") {
+      response.error = job.error;
+    }
+
+    res.json(response);
+  } catch (err) {
+    console.error("GET /api/evaluations/jobs/:jobId error:", err);
+    res.status(500).json({ error: "Failed to fetch evaluation job" });
   }
 });
 

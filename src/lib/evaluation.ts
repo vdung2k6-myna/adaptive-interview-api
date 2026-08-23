@@ -1,5 +1,5 @@
 import { db } from "./db";
-import { interviewSessions, candidates, positions, messages, evaluationVersions } from "./schema";
+import { interviewSessions, candidates, positions, messages, evaluationVersions, evaluationJobs } from "./schema";
 import { eq } from "drizzle-orm";
 import { generateChatResponse } from "./ollama";
 import { OllamaError } from "./errors";
@@ -227,5 +227,40 @@ function parseEvaluationJson(raw: string): EvaluationResult | null {
     };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Run evaluation generation in the background and update the job record.
+ * This function is fire-and-forget: callers should NOT await it.
+ */
+export async function runEvaluationInBackground(
+  jobId: string,
+  sessionId: string,
+  model?: string
+): Promise<void> {
+  try {
+    const result = await generateEvaluation(sessionId, model);
+
+    await db
+      .update(evaluationJobs)
+      .set({
+        status: "completed",
+        resultId: result.id,
+        updatedAt: new Date(),
+      })
+      .where(eq(evaluationJobs.id, jobId));
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[runEvaluationInBackground] Job ${jobId} failed:`, errorMessage);
+
+    await db
+      .update(evaluationJobs)
+      .set({
+        status: "failed",
+        error: errorMessage,
+        updatedAt: new Date(),
+      })
+      .where(eq(evaluationJobs.id, jobId));
   }
 }
