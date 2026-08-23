@@ -1,0 +1,40 @@
+import type { AppConfig } from "./index";
+
+export const productionConfig: AppConfig = {
+  env: "production",
+  database: {
+    poolSize: 20, // Higher concurrency in production
+  },
+  ollama: {
+    baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
+    chatModel: process.env.OLLAMA_MODEL || "llama3.1",
+    embedModel: process.env.OLLAMA_EMBED_MODEL || "mxbai-embed-large",
+    chatTimeoutMs: 120_000, // 120s — remote/cloud models may need more time
+    embedTimeoutMs: 30_000, // 30s
+    retries: 2,
+  },
+  evaluation: {
+    temperature: 0.3,
+    maxAttempts: 3,
+  },
+  features: {
+    enableStreaming: true,
+    enableEvaluations: true,
+    enableEmbeddings: true,
+  },
+  mcp: {
+    enabled: process.env.MCP_ENABLED === "true",
+    authToken: process.env.MCP_AUTH_TOKEN || "",
+  },
+  auth: {
+    apiToken: process.env.API_AUTH_TOKEN || "",
+  },
+  audio: {
+    sttUrl: process.env.AUDIOCPP_BASE_URL || "http://localhost:8080",
+    gatewayUrl: process.env.AUDIO_GATEWAY_URL || "http://localhost:8082",
+    sttModel: process.env.AUDIOCPP_STT_MODEL || "stt",
+    defaultEngine: (process.env.DEFAULT_TTS_ENGINE as "kokoro" | "piper") || "kokoro",
+    defaultVoice: process.env.DEFAULT_VOICE || "default_name",
+    timeoutMs: 60_000,
+  },
+};

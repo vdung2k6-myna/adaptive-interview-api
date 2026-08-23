@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.local
+
+# Logs
+npm-debug.log*
+*.log
+backend.log
+
+# Audio models (large binary files)
+pipervoices/
+kokoro-service/models/
+
+# Python virtual environments and caches
+**/.venv/
+**/__pycache__/
+**/*.pyc
+
+# Claude Code local settings
+.claude/
+
+# Misc
+.DS_Store
+*.pem
+openspec/config.yaml
+openspec/changes/github-cleanup/proposal.md
+openspec/changes/github-cleanup/tasks.md

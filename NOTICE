@@ -1,0 +1,35 @@
+# NOTICE — Voice Model Licensing
+
+This repository contains application code and does **not** redistribute
+text-to-speech voice model files. Users must obtain and place their own
+model files in the directories indicated below.
+
+## Code License
+
+The application code (TypeScript / Python service wrappers) in this
+repository is licensed under the **MIT License** (see `LICENSE`).
+
+## Bundled / Auto-downloaded Model
+
+### Kokoro Vietnamese
+- **Files:** `kokoro_vi.onnx`, `kokoro_vi.pth`, `kokoro_vi_voicepack.pt`
+- **Source:** https://huggingface.co/contextboxai/Kokoro-Vietnamese
+- **License:** Apache-2.0
+- **Usage:** The `download_models.py` script fetches these files at
+  install time. Redistribution of the model files themselves is governed
+  by the Apache-2.0 license.
+
+## User-provided Piper Voice Models
+
+The Piper TTS service loads ONNX voice models from a user-supplied
+directory (`PIPER_MODELS_DIR`). Each voice model has its own independent
+license. The repository **does not** ship or endorse any particular model.
+
+Users are solely responsible for:
+1. Obtaining voice model files legally.
+2. Complying with the license terms of each voice model they use.
+3. Ensuring their use case (commercial or non-commercial) is permitted
+   by the relevant model license.
+
+The authors of this repository assume no liability for voice model
+licensing violations by end users.

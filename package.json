@@ -1,0 +1,39 @@
+{
+  "name": "adaptive-interview-api",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "tsx src/index.ts",
+    "lint": "eslint src/",
+    "db:migrate": "drizzle-kit migrate",
+    "db:generate": "drizzle-kit generate",
+    "start:audio": "node scripts/start-audio.js",
+    "stop:audio": "node scripts/stop-audio.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
+    "express": "^4.21.0",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.22.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/multer": "^1.4.12",
+    "@types/node": "^20",
+    "@types/pg": "^8.21.0",
+    "drizzle-kit": "^0.31.10",
+    "eslint": "^9.0.0",
+    "globals": "^15.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5",
+    "typescript-eslint": "^8.0.0"
+  }
+}
