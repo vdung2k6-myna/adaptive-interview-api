@@ -7,7 +7,7 @@ A lightweight HTTP gateway that exposes a single TTS endpoint and routes to eith
 Instead of Next.js talking directly to multiple TTS services, it talks to **one** gateway. The gateway handles routing, health checks, and pass-through proxying.
 
 ```
-Next.js App (:3000)
+Express Backend (:4000)
     │ POST /v1/audio/speech { text, engine, voice }
     ▼
 Audio Gateway (:8082)
