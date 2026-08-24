@@ -1,7 +1,7 @@
 import { db } from "./db";
 import { interviewSessions, candidates, positions, messages, evaluationVersions, evaluationJobs } from "./schema";
 import { eq } from "drizzle-orm";
-import { generateChatResponse } from "./ollama";
+import { generateChatResponse, OllamaMessage } from "./ollama";
 import { OllamaError } from "./errors";
 import config from "./config";
 
@@ -58,15 +58,7 @@ export async function generateEvaluation(sessionId: string, model?: string) {
     throw new Error("No messages found for session");
   }
 
-  // Build transcript
-  const transcript = messageRows
-    .map((m) => {
-      const role = m.role === "interviewer" ? "Interviewer" : "Candidate";
-      return `${role}: ${m.content}`;
-    })
-    .join("\n\n");
-
-  const prompt = buildEvaluationPrompt(
+  const promptMessages = buildEvaluationMessages(
     position.title,
     position.level,
     position.jobDescription,
@@ -74,7 +66,10 @@ export async function generateEvaluation(sessionId: string, model?: string) {
     candidate.name,
     candidate.skills,
     candidate.experienceYears,
-    transcript
+    messageRows.map((m) => ({
+      role: m.role as "interviewer" | "candidate",
+      content: m.content,
+    }))
   );
 
   // Call Ollama with retry
@@ -85,12 +80,14 @@ export async function generateEvaluation(sessionId: string, model?: string) {
 
   while (attempts < maxAttempts) {
     try {
-      const useStrictPrompt = attempts > 0;
-      const finalPrompt = useStrictPrompt
-        ? prompt + "\n\nCRITICAL: Respond ONLY with valid JSON. No markdown formatting, no extra text."
-        : prompt;
+      const finalMessages = attempts > 0
+        ? [
+            ...promptMessages,
+            { role: "user", content: "CRITICAL: Respond ONLY with valid JSON. No markdown formatting, no extra text." } as OllamaMessage,
+          ]
+        : promptMessages;
 
-      rawResponse = await generateChatResponse({ messages: [{ role: "user", content: finalPrompt }], temperature: config.evaluation.temperature, model: targetModel });
+      rawResponse = await generateChatResponse({ messages: finalMessages, temperature: config.evaluation.temperature, model: targetModel });
       parsedResult = parseEvaluationJson(rawResponse);
       if (parsedResult) break;
     } catch (err) {
@@ -137,7 +134,7 @@ export async function generateEvaluation(sessionId: string, model?: string) {
   return evalRow;
 }
 
-function buildEvaluationPrompt(
+function buildEvaluationMessages(
   title: string,
   level: string,
   jobDescription: string | null,
@@ -145,24 +142,15 @@ function buildEvaluationPrompt(
   candidateName: string,
   skills: string[],
   experienceYears: number | null,
-  transcript: string
-): string {
+  transcriptMessages: { role: "interviewer" | "candidate"; content: string }[]
+): OllamaMessage[] {
   const jobDescSection = jobDescription
     ? `\nJob Description:\n${jobDescription.substring(0, 1200)}`
     : "";
 
-  return `You are an experienced technical hiring manager reviewing an interview transcript.
+  const systemPrompt = `You are an experienced technical hiring manager reviewing an interview transcript.
 
-Position: ${title} (${level})${jobDescSection}
-Requirements: ${requirements.join(", ")}
-Candidate: ${candidateName}
-Skills: ${skills.join(", ")}
-Experience: ${experienceYears ?? "N/A"} years
-
-Interview transcript:
-${transcript}
-
-Evaluate the candidate on these dimensions (1-5 scale, where 1 = poor, 5 = excellent):
+Evaluate the candidate on these dimensions (1-5 integer scale, where 1 = poor, 5 = excellent):
 - technical_depth: depth of technical knowledge demonstrated
 - communication_clarity: how clearly they explained their reasoning
 - problem_solving: ability to think through problems systematically
@@ -185,6 +173,26 @@ Respond ONLY with valid JSON in this exact format:
   "recommendation": "yes",
   "confidence": 78
 }`;
+
+  const contextPrompt = `Position: ${title} (${level})${jobDescSection}
+Requirements: ${requirements.join(", ")}
+Candidate: ${candidateName}
+Skills: ${skills.join(", ")}
+Experience: ${experienceYears ?? "N/A"} years
+
+Interview transcript:`;
+
+  const turnMessages: OllamaMessage[] = transcriptMessages.map((m) => ({
+    role: m.role === "interviewer" ? "assistant" : "user",
+    content: m.content,
+  }));
+
+  return [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: contextPrompt },
+    ...turnMessages,
+    { role: "user", content: "Evaluate the candidate based on the interview above." },
+  ];
 }
 
 function parseEvaluationJson(raw: string): EvaluationResult | null {

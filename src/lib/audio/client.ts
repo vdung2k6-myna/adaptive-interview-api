@@ -19,6 +19,7 @@ export interface SynthesizeOptions {
   engine?: "kokoro" | "piper";
   voice?: string;
   model?: string;
+  signal?: AbortSignal;
 }
 
 /**
@@ -142,7 +143,7 @@ export class AudioGatewayClient {
   /**
    * Text-to-speech: synthesize audio from text via the gateway.
    * @param text The text to synthesize.
-   * @param options Optional engine and voice overrides.
+   * @param options Optional engine, voice, voice overrides, and abort signal.
    * @returns Audio buffer (WAV format).
    */
   async synthesize(text: string, options?: SynthesizeOptions): Promise<Buffer> {
@@ -159,15 +160,22 @@ export class AudioGatewayClient {
     }
     const body = JSON.stringify(payload);
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timeoutController = new AbortController();
+    const timeout = setTimeout(() => timeoutController.abort(), this.timeoutMs);
+
+    // Combine the per-request timeout with the caller-provided disconnect signal.
+    const signals: AbortSignal[] = [timeoutController.signal];
+    if (options?.signal) {
+      signals.push(options.signal);
+    }
+    const signal = AbortSignal.any(signals);
 
     try {
       const res = await fetch(`${this.baseUrl}/v1/audio/speech`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body,
-        signal: controller.signal,
+        signal,
       });
       clearTimeout(timeout);
 

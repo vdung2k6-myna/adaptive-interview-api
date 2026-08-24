@@ -3,7 +3,7 @@
  * Files are organized under /tmp/audio/{sessionId}/.
  */
 
-import { mkdir, writeFile, readFile, access } from "fs/promises";
+import { mkdir, writeFile, readFile, access, unlink } from "fs/promises";
 import { join } from "path";
 import { randomUUID } from "crypto";
 
@@ -120,4 +120,23 @@ export function urlPathToFilePath(urlPath: string): string {
   // urlPath is like /audio/{sessionId}/{filename}
   const relative = urlPath.replace(/^\/audio\//, "");
   return join(BASE_DIR, relative);
+}
+
+/**
+ * Delete an audio file given its URL path.
+ * Silently ignores missing files so callers can safely delete without checking first.
+ */
+export async function deleteAudio(urlPath: string): Promise<void> {
+  const filePath = urlPathToFilePath(urlPath);
+  try {
+    await unlink(filePath);
+    console.log(`[deleteAudio] Removed ${filePath}`);
+  } catch (err) {
+    if (err instanceof Error && "code" in err && err.code === "ENOENT") {
+      // File already gone — not an error
+      return;
+    }
+    console.error(`[deleteAudio] Failed to remove ${filePath}:`, err);
+    throw err;
+  }
 }

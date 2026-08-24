@@ -166,16 +166,22 @@ export function splitForTTS(text: string, maxChars = 60): string[] {
  * single buffer so no audio is lost.
  *
  * @param text The text to synthesize.
- * @param ttsOptions Engine and voice options.
+ * @param ttsOptions Engine, voice, and optional abort signal.
  * @param depth Recursion depth (max 3).
+ * @param signal Optional abort signal; if aborted, recursion stops early.
  * @returns Audio buffer.
  * @throws If synthesis fails and cannot be recovered.
  */
 export async function synthesizeSpeechWithFallback(
   text: string,
   ttsOptions: SynthesizeOptions,
-  depth = 0
+  depth = 0,
+  signal?: AbortSignal
 ): Promise<Buffer> {
+  if (signal?.aborted) {
+    throw new DOMException("TTS synthesis aborted", "AbortError");
+  }
+
   if (depth > 3) {
     throw new Error(
       `Max TTS recursion depth reached for chunk "${text.slice(0, 30)}..."`
@@ -188,9 +194,14 @@ export async function synthesizeSpeechWithFallback(
   }
 
   try {
-    return await synthesizeSpeech(text, ttsOptions);
+    return await synthesizeSpeech(text, { ...ttsOptions, signal });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+
+    if (err instanceof Error && err.name === "AbortError") {
+      throw err;
+    }
+
     const isPhonemeError =
       msg.includes("Piper produced no audio data") ||
       msg.includes("Phoneme chunk too long");
@@ -213,15 +224,23 @@ export async function synthesizeSpeechWithFallback(
       const right = text.slice(splitAt).trim();
 
       if (left && right) {
+        if (signal?.aborted) {
+          throw new DOMException("TTS synthesis aborted", "AbortError");
+        }
         const leftBuf = await synthesizeSpeechWithFallback(
           left,
           ttsOptions,
-          depth + 1
+          depth + 1,
+          signal
         );
+        if (signal?.aborted) {
+          throw new DOMException("TTS synthesis aborted", "AbortError");
+        }
         const rightBuf = await synthesizeSpeechWithFallback(
           right,
           ttsOptions,
-          depth + 1
+          depth + 1,
+          signal
         );
 
         // If both halves are WAV, concatenate so no audio is lost
@@ -250,10 +269,11 @@ export async function synthesizeSpeechWithFallback(
  * (previous implementation only returned one half).
  *
  * @param chunk The text chunk to synthesize.
- * @param ttsOptions Engine and voice options.
+ * @param ttsOptions Engine, voice, and optional abort signal.
  * @param sessionId Session identifier for audio storage.
  * @param chunkIndex Index used as part of the filename prefix.
  * @param depth Recursion depth (max 3).
+ * @param signal Optional abort signal; if aborted, skip saving and return empty.
  * @returns Array of saved results (may contain multiple entries if split).
  */
 export async function synthesizeChunkWithFallback(
@@ -261,7 +281,8 @@ export async function synthesizeChunkWithFallback(
   ttsOptions: SynthesizeOptions,
   sessionId: string,
   chunkIndex: number,
-  depth = 0
+  depth = 0,
+  signal?: AbortSignal
 ): Promise<SynthesizeResult[]> {
   if (depth > 3) {
     console.warn(
@@ -276,8 +297,15 @@ export async function synthesizeChunkWithFallback(
     return [];
   }
 
+  if (signal?.aborted) {
+    return [];
+  }
+
   try {
-    const buffer = await synthesizeSpeech(chunk, ttsOptions);
+    const buffer = await synthesizeSpeech(chunk, { ...ttsOptions, signal });
+    if (signal?.aborted) {
+      return [];
+    }
     const fmt = detectAudioFormat(buffer);
     const { urlPath } = await saveAudio(
       sessionId,
@@ -287,6 +315,10 @@ export async function synthesizeChunkWithFallback(
     );
     return [{ urlPath, text: chunk }];
   } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      return [];
+    }
+
     const msg = err instanceof Error ? err.message : String(err);
     const isPhonemeError =
       msg.includes("Piper produced no audio data") ||
@@ -310,19 +342,27 @@ export async function synthesizeChunkWithFallback(
       const right = chunk.slice(splitAt).trim();
 
       if (left && right) {
+        if (signal?.aborted) {
+          return [];
+        }
         const leftResults = await synthesizeChunkWithFallback(
           left,
           ttsOptions,
           sessionId,
           chunkIndex,
-          depth + 1
+          depth + 1,
+          signal
         );
+        if (signal?.aborted) {
+          return [];
+        }
         const rightResults = await synthesizeChunkWithFallback(
           right,
           ttsOptions,
           sessionId,
           chunkIndex,
-          depth + 1
+          depth + 1,
+          signal
         );
         return [...leftResults, ...rightResults];
       }

@@ -1,4 +1,4 @@
-import { Router, type Request, type Response } from "express";
+import { Router, type Response } from "express";
 import multer from "multer";
 import { db } from "@/lib/db";
 import { interviewSessions, candidates, positions, messages } from "@/lib/schema";
@@ -10,6 +10,7 @@ import {
   transcribeAudio,
   synthesizeSpeech,
   saveAudio,
+  deleteAudio,
   detectAudioFormat,
   splitSentences,
   stripMarkdown,
@@ -33,6 +34,14 @@ function sendSseEvent(res: Response, event: string, data: unknown) {
   } catch {
     // Client may have disconnected
   }
+}
+
+/**
+ * Delete all audio files associated with saved URL paths.
+ * Used to clean up partially-synthesized chunks when a client disconnects.
+ */
+async function cleanupSavedAudio(urls: string[]): Promise<void> {
+  await Promise.all(urls.map((url) => deleteAudio(url).catch(() => undefined)));
 }
 
 /* ── POST /api/voice/start ──────────────────────────────────────── */
@@ -445,6 +454,20 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
 
+  // Track generated chunk files so we can delete them if the client disconnects.
+  const savedUrls: string[] = [];
+
+  // AbortController lets us cancel the LLM stream and active Audio Gateway requests on disconnect.
+  const abortController = new AbortController();
+  const onDisconnect = () => {
+    if (!abortController.signal.aborted && !res.writableEnded) {
+      abortController.abort();
+    }
+  };
+  // For SSE, res "close" fires when the underlying connection is closed by the client.
+  // If the response ends normally (res.end()), writableEnded will be true, so we ignore it.
+  res.on("close", onDisconnect);
+
   try {
     const sessionId = req.body.sessionId as string | undefined;
     const audioFile = req.file;
@@ -540,11 +563,16 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
       try {
         const ttsOptions: SynthesizeOptions = {
           engine: (session.ttsProvider as "kokoro" | "piper") || "kokoro",
+          signal: abortController.signal,
         };
-        const ttsBuffer = await synthesizeSpeech(completionText, ttsOptions);
+        const ttsBuffer = await synthesizeSpeechWithFallback(completionText, ttsOptions, 0, abortController.signal);
         const { urlPath } = await saveAudio(sessionId, ttsBuffer, "interviewer", "wav");
         interviewerAudioUrl = urlPath;
       } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") {
+          await cleanupSavedAudio(savedUrls);
+          return;
+        }
         console.error("[POST /api/voice/stream] TTS error for completion:", err);
       }
 
@@ -559,20 +587,22 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
         })
         .returning();
 
-      sendSseEvent(res, "sentence", {
-        index: 0,
-        text: completionText,
-        audioUrl: interviewerAudioUrl || null,
-      });
+      if (!abortController.signal.aborted) {
+        sendSseEvent(res, "sentence", {
+          index: 0,
+          text: completionText,
+          audioUrl: interviewerAudioUrl || null,
+        });
 
-      sendSseEvent(res, "done", {
-        session: {
-          status: "completed",
-          currentTurn: newTurn,
-          maxTurns: session.maxTurns,
-        },
-        messageId: interviewerMsgRows[0].id,
-      });
+        sendSseEvent(res, "done", {
+          session: {
+            status: "completed",
+            currentTurn: newTurn,
+            maxTurns: session.maxTurns,
+          },
+          messageId: interviewerMsgRows[0].id,
+        });
+      }
 
       res.end();
       return;
@@ -633,6 +663,7 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
 
     const ttsOptions: SynthesizeOptions = {
       engine: (session.ttsProvider as "kokoro" | "piper") || "kokoro",
+      signal: abortController.signal,
     };
 
     const { stream: llmStream, getFullText } = generateChatResponseStream({
@@ -659,11 +690,13 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
         if (result.buffer) {
           sentenceBuffers[result.index] = result.buffer;
         }
-        sendSseEvent(res, "sentence", {
-          index: result.index,
-          text: result.text,
-          audioUrl: result.urlPath,
-        });
+        if (!abortController.signal.aborted) {
+          sendSseEvent(res, "sentence", {
+            index: result.index,
+            text: result.text,
+            audioUrl: result.urlPath,
+          });
+        }
         nextEmitIndex++;
       }
     }
@@ -686,8 +719,13 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
             `interviewer-chunk-${idx}`,
             fmt
           );
+          // Track the URL immediately so cleanup can find it even if the route exits before .then() fires.
+          savedUrls.push(urlPath);
           return { index: idx, buffer, text: sentenceText, urlPath };
         } catch (err) {
+          if (err instanceof Error && err.name === "AbortError") {
+            return { index: idx, buffer: null, text: sentenceText, urlPath: null };
+          }
           console.error(`[POST /api/voice/stream] TTS error for sentence ${idx}:`, err);
           return { index: idx, buffer: null, text: sentenceText, urlPath: null };
         }
@@ -705,6 +743,10 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
 
     try {
       while (true) {
+        if (abortController.signal.aborted || res.writableEnded) {
+          await reader.cancel();
+          break;
+        }
         const { done, value } = await reader.read();
         if (done) break;
         if (value) {
@@ -712,25 +754,45 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
 
           const allSentences = splitSentences(stripMarkdown(accumulatedText));
           for (let i = sentenceIndex; i < allSentences.length; i++) {
+            if (abortController.signal.aborted || res.writableEnded) {
+              await reader.cancel();
+              break;
+            }
             const sentenceText = allSentences[i];
             if (!/[.!?…。？！]$/.test(sentenceText)) {
               break;
             }
             const chunks = splitForTTS(sentenceText);
             for (const chunk of chunks) {
+              if (abortController.signal.aborted || res.writableEnded) {
+                await reader.cancel();
+                break;
+              }
               const idx = chunkIndex++;
-              enqueueTTS(idx, chunk, () => synthesizeSpeechWithFallback(chunk, ttsOptions));
+              enqueueTTS(idx, chunk, () => synthesizeSpeechWithFallback(chunk, ttsOptions, 0, abortController.signal));
             }
             sentenceIndex++;
           }
         }
       }
     } catch (err) {
-      llmError = err instanceof Error ? err : new Error(String(err));
+      if (err instanceof Error && err.name === "AbortError") {
+        llmError = null;
+      } else {
+        llmError = err instanceof Error ? err : new Error(String(err));
+      }
+    }
+
+    // If the client disconnected mid-stream, abandon queued work and clean up.
+    if (abortController.signal.aborted || res.writableEnded) {
+      await cleanupSavedAudio(savedUrls);
+      res.end();
+      return;
     }
 
     if (llmError) {
       console.error("[POST /api/voice/stream] LLM error:", llmError);
+      await cleanupSavedAudio(savedUrls);
       sendSseEvent(res, "error", {
         message:
           llmError instanceof OllamaError
@@ -743,6 +805,7 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
 
     const fullText = getFullText().trim() || accumulatedText.trim();
     if (!fullText) {
+      await cleanupSavedAudio(savedUrls);
       sendSseEvent(res, "error", { message: "LLM returned empty response" });
       res.end();
       return;
@@ -755,8 +818,13 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
         const sentenceText = finalSentences[i];
         const chunks = splitForTTS(sentenceText);
         for (const chunk of chunks) {
+          if (abortController.signal.aborted || res.writableEnded) {
+            await cleanupSavedAudio(savedUrls);
+            res.end();
+            return;
+          }
           const idx = chunkIndex++;
-          enqueueTTS(idx, chunk, () => synthesizeSpeechWithFallback(chunk, ttsOptions));
+          enqueueTTS(idx, chunk, () => synthesizeSpeechWithFallback(chunk, ttsOptions, 0, abortController.signal));
         }
         sentenceIndex++;
       }
@@ -769,14 +837,29 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
       if (tail) {
         const chunks = splitForTTS(tail);
         for (const chunk of chunks) {
+          if (abortController.signal.aborted || res.writableEnded) {
+            await cleanupSavedAudio(savedUrls);
+            res.end();
+            return;
+          }
           const idx = chunkIndex++;
-          enqueueTTS(idx, chunk, () => synthesizeSpeechWithFallback(chunk, ttsOptions));
+          enqueueTTS(idx, chunk, () => synthesizeSpeechWithFallback(chunk, ttsOptions, 0, abortController.signal));
         }
         sentenceIndex++;
       }
     }
 
-    await Promise.all(pendingTTS);
+    // Wait for remaining TTS only if the client is still connected.
+    if (!abortController.signal.aborted && !res.writableEnded) {
+      await Promise.all(pendingTTS);
+    }
+
+    // If the client disconnected while we were awaiting TTS, clean up and exit.
+    if (abortController.signal.aborted || res.writableEnded) {
+      await cleanupSavedAudio(savedUrls);
+      res.end();
+      return;
+    }
 
     let interviewerAudioUrl: string | undefined;
     let combinedFormat: string | null = null;
@@ -835,6 +918,7 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
     res.end();
   } catch (err) {
     console.error("[POST /api/voice/stream] UNEXPECTED ERROR:", err);
+    await cleanupSavedAudio(savedUrls);
     try {
       sendSseEvent(res, "error", {
         message: err instanceof Error ? err.message : "Failed to process voice turn",
@@ -879,6 +963,20 @@ router.post("/speak-stream", async (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
 
+  // Track generated chunk files so we can delete them if the client disconnects.
+  const savedUrls: string[] = [];
+
+  // AbortController lets us cancel the active Audio Gateway request on disconnect.
+  const abortController = new AbortController();
+  const onDisconnect = () => {
+    if (!abortController.signal.aborted && !res.writableEnded) {
+      abortController.abort();
+    }
+  };
+  // For SSE, res "close" fires when the underlying connection is closed by the client.
+  // If the response ends normally (res.end()), writableEnded will be true, so we ignore it.
+  res.on("close", onDisconnect);
+
   try {
     const { text, engine, sessionId } = req.body as {
       text?: string;
@@ -902,17 +1000,32 @@ router.post("/speak-stream", async (req, res) => {
       return;
     }
 
-    const ttsOptions: SynthesizeOptions = { engine };
+    const ttsOptions: SynthesizeOptions = { engine, signal: abortController.signal };
     let chunkIndex = 0;
 
     for (const sentenceText of sentences) {
       for (const chunk of splitForTTS(sentenceText)) {
+        if (res.writableEnded || abortController.signal.aborted) {
+          await cleanupSavedAudio(savedUrls);
+          return;
+        }
+
         const results: SynthesizeResult[] = await synthesizeChunkWithFallback(
           chunk,
           ttsOptions,
           sid,
-          chunkIndex
+          chunkIndex,
+          0,
+          abortController.signal
         );
+
+        if (res.writableEnded || abortController.signal.aborted) {
+          for (const result of results) {
+            if (result.urlPath) savedUrls.push(result.urlPath);
+          }
+          await cleanupSavedAudio(savedUrls);
+          return;
+        }
 
         if (results.length === 0) {
           sendSseEvent(res, "sentence", {
@@ -923,6 +1036,7 @@ router.post("/speak-stream", async (req, res) => {
           chunkIndex++;
         } else {
           for (const result of results) {
+            if (result.urlPath) savedUrls.push(result.urlPath);
             sendSseEvent(res, "sentence", {
               index: chunkIndex,
               text: result.text,
@@ -938,6 +1052,7 @@ router.post("/speak-stream", async (req, res) => {
     res.end();
   } catch (err) {
     console.error("[POST /api/voice/speak-stream] error:", err);
+    await cleanupSavedAudio(savedUrls);
     try {
       sendSseEvent(res, "error", {
         message: err instanceof Error ? err.message : "Failed to synthesize speech",

@@ -8,7 +8,7 @@ import { audioGateway, type SynthesizeOptions } from "./client";
 /**
  * Synthesize text into an audio buffer.
  * @param text The text to speak.
- * @param options Optional engine and voice overrides.
+ * @param options Optional engine, voice overrides, and abort signal.
  * @returns Audio buffer (WAV format).
  */
 export async function synthesizeSpeech(
