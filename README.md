@@ -1,6 +1,6 @@
 # Adaptive Interview API
 
-Standalone backend API for the [Adaptive Interview Engine](../ollama-chat-react).
+Standalone backend API for the [Adaptive Interview Engine](https://github.com/vdung2k6-myna/adaptive-interview).
 
 Extracted from the Next.js monolith as part of Pattern B separation.
 
@@ -9,7 +9,7 @@ Extracted from the Next.js monolith as part of Pattern B separation.
 - [Setup Guide](docs/SETUP.md)
 - [API Reference](docs/API.md)
 - [Architecture](docs/ARCHITECTURE.md)
-- [Frontend repo](../ollama-chat-react)
+- [Frontend repo](https://github.com/vdung2k6-myna/adaptive-interview)
 
 ## Route Overview
 

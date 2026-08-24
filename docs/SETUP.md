@@ -226,7 +226,7 @@ The server starts on port `4000` by default.
      -d '{"name":"Jane Doe","email":"jane@example.com","skills":["React","Node.js"]}'
    ```
 
-3. **Test with the frontend:** see the frontend repo's [SETUP.md](../ollama-chat-react/docs/SETUP.md).
+3. **Test with the frontend:** see the frontend repo's [SETUP.md](https://github.com/vdung2k6-myna/adaptive-interview/blob/main/docs/SETUP.md).
 
 ## Production Configuration
 
