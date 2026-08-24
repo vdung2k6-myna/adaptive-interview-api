@@ -4,6 +4,7 @@ import { positions, interviewSessions, embeddings } from "@/lib/schema";
 import { eq, count } from "drizzle-orm";
 import { embedText } from "@/lib/ollama";
 import { storeRequirementEmbedding } from "@/lib/embeddings";
+import { getPositionsWithSessionCount } from "@/lib/position-queries";
 
 const router = Router();
 
@@ -47,24 +48,7 @@ router.post("/", async (req, res) => {
 
 router.get("/", async (_req, res) => {
   try {
-    const rows = await db.select().from(positions).orderBy(positions.createdAt);
-
-    // Count sessions per position
-    const sessionCounts = await db
-      .select({
-        positionId: interviewSessions.positionId,
-        count: count(),
-      })
-      .from(interviewSessions)
-      .groupBy(interviewSessions.positionId);
-
-    const sessionCountMap = new Map(sessionCounts.map((s) => [s.positionId, s.count]));
-
-    const results = rows.map((p) => ({
-      ...p,
-      sessionCount: sessionCountMap.get(p.id) || 0,
-    }));
-
+    const results = await getPositionsWithSessionCount();
     res.json(results);
   } catch (err) {
     console.error("GET /api/positions error:", err);
