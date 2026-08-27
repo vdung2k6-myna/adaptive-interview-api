@@ -54,6 +54,12 @@ AUDIO_GATEWAY_URL=http://localhost:8082
 DEFAULT_TTS_ENGINE=kokoro
 DEFAULT_VOICE=default_voice
 
+# Per-language TTS voices (English defaults; leave Vietnamese empty to use service defaults)
+KOKORO_VOICE_ENGLISH=af_heart
+# KOKORO_VOICE_VIETNAMESE=
+PIPER_VOICE_ENGLISH=en_US-lessac-medium
+# PIPER_VOICE_VIETNAMESE=
+
 # CORS
 FRONTEND_URL=http://localhost:3000
 
@@ -166,7 +172,7 @@ Voice interviews require an audio stack (STT + TTS) maintained in this repositor
 ### Setup
 
 ```bash
-# Kokoro
+# Kokoro (currently ships a Vietnamese model)
 cd kokoro-service
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\Activate.ps1
@@ -178,6 +184,11 @@ cd ../piper-service
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# Download the English voice for English interviews (optional if only Vietnamese is needed)
+# Place in ../pipervoices/:
+#   en_US-lessac-medium.onnx
+#   en_US-lessac-medium.onnx.json
 
 # Audio Gateway
 cd ../audio-gateway
@@ -191,6 +202,8 @@ See each service's README for detailed setup:
 - [`audio-gateway/README.md`](audio-gateway/README.md)
 - [`kokoro-service/README.md`](kokoro-service/README.md)
 - [`piper-service/README.md`](piper-service/README.md)
+
+**English voice note:** The default English voice mapping expects `en_US-lessac-medium` for Piper and `af_heart` for Kokoro. Piper English voices are downloaded as `.onnx` + `.onnx.json` files into the `pipervoices` directory. Kokoro currently uses the Vietnamese model in this repo; use Piper for English interviews until an English Kokoro model is added.
 
 ### Running
 

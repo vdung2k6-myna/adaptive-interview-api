@@ -68,6 +68,7 @@ router.post("/", async (req, res) => {
 
     const candidate = candidateRows[0];
     const position = positionRows[0];
+    const language = (session.language as "english" | "vietnamese") || "english";
 
     if (!candidate || !position) {
       res.status(404).json({ error: "Related candidate or position not found" });
@@ -87,6 +88,7 @@ router.post("/", async (req, res) => {
           id: session.id,
           positionId: session.positionId,
           status: session.status,
+          language,
           maxTurns: session.maxTurns,
           currentTurn: session.currentTurn,
           position: {
@@ -216,6 +218,7 @@ router.post("/", async (req, res) => {
         id: session.id,
         positionId: session.positionId,
         status: "in_progress",
+        language,
         maxTurns: session.maxTurns,
         currentTurn: newTurn,
         position: {

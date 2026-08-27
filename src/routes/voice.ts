@@ -15,11 +15,11 @@ import {
   stripMarkdown,
   splitForTTS,
   synthesizeSpeechWithFallback,
-  synthesizeChunkWithFallback,
   synthesizeLongText,
   concatWavBuffers,
+  resolveVoice,
+  resolveEngineForLanguage,
   type SynthesizeOptions,
-  type SynthesizeResult,
 } from "@/lib/audio";
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -120,11 +120,16 @@ router.post("/start", async (req, res) => {
       return;
     }
 
+    const requestedEngine = (session.ttsProvider as "kokoro" | "piper") || "kokoro";
+    const language = (session.language as "english" | "vietnamese") || "english";
+    const engine = resolveEngineForLanguage(requestedEngine, language);
+
     const prompt = await buildPrompt(
       {
         id: session.id,
         positionId: session.positionId,
         status: session.status,
+        language,
         maxTurns: session.maxTurns,
         currentTurn: session.currentTurn,
         position: {
@@ -161,9 +166,9 @@ router.post("/start", async (req, res) => {
 
     let audioUrl: string | undefined;
     try {
-      const engine = (session.ttsProvider as "kokoro" | "piper") || "kokoro";
       const result = await synthesizeLongText(questionText, {
         engine,
+        voice: resolveVoice(engine, language),
         sessionId,
         prefix: "interviewer",
         signal: abortController.signal,
@@ -323,6 +328,10 @@ router.post("/turn", upload.single("audio"), async (req, res) => {
       .where(eq(messages.sessionId, sessionId))
       .orderBy(messages.createdAt);
 
+    const requestedEngine = (session.ttsProvider as "kokoro" | "piper") || "kokoro";
+    const language = (session.language as "english" | "vietnamese") || "english";
+    const engine = resolveEngineForLanguage(requestedEngine, language);
+
     const promptMessages: PromptMessage[] = existingMessages.map((m) => ({
       role: m.role as "interviewer" | "candidate",
       content: m.content,
@@ -333,6 +342,7 @@ router.post("/turn", upload.single("audio"), async (req, res) => {
         id: session.id,
         positionId: session.positionId,
         status: "in_progress",
+        language,
         maxTurns: session.maxTurns,
         currentTurn: session.currentTurn,
         position: {
@@ -363,9 +373,9 @@ router.post("/turn", upload.single("audio"), async (req, res) => {
 
       let interviewerAudioUrl: string | undefined;
       try {
-        const engine = (session.ttsProvider as "kokoro" | "piper") || "kokoro";
         const result = await synthesizeLongText(completionText, {
           engine,
+          voice: resolveVoice(engine, language),
           sessionId,
           prefix: "interviewer",
           signal: abortController.signal,
@@ -435,9 +445,9 @@ router.post("/turn", upload.single("audio"), async (req, res) => {
 
     let interviewerAudioUrl: string | undefined;
     try {
-      const engine = (session.ttsProvider as "kokoro" | "piper") || "kokoro";
       const result = await synthesizeLongText(questionText, {
         engine,
+        voice: resolveVoice(engine, language),
         sessionId,
         prefix: "interviewer",
         signal: abortController.signal,
@@ -601,6 +611,11 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
     });
 
     const newTurn = session.currentTurn + 1;
+    const streamLanguage = (session.language as "english" | "vietnamese") || "english";
+    const streamEngine = resolveEngineForLanguage(
+      (session.ttsProvider as "kokoro" | "piper") || "kokoro",
+      streamLanguage
+    );
 
     if (newTurn >= session.maxTurns) {
       await db
@@ -608,12 +623,15 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
         .set({ status: "completed", currentTurn: newTurn, completedAt: new Date() })
         .where(eq(interviewSessions.id, sessionId));
 
-      const completionText = "Thank you, the interview is complete.";
+      const completionText = streamLanguage === "vietnamese"
+        ? "Cảm ơn bạn, buổi phỏng vấn đã kết thúc."
+        : "Thank you, the interview is complete.";
 
       let interviewerAudioUrl: string | undefined;
       try {
         const ttsOptions: SynthesizeOptions = {
-          engine: (session.ttsProvider as "kokoro" | "piper") || "kokoro",
+          engine: streamEngine,
+          voice: resolveVoice(streamEngine, streamLanguage),
           signal: abortController.signal,
         };
         const ttsBuffer = await synthesizeSpeechWithFallback(completionText, ttsOptions, 0, abortController.signal);
@@ -694,6 +712,7 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
         id: session.id,
         positionId: session.positionId,
         status: "in_progress",
+        language: streamLanguage,
         maxTurns: session.maxTurns,
         currentTurn: session.currentTurn,
         position: {
@@ -713,7 +732,8 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
     );
 
     const ttsOptions: SynthesizeOptions = {
-      engine: (session.ttsProvider as "kokoro" | "piper") || "kokoro",
+      engine: streamEngine,
+      voice: resolveVoice(streamEngine, streamLanguage),
       signal: abortController.signal,
     };
 
@@ -1007,10 +1027,11 @@ router.post("/speak", async (req, res) => {
   res.on("close", onDisconnect);
 
   try {
-    const { text, voice, engine } = req.body as {
+    const { text, voice, engine, language: requestLanguage } = req.body as {
       text?: string;
       voice?: string;
       engine?: "kokoro" | "piper";
+      language?: string;
     };
 
     if (!text || typeof text !== "string") {
@@ -1018,9 +1039,13 @@ router.post("/speak", async (req, res) => {
       return;
     }
 
+    const resolvedLanguage: "english" | "vietnamese" =
+      requestLanguage === "vietnamese" ? "vietnamese" : "english";
+    const resolvedEngine = resolveEngineForLanguage(engine, resolvedLanguage);
+
     const result = await synthesizeLongText(text, {
-      engine,
-      voice,
+      engine: resolvedEngine,
+      voice: voice || resolveVoice(resolvedEngine, resolvedLanguage),
       signal: abortController.signal,
     });
 
@@ -1050,9 +1075,6 @@ router.post("/speak-stream", async (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
 
-  // Track generated chunk files so we can delete them if the client disconnects.
-  const savedUrls: string[] = [];
-
   // AbortController lets us cancel the active Audio Gateway request on disconnect.
   const abortController = new AbortController();
   const onDisconnect = () => {
@@ -1065,10 +1087,10 @@ router.post("/speak-stream", async (req, res) => {
   res.on("close", onDisconnect);
 
   try {
-    const { text, engine, sessionId } = req.body as {
+    const { text, engine, language: requestLanguage } = req.body as {
       text?: string;
       engine?: "kokoro" | "piper";
-      sessionId?: string;
+      language?: string;
     };
 
     if (!text || typeof text !== "string") {
@@ -1077,7 +1099,10 @@ router.post("/speak-stream", async (req, res) => {
       return;
     }
 
-    const sid = sessionId || "transcript";
+    const resolvedLanguage: "english" | "vietnamese" =
+      requestLanguage === "vietnamese" ? "vietnamese" : "english";
+    const resolvedEngine = resolveEngineForLanguage(engine, resolvedLanguage);
+
     const cleanText = stripMarkdown(text);
     const sentences = splitSentences(cleanText);
 
@@ -1087,68 +1112,54 @@ router.post("/speak-stream", async (req, res) => {
       return;
     }
 
-    const ttsOptions: SynthesizeOptions = { engine, signal: abortController.signal };
+    const ttsOptions: SynthesizeOptions = {
+      engine: resolvedEngine,
+      voice: resolveVoice(resolvedEngine, resolvedLanguage),
+      signal: abortController.signal,
+    };
     let chunkIndex = 0;
 
     for (const sentenceText of sentences) {
       for (const chunk of splitForTTS(sentenceText)) {
         if (res.writableEnded || abortController.signal.aborted) {
-          await cleanupSavedAudio(savedUrls);
           return;
         }
 
-        const results: SynthesizeResult[] = await synthesizeChunkWithFallback(
-          chunk,
-          ttsOptions,
-          sid,
-          chunkIndex,
-          0,
-          abortController.signal
-        );
+        let buffer: Buffer | null = null;
+        try {
+          buffer = await synthesizeSpeechWithFallback(chunk, ttsOptions, 0, abortController.signal);
+        } catch (err) {
+          // No synthesizable content (e.g. pure punctuation) and unrecoverable TTS
+          // errors are emitted as a null audioData chunk so the frontend can skip
+          // them without stalling the sentence index sequence.
+          if (
+            !(err instanceof Error) ||
+            err.name !== "AbortError"
+          ) {
+            console.warn(
+              `[POST /api/voice/speak-stream] TTS skipped for chunk ${chunkIndex}:`,
+              err instanceof Error ? err.message : err
+            );
+          }
+        }
 
         if (res.writableEnded || abortController.signal.aborted) {
-          for (const result of results) {
-            if (result.urlPath) savedUrls.push(result.urlPath);
-          }
-          await cleanupSavedAudio(savedUrls);
           return;
         }
 
-        if (results.length === 0) {
-          sendSseEvent(res, "sentence", {
-            index: chunkIndex,
-            text: chunk,
-            audioUrl: null,
-          });
-          chunkIndex++;
-        } else {
-          for (const result of results) {
-            if (result.urlPath) savedUrls.push(result.urlPath);
-            sendSseEvent(res, "sentence", {
-              index: chunkIndex,
-              text: result.text,
-              audioUrl: result.urlPath,
-            });
-            chunkIndex++;
-          }
-        }
+        sendSseEvent(res, "sentence", {
+          index: chunkIndex,
+          text: chunk,
+          audioData: buffer ? buffer.toString("base64") : null,
+        });
+        chunkIndex++;
       }
     }
 
     sendSseEvent(res, "done", {});
     res.end();
-
-    // Clean up temporary chunk files after a grace period so slow clients can
-    // finish fetching the last chunk.
-    if (savedUrls.length > 0) {
-      const urlsToClean = [...savedUrls];
-      setTimeout(() => {
-        cleanupSavedAudio(urlsToClean).catch(() => undefined);
-      }, 30_000);
-    }
   } catch (err) {
     console.error("[POST /api/voice/speak-stream] error:", err);
-    await cleanupSavedAudio(savedUrls);
     try {
       sendSseEvent(res, "error", {
         message: err instanceof Error ? err.message : "Failed to synthesize speech",

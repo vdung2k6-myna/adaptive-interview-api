@@ -36,5 +36,15 @@ export const developmentConfig: AppConfig = {
     defaultEngine: (process.env.DEFAULT_TTS_ENGINE as "kokoro" | "piper") || "kokoro",
     defaultVoice: process.env.DEFAULT_VOICE || "default_name",
     timeoutMs: 60_000,
+    voices: {
+      kokoro: {
+        english: process.env.KOKORO_VOICE_ENGLISH || "af_heart",
+        vietnamese: process.env.KOKORO_VOICE_VIETNAMESE || "",
+      },
+      piper: {
+        english: process.env.PIPER_VOICE_ENGLISH || "en_US-lessac-medium",
+        vietnamese: process.env.PIPER_VOICE_VIETNAMESE || "",
+      },
+    },
   },
 };

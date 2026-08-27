@@ -34,6 +34,16 @@ export interface AppConfig {
     defaultEngine: "kokoro" | "piper"; // default TTS engine
     defaultVoice: string;   // voice ID, e.g. "default_name" (kokoro) or "vi_VN-vais1000-medium" (piper)
     timeoutMs: number;
+    voices: {
+      kokoro: {
+        english: string;
+        vietnamese: string;
+      };
+      piper: {
+        english: string;
+        vietnamese: string;
+      };
+    };
   };
 }
 

@@ -14,10 +14,44 @@ import { saveAudio, deleteAudio, detectAudioFormat } from "./storage";
 import { concatWavBuffers } from "./wav-utils";
 import { splitSentences } from "./split-sentences";
 import type { SynthesizeOptions } from "./client";
+import config from "@/lib/config";
 
 export interface SynthesizeResult {
   urlPath: string;
   text: string;
+}
+
+export type InterviewLanguage = "english" | "vietnamese";
+
+/**
+ * Resolve the voice ID for a given TTS engine and interview language.
+ * Returns undefined when the configured voice is empty, which tells the caller
+ * to use the service's own default (preserves existing Vietnamese behavior).
+ */
+export function resolveVoice(
+  engine: "kokoro" | "piper",
+  language: InterviewLanguage
+): string | undefined {
+  const voice = config.audio.voices[engine][language]?.trim();
+  return voice || undefined;
+}
+
+/**
+ * Resolve the TTS engine to use for a given interview language.
+ *
+ * Engine ↔ Language mapping is forced at runtime because the deployed voice
+ * models are language-specific:
+ * - English interviews must use Piper (only English voices are installed there).
+ * - Vietnamese interviews must use Kokoro (only Vietnamese voices are installed there).
+ */
+export function resolveEngineForLanguage(
+  requestedEngine: "kokoro" | "piper" | undefined,
+  language: InterviewLanguage
+): "kokoro" | "piper" {
+  if (language === "english") {
+    return "piper";
+  }
+  return "kokoro";
 }
 
 /**
@@ -527,6 +561,32 @@ export function splitForTTS(text: string, maxChars = 60): string[] {
   }
 
   if (remaining) chunks.push(remaining);
+
+  // Merge a trailing fragment that is too short to stand alone (e.g. a single
+  // word like "mèo?" left after splitting a long Vietnamese sentence). This
+  // avoids synthesizing one-word chunks that are meaningless out of context.
+  // The merge is capped at 1.5× maxChars so we do not accidentally push the
+  // previous chunk past the engine's comfortable limit.
+  const minWords = 3;
+  const minChars = 15;
+  const mergeLimit = Math.floor(maxChars * 1.5);
+  while (chunks.length >= 2) {
+    const last = chunks[chunks.length - 1];
+    const wordCount = last.trim().split(/\s+/).length;
+    if (wordCount < minWords || last.length < minChars) {
+      const prev = chunks[chunks.length - 2];
+      if (prev.length + 1 + last.length <= mergeLimit) {
+        chunks[chunks.length - 2] = (prev + " " + last).trim();
+        chunks.pop();
+      } else {
+        // Cannot merge without exceeding the safe limit; leave the short chunk.
+        break;
+      }
+    } else {
+      break;
+    }
+  }
+
   return chunks;
 }
 

@@ -254,6 +254,18 @@ describe("splitForTTS", () => {
     assert.ok(chunks.length >= 2);
     assert.ok(!chunks.some((c) => /\b5$/.test(c)), `chunk ends in 5: ${JSON.stringify(chunks)}`);
   });
+
+  it("merges a trailing fragment so the final chunk is meaningful", () => {
+    const chunks = splitForTTS(
+      "Với vai trò chuyên gia, anh/chị hãy giải thích ngắn gọn: vì sao mèo không tự tổng hợp đủ taurine trong cơ thể, và thiếu taurine kéo dài sẽ gây ra hai bệnh lý chính gì ở mèo?"
+    );
+    const last = chunks[chunks.length - 1];
+    const wordCount = last.trim().split(/\s+/).length;
+    assert.ok(
+      wordCount >= 3,
+      `expected final chunk to have at least 3 words, got ${wordCount}: ${JSON.stringify(chunks)}`
+    );
+  });
 });
 
 describe("stripMarkdown", () => {

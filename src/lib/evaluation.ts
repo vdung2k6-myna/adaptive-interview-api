@@ -66,6 +66,7 @@ export async function generateEvaluation(sessionId: string, model?: string) {
     candidate.name,
     candidate.skills,
     candidate.experienceYears,
+    (session.language as "english" | "vietnamese") || "english",
     messageRows.map((m) => ({
       role: m.role as "interviewer" | "candidate",
       content: m.content,
@@ -142,11 +143,17 @@ function buildEvaluationMessages(
   candidateName: string,
   skills: string[],
   experienceYears: number | null,
+  language: "english" | "vietnamese",
   transcriptMessages: { role: "interviewer" | "candidate"; content: string }[]
 ): OllamaMessage[] {
   const jobDescSection = jobDescription
     ? `\nJob Description:\n${jobDescription.substring(0, 1200)}`
     : "";
+
+  const languageInstruction =
+    language === "vietnamese"
+      ? "Write all feedback in Vietnamese only."
+      : "Write all feedback in English only.";
 
   const systemPrompt = `You are an experienced technical hiring manager reviewing an interview transcript.
 
@@ -161,6 +168,8 @@ Also provide:
 - weaknesses: array of 2-5 specific weaknesses or gaps
 - recommendation: one of [strong_yes, yes, maybe, no, strong_no]
 - confidence: 0-100 (how confident you are in this assessment)
+
+${languageInstruction}
 
 Respond ONLY with valid JSON in this exact format:
 {

@@ -282,7 +282,8 @@ Create a new interview session.
   "positionId": "uuid",
   "candidateId": "uuid",
   "mode": "voice",
-  "ttsProvider": "piper"
+  "ttsProvider": "piper",
+  "language": "vietnamese"
 }
 ```
 
@@ -291,6 +292,7 @@ Create a new interview session.
 
 - `mode` (`"text"` or `"voice"`, defaults to `"text"`)
 - `ttsProvider` (`"kokoro"` or `"piper"`, defaults to `"kokoro"`; only used when `mode` is `"voice"`)
+- `language` (`"english"` or `"vietnamese"`, defaults to `"english"`)
 - `maxTurns` (`number`, defaults to `8`)
 
 **Response:**
@@ -302,6 +304,8 @@ Create a new interview session.
   "candidateId": "uuid",
   "status": "created",
   "mode": "voice",
+  "ttsProvider": "piper",
+  "language": "vietnamese",
   "maxTurns": 8,
   "currentTurn": 0,
   "createdAt": "2026-08-08T12:00:00Z"
@@ -367,6 +371,8 @@ Get a single session with all related data.
   "session": {
     "id": "uuid",
     "status": "completed",
+    "mode": "voice",
+    "language": "vietnamese",
     "maxTurns": 8,
     "currentTurn": 8,
     "createdAt": "2026-08-08T12:00:00Z",
@@ -619,9 +625,18 @@ On-demand TTS for transcript replay. Synthesizes any text to speech via the Audi
 ```json
 {
   "text": "Hello, this is a test.",
-  "voice": "diem_trinh"
+  "engine": "piper",
+  "voice": "en_US-lessac-medium",
+  "language": "english"
 }
 ```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `text` | `string` | Yes | Text to synthesize |
+| `engine` | `"kokoro"` \| `"piper"` | No | Default: `"kokoro"` |
+| `voice` | `string` | No | Explicit voice ID override |
+| `language` | `"english"` \| `"vietnamese"` | No | Default: `"english"`; selects the configured voice unless `voice` is provided |
 
 **Response:** `audio/wav` — WAV audio stream.
 
@@ -639,14 +654,15 @@ Markdown formatting (bold, italic, strikethrough, headers, code blocks, inline c
 
 ### `POST /api/voice/speak-stream`
 
-**Streaming TTS for transcript replay** via Server-Sent Events (SSE). Same functionality as `/api/voice/speak` but splits text into sentences server-side, synthesizes each sentence in order, and emits `sentence` events as audio becomes ready. This gives near-instant playback for long messages instead of waiting for the entire synthesis.
+**Streaming TTS for transcript replay** via Server-Sent Events (SSE). Same functionality as `/api/voice/speak` but splits text into sentences server-side, synthesizes each sentence in order, and emits `sentence` events with embedded base64 audio data as each chunk becomes ready. Embedding the audio data removes a per-chunk HTTP fetch round-trip, so playback starts as soon as the first chunk arrives.
 
 **Request Body:**
 
 ```json
 {
   "text": "Hello. How are you? **This** is a test.",
-  "engine": "piper"
+  "engine": "piper",
+  "language": "english"
 }
 ```
 
@@ -654,12 +670,13 @@ Markdown formatting (bold, italic, strikethrough, headers, code blocks, inline c
 |-------|------|----------|-------------|
 | `text` | `string` | Yes | Text to synthesize |
 | `engine` | `"kokoro"` \| `"piper"` | No | Default: `"kokoro"` |
+| `language` | `"english"` \| `"vietnamese"` | No | Default: `"english"`; selects the configured voice for the engine |
 
 **Response:** `text/event-stream`
 
 | Event | Data Shape | Description |
 |-------|-----------|-------------|
-| `sentence` | `{ index, text, audioUrl }` | A sentence chunk ready to play |
+| `sentence` | `{ index, text, audioData }` | A sentence chunk ready to play |
 | `done` | `{}` | All sentences processed |
 | `error` | `{ message }` | Fatal error (stream terminates) |
 
@@ -667,10 +684,10 @@ Markdown formatting (bold, italic, strikethrough, headers, code blocks, inline c
 
 ```
 event: sentence
-data: {"index":0,"text":"Hello.","audioUrl":"/audio/transcript/..."}
+data: {"index":0,"text":"Hello.","audioData":"UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA..."}
 
 event: sentence
-data: {"index":1,"text":"How are you?","audioUrl":"/audio/transcript/..."}
+data: {"index":1,"text":"How are you?","audioData":"UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA..."}
 
 event: done
 data: {}

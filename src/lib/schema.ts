@@ -26,6 +26,7 @@ export const interviewSessions = pgTable("interview_sessions", {
   status: text("status").notNull().default("created"),
   mode: text("mode").notNull().default("text"),
   ttsProvider: text("tts_provider").notNull().default("kokoro"),
+  language: text("language").notNull().default("english"),
   maxTurns: integer("max_turns").notNull().default(8),
   currentTurn: integer("current_turn").notNull().default(0),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),

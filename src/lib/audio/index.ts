@@ -26,9 +26,12 @@ export {
   synthesizeSpeechWithFallback,
   synthesizeChunkWithFallback,
   synthesizeLongText,
+  resolveVoice,
+  resolveEngineForLanguage,
   type SynthesizeResult,
   type SynthesizeLongTextOptions,
   type SynthesizeLongTextResult,
+  type InterviewLanguage,
 } from "./text-processing";
 
 /**

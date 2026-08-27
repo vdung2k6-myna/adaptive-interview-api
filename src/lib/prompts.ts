@@ -5,6 +5,7 @@ export interface PromptSession {
   id: string;
   positionId: string;
   status: string;
+  language: "english" | "vietnamese";
   maxTurns: number;
   currentTurn: number;
   position: {
@@ -40,7 +41,12 @@ function getMaxPromptTurnChars(): number {
   return Number.isNaN(parsed) || parsed <= 0 ? DEFAULT_MAX_PROMPT_TURN_CHARS : parsed;
 }
 
-function buildSystemPrompt(): string {
+function buildSystemPrompt(language: "english" | "vietnamese" = "english"): string {
+  const languageInstruction =
+    language === "vietnamese"
+      ? "- Conduct the entire interview in Vietnamese. Questions, explanations, and replies must be in Vietnamese only."
+      : "- Conduct the entire interview in English. Questions, explanations, and replies must be in English only.";
+
   return `You are an experienced technical interviewer conducting a structured interview.
 
 Rules:
@@ -51,7 +57,8 @@ Rules:
 - Keep questions relevant to the position requirements and the candidate's background.
 - Prioritize technical questions that probe the position requirements and the candidate's stated skills.
 - Ask behavioral or situational questions only as natural follow-ups to a technical answer, or after the core technical requirements have been covered.
-- You are the interviewer in this conversation.`;
+- You are the interviewer in this conversation.
+${languageInstruction}`;
 }
 
 function buildContextUserPrompt(session: PromptSession, coveredTopics: string[], remainingTopics: string[]): string {
@@ -122,7 +129,7 @@ export async function buildPrompt(
   const coveredTopics = coverage.covered.map((c) => c.content);
   const remainingTopics = coverage.remaining.map((r) => r.content);
 
-  const systemPrompt = buildSystemPrompt();
+  const systemPrompt = buildSystemPrompt(session.language);
   const contextPrompt = buildContextUserPrompt(session, coveredTopics, remainingTopics);
   const turnMessages = buildTurnMessages(messages);
   const trimmedTurns = trimTurnMessages(turnMessages, getMaxPromptTurnChars());

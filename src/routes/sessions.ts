@@ -131,13 +131,23 @@ router.get("/", async (req, res) => {
   }
 });
 
+const VALID_LANGUAGES = ["english", "vietnamese"] as const;
+type InterviewLanguage = (typeof VALID_LANGUAGES)[number];
+
+function normalizeLanguage(language: unknown): InterviewLanguage {
+  const value = typeof language === "string" ? language.toLowerCase().trim() : "";
+  return VALID_LANGUAGES.includes(value as InterviewLanguage) ? (value as InterviewLanguage) : "english";
+}
+
 router.post("/", async (req, res) => {
   try {
-    const { positionId, candidateId, mode, ttsProvider } = req.body;
+    const { positionId, candidateId, mode, ttsProvider, language } = req.body;
     if (!positionId || !candidateId) {
       res.status(400).json({ error: "positionId and candidateId are required" });
       return;
     }
+
+    const normalizedLanguage = normalizeLanguage(language);
 
     const session = await db
       .insert(interviewSessions)
@@ -146,6 +156,7 @@ router.post("/", async (req, res) => {
         candidateId,
         mode: mode || "text",
         ttsProvider: ttsProvider || "kokoro",
+        language: normalizedLanguage,
       })
       .returning();
 
