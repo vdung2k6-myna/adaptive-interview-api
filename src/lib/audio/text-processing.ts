@@ -10,7 +10,7 @@
  */
 
 import { synthesizeSpeech } from "./tts";
-import { saveAudio, detectAudioFormat } from "./storage";
+import { saveAudio, deleteAudio, detectAudioFormat } from "./storage";
 import { concatWavBuffers } from "./wav-utils";
 import { splitSentences } from "./split-sentences";
 import type { SynthesizeOptions } from "./client";
@@ -29,6 +29,8 @@ export interface SynthesizeLongTextOptions extends SynthesizeOptions {
   sessionId?: string;
   /** Filename prefix when saving (default: "speech"). */
   prefix?: string;
+  /** Optional abort signal for cancelling synthesis and cleaning up saved audio. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -644,6 +646,15 @@ export async function synthesizeChunkWithFallback(
     return [];
   }
 
+  const savedUrls: string[] = [];
+
+  const cleanupOnAbort = async () => {
+    if (savedUrls.length > 0) {
+      await Promise.all(savedUrls.map((url) => deleteAudio(url).catch(() => undefined)));
+      savedUrls.length = 0;
+    }
+  };
+
   try {
     const buffer = await synthesizeSpeech(normalizedChunk, { ...ttsOptions, signal });
     if (signal?.aborted) {
@@ -656,9 +667,17 @@ export async function synthesizeChunkWithFallback(
       `speak-chunk-${chunkIndex}`,
       fmt
     );
+    savedUrls.push(urlPath);
+
+    if (signal?.aborted) {
+      await cleanupOnAbort();
+      return [];
+    }
+
     return [{ urlPath, text: chunk }];
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
+      await cleanupOnAbort();
       return [];
     }
 
@@ -696,9 +715,17 @@ export async function synthesizeChunkWithFallback(
           depth + 1,
           signal
         );
+
+        // Track URLs returned by recursive calls so we can clean them up on abort.
+        for (const result of leftResults) {
+          if (result.urlPath) savedUrls.push(result.urlPath);
+        }
+
         if (signal?.aborted) {
+          await cleanupOnAbort();
           return [];
         }
+
         const rightResults = await synthesizeChunkWithFallback(
           right,
           ttsOptions,
@@ -768,16 +795,29 @@ export async function synthesizeLongText(
   }
 
   const buffers: Buffer[] = [];
-  for (const chunk of chunks) {
+  const concurrency = 3;
+  for (let i = 0; i < chunks.length; i += concurrency) {
     if (signal?.aborted) {
       throw new DOMException("TTS synthesis aborted", "AbortError");
     }
-    const normalizedChunk = normalizeTextForEngine(chunk, engine);
-    if (!hasSynthesizableContent(normalizedChunk)) {
-      continue;
+
+    const batch = chunks.slice(i, i + concurrency);
+    const batchBuffers = await Promise.all(
+      batch.map(async (chunk) => {
+        if (signal?.aborted) {
+          throw new DOMException("TTS synthesis aborted", "AbortError");
+        }
+        const normalizedChunk = normalizeTextForEngine(chunk, engine);
+        if (!hasSynthesizableContent(normalizedChunk)) {
+          return null;
+        }
+        return synthesizeFn(chunk, options, 0, signal);
+      })
+    );
+
+    for (const buffer of batchBuffers) {
+      if (buffer) buffers.push(buffer);
     }
-    const buffer = await synthesizeFn(chunk, options, 0, signal);
-    buffers.push(buffer);
   }
 
   if (buffers.length === 0) {
@@ -807,6 +847,12 @@ export async function synthesizeLongText(
       options.prefix || "speech",
       fmt
     );
+
+    if (signal?.aborted) {
+      await deleteAudio(urlPath).catch(() => undefined);
+      throw new DOMException("TTS synthesis aborted", "AbortError");
+    }
+
     return { buffer: combinedBuffer, urlPath, text: normalizedText };
   }
 

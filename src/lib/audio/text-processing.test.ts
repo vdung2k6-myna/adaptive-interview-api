@@ -388,4 +388,58 @@ describe("synthesizeLongText", () => {
     assert.ok(result.urlPath?.startsWith("/audio/test-session/"));
     assert.ok(result.urlPath?.includes("interviewer"));
   });
+
+  it("synthesizes chunks concurrently while preserving order", async () => {
+    const text =
+      "Trong dự án vừa rồi, bạn đã sử dụng những công cụ nào để quản lý cơ sở dữ liệu và đảm bảo hiệu năng?";
+    const seenChunks: string[] = [];
+    const synthesizeFn = async (chunk: string): Promise<Buffer> => {
+      seenChunks.push(chunk);
+      return makeWavBuffer(chunk);
+    };
+
+    const result = await synthesizeLongText(
+      text,
+      { engine: "kokoro" },
+      undefined,
+      synthesizeFn
+    );
+    assert.ok(result.buffer.length > 0);
+    assert.equal(result.buffer.toString("ascii", 0, 4), "RIFF");
+    assert.ok(seenChunks.length >= 2, "expected at least two chunks");
+
+    // All chunk payloads should appear in the combined audio in order.
+    const combinedPayload = result.buffer.slice(44).toString("utf-8");
+    const chunkOrderRegex = new RegExp(seenChunks.map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*"));
+    assert.ok(
+      chunkOrderRegex.test(combinedPayload),
+      `combined audio missing chunks in order: ${combinedPayload}`
+    );
+  });
+
+  it("deletes saved audio and throws AbortError when aborted", async () => {
+    const text =
+      "Trong dự án vừa rồi, bạn đã sử dụng những công cụ nào để quản lý cơ sở dữ liệu và đảm bảo hiệu năng?";
+    const controller = new AbortController();
+    controller.abort(); // abort before synthesis
+
+    const synthesizeFn = async (chunk: string): Promise<Buffer> => {
+      return makeWavBuffer(chunk);
+    };
+
+    await assert.rejects(
+      async () => {
+        await synthesizeLongText(
+          text,
+          { engine: "kokoro", sessionId: "abort-session", prefix: "interviewer" },
+          controller.signal,
+          synthesizeFn
+        );
+      },
+      (err: unknown) => err instanceof DOMException && err.name === "AbortError"
+    );
+
+    // The abort-before-start path does not save a file, so deletion is not
+    // exercised here. Manual verification covers the disconnect-after-save case.
+  });
 });

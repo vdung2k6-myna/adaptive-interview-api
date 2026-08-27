@@ -49,6 +49,14 @@ async function cleanupSavedAudio(urls: string[]): Promise<void> {
 
 /* ── POST /api/voice/start ──────────────────────────────────────── */
 router.post("/start", async (req, res) => {
+  const abortController = new AbortController();
+  const onDisconnect = () => {
+    if (!abortController.signal.aborted && !res.writableEnded) {
+      abortController.abort();
+    }
+  };
+  res.on("close", onDisconnect);
+
   try {
     const { sessionId } = req.body as { sessionId?: string };
 
@@ -148,14 +156,19 @@ router.post("/start", async (req, res) => {
         engine,
         sessionId,
         prefix: "interviewer",
+        signal: abortController.signal,
       });
       audioUrl = result.urlPath;
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
-        console.error("[POST /api/voice/start] TTS timed out — Audio Gateway took too long.");
-      } else {
-        console.error("[POST /api/voice/start] TTS error:", err);
+        console.log("[POST /api/voice/start] Client disconnected during TTS.");
+        return;
       }
+      console.error("[POST /api/voice/start] TTS error:", err);
+    }
+
+    if (abortController.signal.aborted || res.writableEnded) {
+      return;
     }
 
     const msgRows = await db
@@ -198,6 +211,14 @@ router.post("/start", async (req, res) => {
 
 /* ── POST /api/voice/turn ───────────────────────────────────────── */
 router.post("/turn", upload.single("audio"), async (req, res) => {
+  const abortController = new AbortController();
+  const onDisconnect = () => {
+    if (!abortController.signal.aborted && !res.writableEnded) {
+      abortController.abort();
+    }
+  };
+  res.on("close", onDisconnect);
+
   try {
     const sessionId = req.body.sessionId as string | undefined;
     const audioFile = req.file;
@@ -337,10 +358,19 @@ router.post("/turn", upload.single("audio"), async (req, res) => {
           engine,
           sessionId,
           prefix: "interviewer",
+          signal: abortController.signal,
         });
         interviewerAudioUrl = result.urlPath;
       } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") {
+          console.log("[POST /api/voice/turn] Client disconnected during completion TTS.");
+          return;
+        }
         console.error("[POST /api/voice/turn] TTS error for completion:", err);
+      }
+
+      if (abortController.signal.aborted || res.writableEnded) {
+        return;
       }
 
       const interviewerMsgRows = await db
@@ -400,14 +430,19 @@ router.post("/turn", upload.single("audio"), async (req, res) => {
         engine,
         sessionId,
         prefix: "interviewer",
+        signal: abortController.signal,
       });
       interviewerAudioUrl = result.urlPath;
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
-        console.error("[POST /api/voice/turn] TTS timed out — Audio Gateway took too long.");
-      } else {
-        console.error("[POST /api/voice/turn] TTS error:", err);
+        console.log("[POST /api/voice/turn] Client disconnected during TTS.");
+        return;
       }
+      console.error("[POST /api/voice/turn] TTS error:", err);
+    }
+
+    if (abortController.signal.aborted || res.writableEnded) {
+      return;
     }
 
     const interviewerMsgRows = await db
@@ -889,6 +924,12 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
           interviewerAudioUrl = urlPath;
           combinedFormat = fmt;
         }
+
+        // Combined file is now the canonical audio; temporary chunk files are no longer needed.
+        if (savedUrls.length > 0) {
+          await cleanupSavedAudio(savedUrls).catch(() => undefined);
+          savedUrls.length = 0;
+        }
       } catch (err) {
         console.error("[POST /api/voice/stream] Audio concat error:", err);
       }
@@ -938,6 +979,14 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
 
 /* ── POST /api/voice/speak ──────────────────────────────────────── */
 router.post("/speak", async (req, res) => {
+  const abortController = new AbortController();
+  const onDisconnect = () => {
+    if (!abortController.signal.aborted && !res.writableEnded) {
+      abortController.abort();
+    }
+  };
+  res.on("close", onDisconnect);
+
   try {
     const { text, voice, engine } = req.body as {
       text?: string;
@@ -950,13 +999,26 @@ router.post("/speak", async (req, res) => {
       return;
     }
 
-    const result = await synthesizeLongText(text, { engine, voice });
+    const result = await synthesizeLongText(text, {
+      engine,
+      voice,
+      signal: abortController.signal,
+    });
+
+    if (abortController.signal.aborted || res.writableEnded) {
+      return;
+    }
+
     const audioBuffer = result.buffer;
 
     res.setHeader("Content-Type", "audio/wav");
     res.setHeader("Content-Length", String(audioBuffer.length));
     res.send(audioBuffer);
   } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      console.log("[POST /api/voice/speak] Client disconnected during TTS.");
+      return;
+    }
     console.error("[POST /api/voice/speak] error:", err);
     res.status(500).json({ error: err instanceof Error ? err.message : "TTS failed" });
   }
@@ -1056,6 +1118,15 @@ router.post("/speak-stream", async (req, res) => {
 
     sendSseEvent(res, "done", {});
     res.end();
+
+    // Clean up temporary chunk files after a grace period so slow clients can
+    // finish fetching the last chunk.
+    if (savedUrls.length > 0) {
+      const urlsToClean = [...savedUrls];
+      setTimeout(() => {
+        cleanupSavedAudio(urlsToClean).catch(() => undefined);
+      }, 30_000);
+    }
   } catch (err) {
     console.error("[POST /api/voice/speak-stream] error:", err);
     await cleanupSavedAudio(savedUrls);
