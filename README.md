@@ -9,6 +9,10 @@ Extracted from the Next.js monolith as part of Pattern B separation.
 - [Setup Guide](docs/SETUP.md)
 - [API Reference](docs/API.md)
 - [Architecture](docs/ARCHITECTURE.md)
+- [Database Guide](docs/DATABASE.md)
+- [Evaluation System](docs/EVALUATION.md)
+- [Ollama Integration](docs/OLLAMA.md)
+- [Performance Notes](docs/PERFORMANCE.md)
 - [Frontend repo](https://github.com/vdung2k6-myna/adaptive-interview)
 
 ## Route Overview
@@ -61,6 +65,10 @@ curl http://localhost:4000/health
 | `DEFAULT_TTS_ENGINE` | No | `kokoro` or `piper` (default: `kokoro`) |
 | `DEFAULT_VOICE` | No | Voice ID (default: `default_voice`) |
 | `EMBEDDING_SIMILARITY_THRESHOLD` | No | Default: `0.75` |
+| `KOKORO_VOICE_ENGLISH` | No | Kokoro voice for English sessions (e.g. `af_heart`) |
+| `KOKORO_VOICE_VIETNAMESE` | No | Kokoro voice for Vietnamese sessions |
+| `PIPER_VOICE_ENGLISH` | No | Piper voice for English sessions (e.g. `en_US-lessac-medium`) |
+| `PIPER_VOICE_VIETNAMESE` | No | Piper voice for Vietnamese sessions |
 
 ## Testing with curl
 
