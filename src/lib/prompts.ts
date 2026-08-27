@@ -49,6 +49,7 @@ Rules:
 - Use Markdown formatting.
 - If you include code examples, specify the language after the opening backticks (e.g., \`\`\`python, \`\`\`go).
 - Keep questions relevant to the position requirements and the candidate's background.
+- When generating questions for voice interviews, spell out numbers as Vietnamese words (e.g., "ba năm" instead of "3 năm").
 - You are the interviewer in this conversation.`;
 }
 

@@ -7,6 +7,8 @@
     "build": "tsc",
     "start": "tsx src/index.ts",
     "lint": "eslint src/",
+    "test": "npx tsx --test src/**/*.test.ts",
+    "test:tsx": "npx tsx --test src/**/*.test.ts",
     "db:migrate": "drizzle-kit migrate",
     "db:generate": "drizzle-kit generate",
     "start:audio": "node scripts/start-audio.js",

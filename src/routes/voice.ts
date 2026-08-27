@@ -8,7 +8,6 @@ import { generateChatResponse, generateChatResponseStream } from "@/lib/ollama";
 import { OllamaError } from "@/lib/errors";
 import {
   transcribeAudio,
-  synthesizeSpeech,
   saveAudio,
   deleteAudio,
   detectAudioFormat,
@@ -17,6 +16,7 @@ import {
   splitForTTS,
   synthesizeSpeechWithFallback,
   synthesizeChunkWithFallback,
+  synthesizeLongText,
   concatWavBuffers,
   type SynthesizeOptions,
   type SynthesizeResult,
@@ -31,6 +31,9 @@ function sendSseEvent(res: Response, event: string, data: unknown) {
   try {
     const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
     res.write(payload);
+    // Flush through any compression/buffering middleware so the client receives
+    // events as soon as they are produced, rather than batched at the end.
+    (res as Response & { flush?: () => void }).flush?.();
   } catch {
     // Client may have disconnected
   }
@@ -140,12 +143,13 @@ router.post("/start", async (req, res) => {
 
     let audioUrl: string | undefined;
     try {
-      const ttsOptions: SynthesizeOptions = {
-        engine: (session.ttsProvider as "kokoro" | "piper") || "kokoro",
-      };
-      const ttsBuffer = await synthesizeSpeech(questionText, ttsOptions);
-      const { urlPath } = await saveAudio(sessionId, ttsBuffer, "interviewer", "wav");
-      audioUrl = urlPath;
+      const engine = (session.ttsProvider as "kokoro" | "piper") || "kokoro";
+      const result = await synthesizeLongText(questionText, {
+        engine,
+        sessionId,
+        prefix: "interviewer",
+      });
+      audioUrl = result.urlPath;
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
         console.error("[POST /api/voice/start] TTS timed out — Audio Gateway took too long.");
@@ -328,12 +332,13 @@ router.post("/turn", upload.single("audio"), async (req, res) => {
 
       let interviewerAudioUrl: string | undefined;
       try {
-        const ttsOptions: SynthesizeOptions = {
-          engine: (session.ttsProvider as "kokoro" | "piper") || "kokoro",
-        };
-        const ttsBuffer = await synthesizeSpeech(completionText, ttsOptions);
-        const { urlPath } = await saveAudio(sessionId, ttsBuffer, "interviewer", "wav");
-        interviewerAudioUrl = urlPath;
+        const engine = (session.ttsProvider as "kokoro" | "piper") || "kokoro";
+        const result = await synthesizeLongText(completionText, {
+          engine,
+          sessionId,
+          prefix: "interviewer",
+        });
+        interviewerAudioUrl = result.urlPath;
       } catch (err) {
         console.error("[POST /api/voice/turn] TTS error for completion:", err);
       }
@@ -390,12 +395,13 @@ router.post("/turn", upload.single("audio"), async (req, res) => {
 
     let interviewerAudioUrl: string | undefined;
     try {
-      const ttsOptions: SynthesizeOptions = {
-        engine: (session.ttsProvider as "kokoro" | "piper") || "kokoro",
-      };
-      const ttsBuffer = await synthesizeSpeech(questionText, ttsOptions);
-      const { urlPath } = await saveAudio(sessionId, ttsBuffer, "interviewer", "wav");
-      interviewerAudioUrl = urlPath;
+      const engine = (session.ttsProvider as "kokoro" | "piper") || "kokoro";
+      const result = await synthesizeLongText(questionText, {
+        engine,
+        sessionId,
+        prefix: "interviewer",
+      });
+      interviewerAudioUrl = result.urlPath;
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
         console.error("[POST /api/voice/turn] TTS timed out — Audio Gateway took too long.");
@@ -944,8 +950,8 @@ router.post("/speak", async (req, res) => {
       return;
     }
 
-    const cleanText = stripMarkdown(text);
-    const audioBuffer = await synthesizeSpeech(cleanText, { engine, voice });
+    const result = await synthesizeLongText(text, { engine, voice });
+    const audioBuffer = result.buffer;
 
     res.setHeader("Content-Type", "audio/wav");
     res.setHeader("Content-Length", String(audioBuffer.length));

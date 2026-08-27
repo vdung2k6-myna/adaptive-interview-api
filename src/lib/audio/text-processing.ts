@@ -3,6 +3,7 @@
  *
  * Provides:
  * - stripMarkdown: Remove markdown formatting for clean TTS input
+ * - normalizeNumbersForKokoro: Convert Arabic numerals to Vietnamese words
  * - splitForTTS: Split long text into phoneme-safe chunks
  * - synthesizeSpeechWithFallback: Recursive retry on phoneme overflow
  * - synthesizeChunkWithFallback: Wrapper that saves audio after synthesis
@@ -11,10 +12,32 @@
 import { synthesizeSpeech } from "./tts";
 import { saveAudio, detectAudioFormat } from "./storage";
 import { concatWavBuffers } from "./wav-utils";
+import { splitSentences } from "./split-sentences";
 import type { SynthesizeOptions } from "./client";
 
 export interface SynthesizeResult {
   urlPath: string;
+  text: string;
+}
+
+/**
+ * Options for synthesizing long text into a single combined audio clip.
+ * Extends the standard TTS options with optional session/prefix for saving.
+ */
+export interface SynthesizeLongTextOptions extends SynthesizeOptions {
+  /** Session identifier used when saving the combined audio file. */
+  sessionId?: string;
+  /** Filename prefix when saving (default: "speech"). */
+  prefix?: string;
+}
+
+/**
+ * Result of synthesizing long text: the combined audio buffer and, when a
+ * sessionId was provided, the URL path where it was saved.
+ */
+export interface SynthesizeLongTextResult {
+  buffer: Buffer;
+  urlPath?: string;
   text: string;
 }
 
@@ -76,6 +99,288 @@ export function stripMarkdown(text: string): string {
   );
 }
 
+// ── Vietnamese number normalization ─────────────────────────────────────
+
+const DIGITS = ["không", "một", "hai", "ba", "bốn", "năm", "sáu", "bảy", "tám", "chín"];
+
+/**
+ * Convert a number in the range 0..999 into Vietnamese words.
+ */
+function readThreeDigits(n: number, pad = false): string {
+  if (n === 0 && !pad) return "";
+
+  const hundreds = Math.floor(n / 100);
+  const remainder = n % 100;
+  const tens = Math.floor(remainder / 10);
+  const ones = remainder % 10;
+
+  const parts: string[] = [];
+  if (hundreds > 0) {
+    parts.push(DIGITS[hundreds], "trăm");
+  } else if (pad) {
+    parts.push("không", "trăm");
+  }
+
+  if (remainder > 0) {
+    if ((hundreds > 0 || pad) && tens === 0 && ones > 0) {
+      parts.push("linh");
+    }
+
+    if (tens > 1) {
+      parts.push(DIGITS[tens], "mươi");
+      if (ones === 1) {
+        parts.push("mốt");
+      } else if (ones === 4) {
+        parts.push("tư");
+      } else if (ones === 5) {
+        parts.push("lăm");
+      } else if (ones > 0) {
+        parts.push(DIGITS[ones]);
+      }
+    } else if (tens === 1) {
+      parts.push("mười");
+      if (ones === 5) {
+        parts.push("lăm");
+      } else if (ones > 0) {
+        parts.push(DIGITS[ones]);
+      }
+    } else if (tens === 0 && ones > 0) {
+      parts.push(DIGITS[ones]);
+    }
+  }
+
+  return parts.join(" ");
+}
+
+/**
+ * Convert a non-negative integer (0..999,999,999,999) to Vietnamese words.
+ *
+ * @param n A non-negative integer.
+ * @returns The Vietnamese reading of the number.
+ * @throws RangeError if n is negative, non-integer, or exceeds 999,999,999,999.
+ */
+export function numberToVietnameseWords(n: number): string {
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+    throw new RangeError(`numberToVietnameseWords expects a non-negative integer, got ${n}`);
+  }
+  if (n > 999_999_999_999) {
+    throw new RangeError("numberToVietnameseWords supports numbers up to 999,999,999,999");
+  }
+
+  if (n === 0) return "không";
+
+  const chunks: number[] = [];
+  let remaining = n;
+  while (remaining > 0) {
+    chunks.push(remaining % 1000);
+    remaining = Math.floor(remaining / 1000);
+  }
+
+  const scales = ["", "nghìn", "triệu", "tỷ"];
+
+  const parts: string[] = [];
+  for (let i = chunks.length - 1; i >= 0; i--) {
+    const chunk = chunks[i];
+    if (chunk === 0) continue;
+
+    // Non-highest chunks that are < 100 need a leading "không trăm" so the
+    // missing hundreds place is pronounced (e.g., 1,005 → "một nghìn không
+    // trăm linh năm").
+    const isMostSignificant = i === chunks.length - 1;
+    const chunkWords = readThreeDigits(chunk, !isMostSignificant && chunk < 100);
+    if (chunkWords) {
+      parts.push(chunkWords);
+      if (scales[i]) {
+        parts.push(scales[i]);
+      }
+    }
+  }
+
+  return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Convert a sequence of digits into Vietnamese digit-by-digit words.
+ * Used for codes, version segments, and other cases where reading the value
+ * would be unnatural (e.g., "0909" should not become "chín trăm linh chín").
+ */
+function digitsToWords(text: string): string {
+  return text
+    .split("")
+    .map((ch) => DIGITS[parseInt(ch, 10)])
+    .join(" ");
+}
+
+/**
+ * Heuristic: should this digit sequence be read as a number value rather than
+ * digit-by-digit? True for short natural numbers; false for long sequences
+ * that look like phone numbers, codes, or version segments.
+ */
+function shouldReadAsValue(digits: string): boolean {
+  // 1-4 digit numbers are read as values (covers years, experience, simple counts).
+  // 5+ digit sequences are read as individual digits (phone, postal codes, etc.).
+  return digits.length >= 1 && digits.length <= 4;
+}
+
+/**
+ * Convert a percentage like "50%" to Vietnamese words.
+ */
+function normalizePercentage(match: string): string {
+  const digits = match.slice(0, -1); // remove trailing %
+  if (!/^\d+$/.test(digits)) return match;
+  return `${numberToVietnameseWords(parseInt(digits, 10))} phần trăm`;
+}
+
+/**
+ * Convert a simple decimal like "3.14" to Vietnamese words.
+ */
+function normalizeDecimal(match: string): string {
+  const [whole, fraction] = match.split(".");
+  if (!/^\d+$/.test(whole) || !/^\d+$/.test(fraction)) return match;
+  const wholeWords = numberToVietnameseWords(parseInt(whole, 10));
+  const fractionWords = digitsToWords(fraction);
+  return `${wholeWords} phẩy ${fractionWords}`;
+}
+
+/**
+ * Convert a standalone integer to Vietnamese words if it is short enough to read
+ * naturally; otherwise read it digit-by-digit.
+ */
+function normalizeInteger(digits: string): string {
+  if (shouldReadAsValue(digits)) {
+    return numberToVietnameseWords(parseInt(digits, 10));
+  }
+  return digitsToWords(digits);
+}
+
+// Matches a dotted version or IP-like sequence (e.g., v1.2.3, 192.168.1.1).
+const VERSION_OR_IP_RE = /\b[a-zA-Z]*\d+(?:\.\d+){2,}\b/g;
+
+// Matches Vietnamese phone numbers (10-11 digits starting with 0).
+const PHONE_RE = /\b0\d{9,10}\b/g;
+
+// Vietnamese letters with diacritics and tone marks.
+const VIETNAMESE_CHAR_RE = /[àáảãạâầấẩẫậăằắẳẵặđèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵ]/i;
+
+/**
+ * Return true if the text contains Vietnamese-specific characters.
+ * Used as a lightweight language heuristic: if the text has no Vietnamese
+ * diacritics, we assume it is English or another language and skip number
+ * normalization so digits are not read as Vietnamese words.
+ */
+function isVietnameseText(text: string): boolean {
+  return VIETNAMESE_CHAR_RE.test(text);
+}
+
+/**
+ * Convert Arabic numerals in text to Vietnamese words, suitable for the
+ * Vietnamese Kokoro TTS engine.
+ *
+ * Rules:
+ * - Only runs when the text appears to be Vietnamese (contains diacritics).
+ * - Standalone integers 1-4 digits are read as natural numbers (e.g., 3 → ba).
+ * - Longer digit sequences are read digit-by-digit.
+ * - Percentages (50%) are expanded.
+ * - Simple decimals (3.14) are expanded.
+ * - Dotted version/IP-like strings and phone numbers are left untouched.
+ */
+export function normalizeNumbersForKokoro(text: string): string {
+  if (!text || !isVietnameseText(text)) return text;
+
+  // Protect dotted version/IP-like sequences and phone numbers by masking them.
+  const protectedRanges: Array<{ start: number; end: number }> = [];
+  for (const re of [VERSION_OR_IP_RE, PHONE_RE]) {
+    for (const match of text.matchAll(re)) {
+      protectedRanges.push({ start: match.index!, end: match.index! + match[0].length });
+    }
+  }
+
+  function isProtected(start: number, end: number): boolean {
+    return protectedRanges.some((r) => start < r.end && end > r.start);
+  }
+
+  // Percentages first (must match before standalone integers).
+  text = text.replace(/\d+%/g, (match, offset) => {
+    if (isProtected(offset, offset + match.length)) return match;
+    return normalizePercentage(match);
+  });
+
+  // Decimals next.
+  text = text.replace(/\d+\.\d+/g, (match, offset) => {
+    if (isProtected(offset, offset + match.length)) return match;
+    return normalizeDecimal(match);
+  });
+
+  // Standalone integers last.
+  text = text.replace(/\d+/g, (match, offset) => {
+    if (isProtected(offset, offset + match.length)) return match;
+    return normalizeInteger(match);
+  });
+
+  return text;
+}
+
+/**
+ * Apply engine-specific text normalization.
+ *
+ * Kokoro (Vietnamese) needs Arabic numerals converted to words so the model can
+ * pronounce them. Piper and other engines receive the original text unchanged.
+ */
+export function normalizeTextForEngine(text: string, engine?: string): string {
+  const normalized = stripMarkdown(text);
+  if ((engine ?? "kokoro") === "kokoro") {
+    return normalizeNumbersForKokoro(normalized);
+  }
+  return normalized;
+}
+
+/**
+ * Vietnamese words that commonly start a new clause/phrase. Splitting before
+ * them usually sounds natural (e.g., "cho", "với", "nào").
+ */
+const VIETNAMESE_PHRASE_STARTERS = new Set([
+  "nào", "để", "và", "hoặc", "nhưng", "vì", "với", "trong", "tại", "bởi",
+  "khi", "nếu", "cho", "theo", "từ", "đến", "qua", "về", "dưới", "trên",
+  "ngoài", "giữa", "sau", "trước", "bên",
+]);
+
+/**
+ * Two-word Vietnamese phrases that strongly indicate a natural clause break.
+ * These get a higher bonus than single-word starters.
+ */
+const VIETNAMESE_PHRASE_PAIRS = new Set([
+  "cụ thể",
+  "ví dụ",
+  "bởi vì",
+  "mặc dù",
+  "tuy nhiên",
+  "do đó",
+  "vì vậy",
+  "ngoài ra",
+  "trong khi",
+  "khi mà",
+  "nếu như",
+  "sau khi",
+  "trước khi",
+]);
+
+const WORD_RE =
+  /^[a-zA-Zàáảãạâầấẩẫậăằắẳẵặđèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵ]+/i;
+
+/**
+ * Return the first two whitespace-delimited tokens that follow the given index,
+ * lowercased. Used to detect Vietnamese phrase-pair boundaries.
+ */
+function nextTwoWords(text: string, index: number): [string, string] {
+  let tail = text.slice(index + 1).trimStart();
+  const firstMatch = tail.match(WORD_RE);
+  const first = firstMatch ? firstMatch[0].toLowerCase() : "";
+  tail = tail.slice(first.length).trimStart();
+  const secondMatch = tail.match(WORD_RE);
+  const second = secondMatch ? secondMatch[0].toLowerCase() : "";
+  return [first, second];
+}
+
 /**
  * Split a long sentence into smaller chunks safe for TTS engines.
  *
@@ -83,15 +388,17 @@ export function stripMarkdown(text: string): string {
  * ~6 phonemes/char, so a safe chunk size is ~60 characters to leave headroom.
  *
  * Boundary preference (strongest first):
- * 1. Colons and semicolons — natural clause boundaries
- * 2. Commas — phrase boundaries
- * 3. Spaces — word boundaries
- * 4. Hard split at maxChars — last resort
+ * 1. Vietnamese two-word phrase boundaries (e.g., "cụ thể")
+ * 2. Colons and semicolons — natural clause boundaries
+ * 3. Commas — phrase boundaries
+ * 4. Vietnamese single phrase-start words (e.g., "cho", "với") — clause boundaries
+ * 5. Spaces — word boundaries
+ * 6. Hard split at maxChars — last resort
  *
- * The algorithm scores every boundary in the search range and picks the one
- * closest to maxChars, with only a small bonus for stronger boundaries. This
- * prevents a colon at position 5 from producing a 5-char fragment when a
- * space at position 58 would give a much more natural chunk.
+ * The algorithm balances distance from the ideal maxChars with boundary
+ * strength. Stronger boundaries (especially two-word phrase pairs) can win
+ * even when significantly earlier, which prevents unnatural splits like
+ * separating a number from its noun ("cho 5" / "người lớn tuổi").
  *
  * @param text The text to split.
  * @param maxChars Maximum characters per chunk (default: 60).
@@ -101,26 +408,52 @@ export function splitForTTS(text: string, maxChars = 60): string[] {
   if (text.length <= maxChars) return [text];
   const chunks: string[] = [];
   let remaining = text.trim();
-  const minChunkSize = Math.max(20, Math.floor(maxChars / 3));
+
+  // Hard floor: never produce chunks shorter than 10 chars.
+  // Soft floor: weak boundaries (plain spaces) should stay above ~maxChars/3.
+  const hardMin = 10;
+  const softMin = Math.max(20, Math.floor(maxChars / 3));
 
   while (remaining.length > maxChars) {
     let bestAt = -1;
-    let bestScore = -1;
+    let bestScore = -Infinity;
 
-    // Single backward pass: score every boundary in the preferred range
-    for (let i = maxChars; i >= minChunkSize; i--) {
+    // Search backward from maxChars for the best boundary.
+    for (let i = maxChars; i >= hardMin; i--) {
       const ch = remaining[i];
-      let score = i;
+      if (ch !== " " && ch !== ":" && ch !== ";" && ch !== ",") continue;
 
-      if (ch === ":" || ch === ";") {
-        score += 15; // small bonus for strong boundary
+      const [next, nextNext] = nextTwoWords(remaining, i);
+      const phrasePair = `${next} ${nextNext}`;
+      const isPhrasePair = VIETNAMESE_PHRASE_PAIRS.has(phrasePair);
+      const startsPhrase = VIETNAMESE_PHRASE_STARTERS.has(next);
+      const nextIsDigit = /^\d/.test(remaining.slice(i + 1).trimStart());
+
+      // Strong boundaries (punctuation + two-word phrases) may extend below the
+      // soft minimum; single-word starters and spaces stay above it.
+      const isStrongBoundary =
+        ch === ":" || ch === ";" || ch === "," || isPhrasePair;
+      if (i < softMin && !isStrongBoundary) continue;
+
+      let score = 0;
+      if (isPhrasePair) {
+        score += 130; // strongest Vietnamese clause boundary
+      } else if (ch === ":" || ch === ";") {
+        score += 100;
       } else if (ch === ",") {
-        score += 8; // smaller bonus for comma
+        score += 80;
+      } else if (startsPhrase) {
+        score += 65;
       } else if (ch === " ") {
-        score += 0; // no bonus for space
-      } else {
-        continue; // not a boundary
+        score += 10;
       }
+
+      // Avoid splitting right before a number or quantifier.
+      if (nextIsDigit) score -= 60;
+
+      // Prefer boundaries close to the target length, but with a modest
+      // penalty so earlier strong boundaries can still win.
+      score -= Math.abs(i - maxChars) * 0.3;
 
       if (score > bestScore) {
         bestScore = score;
@@ -130,17 +463,21 @@ export function splitForTTS(text: string, maxChars = 60): string[] {
 
     let splitAt = bestAt;
 
-    // Fallback: if no boundary in preferred range, search all the way to start
+    // Fallback: if no boundary scored above the floor, search all the way to
+    // the start for any space (but still avoid splitting before digits).
     if (splitAt === -1) {
-      for (let i = minChunkSize; i >= 0; i--) {
-        if (remaining[i] === " ") {
+      for (let i = softMin; i >= 0; i--) {
+        if (
+          remaining[i] === " " &&
+          !/^\d/.test(remaining.slice(i + 1).trimStart())
+        ) {
           splitAt = i;
           break;
         }
       }
     }
 
-    // Last resort: hard split at maxChars
+    // Last resort: hard split at maxChars.
     if (splitAt === -1) {
       splitAt = maxChars;
     }
@@ -188,13 +525,16 @@ export async function synthesizeSpeechWithFallback(
     );
   }
 
+  const engine = ttsOptions.engine ?? "kokoro";
+  const normalizedText = normalizeTextForEngine(text, engine);
+
   // Skip pure punctuation / whitespace chunks silently.
-  if (!hasSynthesizableContent(text)) {
-    throw new Error(`No synthesizable content: "${text.slice(0, 30)}"`);
+  if (!hasSynthesizableContent(normalizedText)) {
+    throw new Error(`No synthesizable content: "${normalizedText.slice(0, 30)}"`);
   }
 
   try {
-    return await synthesizeSpeech(text, { ...ttsOptions, signal });
+    return await synthesizeSpeech(normalizedText, { ...ttsOptions, signal });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
 
@@ -206,22 +546,22 @@ export async function synthesizeSpeechWithFallback(
       msg.includes("Piper produced no audio data") ||
       msg.includes("Phoneme chunk too long");
 
-    if (isPhonemeError && text.length > 15) {
+    if (isPhonemeError && normalizedText.length > 15) {
       console.warn(
-        `[synthesizeSpeechWithFallback] Retrying split for chunk "${text.slice(0, 40)}..." (depth=${depth})`
+        `[synthesizeSpeechWithFallback] Retrying split for chunk "${normalizedText.slice(0, 40)}..." (depth=${depth})`
       );
 
-      const mid = Math.floor(text.length / 2);
+      const mid = Math.floor(normalizedText.length / 2);
       let splitAt = mid;
       for (let i = mid; i >= mid - 10 && i >= 0; i--) {
-        if (text[i] === " ") {
+        if (normalizedText[i] === " ") {
           splitAt = i;
           break;
         }
       }
 
-      const left = text.slice(0, splitAt).trim();
-      const right = text.slice(splitAt).trim();
+      const left = normalizedText.slice(0, splitAt).trim();
+      const right = normalizedText.slice(splitAt).trim();
 
       if (left && right) {
         if (signal?.aborted) {
@@ -291,9 +631,12 @@ export async function synthesizeChunkWithFallback(
     return [];
   }
 
+  const engine = ttsOptions.engine ?? "kokoro";
+  const normalizedChunk = normalizeTextForEngine(chunk, engine);
+
   // Skip pure punctuation / whitespace chunks silently — TTS engines
   // cannot synthesize them and will return "produced no audio data".
-  if (!hasSynthesizableContent(chunk)) {
+  if (!hasSynthesizableContent(normalizedChunk)) {
     return [];
   }
 
@@ -302,7 +645,7 @@ export async function synthesizeChunkWithFallback(
   }
 
   try {
-    const buffer = await synthesizeSpeech(chunk, { ...ttsOptions, signal });
+    const buffer = await synthesizeSpeech(normalizedChunk, { ...ttsOptions, signal });
     if (signal?.aborted) {
       return [];
     }
@@ -324,22 +667,22 @@ export async function synthesizeChunkWithFallback(
       msg.includes("Piper produced no audio data") ||
       msg.includes("Phoneme chunk too long");
 
-    if (isPhonemeError && chunk.length > 15) {
+    if (isPhonemeError && normalizedChunk.length > 15) {
       console.warn(
-        `[synthesizeChunkWithFallback] Retrying split for chunk "${chunk.slice(0, 40)}..." (depth=${depth})`
+        `[synthesizeChunkWithFallback] Retrying split for chunk "${normalizedChunk.slice(0, 40)}..." (depth=${depth})`
       );
 
-      const mid = Math.floor(chunk.length / 2);
+      const mid = Math.floor(normalizedChunk.length / 2);
       let splitAt = mid;
       for (let i = mid; i >= mid - 10 && i >= 0; i--) {
-        if (chunk[i] === " ") {
+        if (normalizedChunk[i] === " ") {
           splitAt = i;
           break;
         }
       }
 
-      const left = chunk.slice(0, splitAt).trim();
-      const right = chunk.slice(splitAt).trim();
+      const left = normalizedChunk.slice(0, splitAt).trim();
+      const right = normalizedChunk.slice(splitAt).trim();
 
       if (left && right) {
         if (signal?.aborted) {
@@ -369,7 +712,103 @@ export async function synthesizeChunkWithFallback(
     }
 
     // Short chunks that still fail, or non-phoneme errors — log once
-    console.warn(`[synthesizeChunkWithFallback] TTS failed (len=${chunk.length}): ${msg}`);
+    console.warn(`[synthesizeChunkWithFallback] TTS failed (len=${normalizedChunk.length}): ${msg}`);
     return [];
   }
+}
+
+/**
+ * Synthesize long text into a single combined audio buffer.
+ *
+ * Normalizes the text, splits it into phoneme-safe chunks, synthesizes each
+ * chunk with recursive fallback, and concatenates the resulting WAV buffers.
+ * If a sessionId is provided, the combined buffer is saved to disk and the
+ * URL path is returned.
+ *
+ * This is the shared implementation used by the non-streaming voice routes
+ * (`/start`, `/turn`, `/speak`) so they are resilient to long Vietnamese
+ * prompts after number normalization.
+ *
+ * @param text The text to synthesize.
+ * @param options Engine, voice, optional session/prefix, and abort signal.
+ * @param signal Optional abort signal for cancellation.
+ * @param synthesizeFn Injectable synthesizer for testing (default: synthesizeSpeechWithFallback).
+ * @returns Combined audio buffer and optional saved URL path.
+ */
+export async function synthesizeLongText(
+  text: string,
+  options: SynthesizeLongTextOptions,
+  signal?: AbortSignal,
+  synthesizeFn: (
+    text: string,
+    options: SynthesizeOptions,
+    depth?: number,
+    signal?: AbortSignal
+  ) => Promise<Buffer> = synthesizeSpeechWithFallback
+): Promise<SynthesizeLongTextResult> {
+  const engine = options.engine ?? "kokoro";
+  const normalizedText = normalizeTextForEngine(text, engine);
+
+  if (!hasSynthesizableContent(normalizedText)) {
+    throw new Error(`No synthesizable content: "${normalizedText.slice(0, 30)}"`);
+  }
+
+  const sentences = splitSentences(normalizedText);
+  const chunks: string[] = [];
+  for (const sentence of sentences) {
+    if (hasSynthesizableContent(sentence)) {
+      chunks.push(...splitForTTS(sentence));
+    }
+  }
+
+  if (chunks.length === 0) {
+    throw new Error(
+      `No synthesizable content after splitting: "${normalizedText.slice(0, 30)}"`
+    );
+  }
+
+  const buffers: Buffer[] = [];
+  for (const chunk of chunks) {
+    if (signal?.aborted) {
+      throw new DOMException("TTS synthesis aborted", "AbortError");
+    }
+    const normalizedChunk = normalizeTextForEngine(chunk, engine);
+    if (!hasSynthesizableContent(normalizedChunk)) {
+      continue;
+    }
+    const buffer = await synthesizeFn(chunk, options, 0, signal);
+    buffers.push(buffer);
+  }
+
+  if (buffers.length === 0) {
+    throw new Error("No audio was produced for any chunk");
+  }
+
+  const allWav = buffers.every(
+    (b) => b.length >= 4 && b.toString("ascii", 0, 4) === "RIFF"
+  );
+
+  let combinedBuffer: Buffer;
+  let fmt: string;
+  if (allWav) {
+    combinedBuffer =
+      buffers.length === 1 ? buffers[0] : concatWavBuffers(buffers);
+    fmt = "wav";
+  } else {
+    // Non-WAV formats cannot be concatenated; keep the first chunk.
+    combinedBuffer = buffers[0];
+    fmt = detectAudioFormat(combinedBuffer);
+  }
+
+  if (options.sessionId) {
+    const { urlPath } = await saveAudio(
+      options.sessionId,
+      combinedBuffer,
+      options.prefix || "speech",
+      fmt
+    );
+    return { buffer: combinedBuffer, urlPath, text: normalizedText };
+  }
+
+  return { buffer: combinedBuffer, text: normalizedText };
 }

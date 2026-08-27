@@ -20,10 +20,15 @@ export { splitSentences, extractNewSentences } from "./split-sentences";
 export { concatWavBuffers, isValidWav } from "./wav-utils";
 export {
   stripMarkdown,
+  normalizeNumbersForKokoro,
+  normalizeTextForEngine,
   splitForTTS,
   synthesizeSpeechWithFallback,
   synthesizeChunkWithFallback,
+  synthesizeLongText,
   type SynthesizeResult,
+  type SynthesizeLongTextOptions,
+  type SynthesizeLongTextResult,
 } from "./text-processing";
 
 /**

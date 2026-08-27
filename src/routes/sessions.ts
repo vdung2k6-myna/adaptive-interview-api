@@ -2,7 +2,7 @@ import { Router } from "express";
 import { db } from "@/lib/db";
 import { interviewSessions, candidates, positions, messages, evaluationVersions, evaluationJobs } from "@/lib/schema";
 import { eq, desc, sql } from "drizzle-orm";
-import { generateEvaluation, runEvaluationInBackground } from "@/lib/evaluation";
+import { runEvaluationInBackground } from "@/lib/evaluation";
 import { OllamaError } from "@/lib/errors";
 
 const router = Router();

@@ -68,7 +68,7 @@ The `adaptive-interview-api` is a standalone Express server that provides all da
 - `ollama.ts`: chat, embeddings, streaming helpers
 - `evaluation.ts`: builds evaluation prompts and parses structured JSON responses
 - `embeddings.ts`: stores requirement/message embeddings and runs cosine similarity
-- `audio/*.ts`: STT/TTS clients, text preprocessing, WAV utilities, audio gateway calls
+- `audio/*.ts`: STT/TTS clients, text preprocessing (markdown stripping + Kokoro number normalization), WAV utilities, audio gateway calls, and `synthesizeLongText` for combining multiple phoneme-safe chunks into a single audio file
 - `position-queries.ts`: small helpers for position lookups
 
 ### Data Access (`src/lib/db.ts`, `src/lib/schema.ts`)
@@ -105,7 +105,7 @@ src/
 │       ├── client.ts     # audio.cpp + Audio Gateway HTTP clients
 │       ├── stt.ts        # Speech-to-text wrapper
 │       ├── tts.ts        # Text-to-speech wrapper
-│       ├── text-processing.ts  # Markdown strip + chunking
+│       ├── text-processing.ts  # Markdown strip + number normalization + chunking
 │       ├── split-sentences.ts    # Sentence boundary detection
 │       ├── wav-utils.ts          # WAV header parse + concat
 │       ├── sentence-queue.ts     # Server-side audio queue logic
