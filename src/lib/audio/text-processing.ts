@@ -56,28 +56,56 @@ function hasSynthesizableContent(text: string): boolean {
  * Strip markdown formatting markers from text before TTS.
  *
  * Handles:
- * - Fenced code blocks (```...```) → "code example"
+ * - Fenced code blocks (```...```) → code content (language tag removed)
  * - Inline code (`code`) → code (backticks removed, content kept)
  * - Bold (**text**) → text
  * - Underline (__text__) → text
  * - Italic (*text*) → text
  * - Italic (_text_) → text
+ * - Strikethrough (~~text~~) → text
  * - Headers (# Title) → Title
  * - Blockquotes (> text) → text
  * - List items (- item, * item, 1. item) → item
+ * - Links ([text](url)) → text
+ * - Images (![alt](url)) → alt text
+ * - Horizontal rules (---, ***, ___) → removed
+ * - Stray backticks from malformed inline code → removed
  */
 export function stripMarkdown(text: string): string {
   return (
     text
-      // Fenced code blocks: replace entire block with placeholder
-      .replace(/```[\s\S]*?```/g, " code example ")
+      // Fenced code blocks: keep code content, remove fence and optional language tag.
+      // The LLM sometimes emits CRLF or literal "\n" after the language tag instead of
+      // a plain newline (e.g., ```markdown\r\nWhat is...? or ```markdown\nWhat is...?).
+      // Accept all common forms and unescape any remaining "\r", "\n", "\t" literals
+      // inside the captured code so they do not get spoken.
+      .replace(
+        /```(?:[a-zA-Z0-9_+-]*(?:\r\n|\n|\\r\\n|\\n))?([\s\S]*?)```/g,
+        (_, code: string) =>
+          code
+            .replace(/\r/g, " ")
+            .replace(/\\r/g, " ")
+            .replace(/\\n/g, " ")
+            .replace(/\\t/g, " ")
+            .trimStart()
+      )
+      // Horizontal rules (their own line). Run before inline formatting so that
+      // lines like "***" are not partially consumed by the italic regex.
+      .replace(/^[\s]*[-*_]{3,}[\s]*$/gm, "")
+      // Images: keep alt text, drop URL (must run before links so the leading
+      // exclamation mark is removed along with the image syntax).
+      .replace(/!\[([^\]]+)\]\([^)]+\)/g, "$1")
+      // Links: keep link text, drop URL
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
       // Inline code: keep content, remove backticks
       .replace(/`([^`]+)`/g, "$1")
+      // Strikethrough (must run before bold/italic because it uses ~)
+      .replace(/~~(.*?)~~/g, "$1")
       // Bold
       .replace(/\*\*(.*?)\*\*/g, "$1")
       // Underline
       .replace(/__(.*?)__/g, "$1")
-      // Italic (must run after bold/underline)
+      // Italic (must run after bold/underline, and after horizontal rules)
       .replace(/\*(.*?)\*/g, "$1")
       .replace(/_(.*?)_/g, "$1")
       // Headers: remove leading # markers
@@ -95,6 +123,11 @@ export function stripMarkdown(text: string): string {
       // punctuation (handled by getPauseMs in the audio queue) provides
       // the natural pause between paragraphs.
       .replace(/\n/g, " ")
+      // Remove stray backticks that may remain from malformed inline code fences.
+      // Other markdown characters are handled by the explicit replacements above;
+      // a bare backtick is the only common leftover that is clearly a formatting
+      // marker rather than ordinary punctuation.
+      .replace(/`/g, "")
       // Collapse multiple whitespace characters
       .replace(/\s+/g, " ")
       .trim()

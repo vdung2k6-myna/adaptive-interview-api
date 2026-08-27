@@ -261,10 +261,79 @@ describe("stripMarkdown", () => {
     assert.equal(stripMarkdown("`npm install`"), "npm install");
   });
 
-  it("replaces fenced code blocks", () => {
+  it("preserves fenced code block content", () => {
     assert.equal(
       stripMarkdown("```python\nprint('hi')\n```"),
-      "code example"
+      "print('hi')"
+    );
+  });
+
+  it("preserves code-only fenced block content", () => {
+    assert.equal(
+      stripMarkdown("```\nconst x = 5;\n```"),
+      "const x = 5;"
+    );
+  });
+
+  it("preserves inline code and fenced code together", () => {
+    assert.equal(
+      stripMarkdown("What does ```python\nprint(1)\n``` do? Use `len()` to check."),
+      "What does print(1) do? Use len() to check."
+    );
+  });
+
+  it("strips link URLs and keeps link text", () => {
+    assert.equal(
+      stripMarkdown("See [REST API](https://example.com) for details."),
+      "See REST API for details."
+    );
+  });
+
+  it("strips image URLs and keeps alt text", () => {
+    assert.equal(
+      stripMarkdown("![diagram of closure](https://example.com/closure.png)"),
+      "diagram of closure"
+    );
+  });
+
+  it("strips strikethrough markers", () => {
+    assert.equal(stripMarkdown("~~deleted~~ kept"), "deleted kept");
+  });
+
+  it("removes horizontal rules", () => {
+    assert.equal(
+      stripMarkdown("---\nBạn có biết OOP không?\n***"),
+      "Bạn có biết OOP không?"
+    );
+  });
+
+  it("handles mixed markdown in one question", () => {
+    assert.equal(
+      stripMarkdown(
+        "## Câu hỏi 1\n\n**Yêu cầu:** Giải thích [closure](https://example.com) và đoạn code `() => {}`.\n\n```javascript\nconst add = (a, b) => a + b;\n```"
+      ),
+      "Câu hỏi 1 Yêu cầu: Giải thích closure và đoạn code () => {}. const add = (a, b) => a + b;"
+    );
+  });
+
+  it("strips fenced code block with escaped newlines", () => {
+    assert.equal(
+      stripMarkdown("```markdown\\nWhat is the role of karma?```"),
+      "What is the role of karma?"
+    );
+  });
+
+  it("strips fenced code block with real newlines", () => {
+    assert.equal(
+      stripMarkdown("```markdown\nWhat is the role of karma?\n```"),
+      "What is the role of karma?"
+    );
+  });
+
+  it("strips fenced code block with CRLF line endings", () => {
+    assert.equal(
+      stripMarkdown("```markdown\r\nWhat is the role of karma?\r\n```"),
+      "What is the role of karma?"
     );
   });
 });

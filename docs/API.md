@@ -627,7 +627,7 @@ On-demand TTS for transcript replay. Synthesizes any text to speech via the Audi
 
 **Text preprocessing:**
 
-Markdown formatting (bold, italic, headers, code blocks, inline code, lists, blockquotes) is stripped before synthesis so TTS engines do not speak formatting characters.
+Markdown formatting (bold, italic, strikethrough, headers, code blocks, inline code, lists, blockquotes, links, images, horizontal rules) is stripped before synthesis so TTS engines do not speak formatting characters.
 
 **Status Codes:**
 

@@ -47,6 +47,16 @@ async function cleanupSavedAudio(urls: string[]): Promise<void> {
   await Promise.all(urls.map((url) => deleteAudio(url).catch(() => undefined)));
 }
 
+/**
+ * Return true if the text has an unmatched opening fenced code block marker.
+ * Used during streaming TTS to avoid speaking partial fence content (including
+ * the language tag) before the closing fence arrives.
+ */
+function hasUnclosedCodeFence(text: string): boolean {
+  const fenceMatches = text.match(/```/g);
+  return !!fenceMatches && fenceMatches.length % 2 === 1;
+}
+
 /* ── POST /api/voice/start ──────────────────────────────────────── */
 router.post("/start", async (req, res) => {
   const abortController = new AbortController();
@@ -793,7 +803,16 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
         if (value) {
           accumulatedText += value;
 
-          const allSentences = splitSentences(stripMarkdown(accumulatedText));
+          const strippedAccumulated = stripMarkdown(accumulatedText);
+
+          // If a fenced code block is still open, wait for the closing fence before
+          // splitting sentences. Otherwise the language tag (e.g., "markdown") and
+          // partial fence markers get sent to TTS.
+          if (hasUnclosedCodeFence(accumulatedText)) {
+            continue;
+          }
+
+          const allSentences = splitSentences(strippedAccumulated);
           for (let i = sentenceIndex; i < allSentences.length; i++) {
             if (abortController.signal.aborted || res.writableEnded) {
               await reader.cancel();
