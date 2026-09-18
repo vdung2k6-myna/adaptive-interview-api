@@ -1,4 +1,5 @@
 import type { AppConfig } from "./index";
+import { parsePositiveInt } from "./env";
 
 export const developmentConfig: AppConfig = {
   env: "development",
@@ -53,5 +54,10 @@ export const developmentConfig: AppConfig = {
   },
   docEtl: {
     apiUrl: process.env.DOC_ETL_API_URL || "http://localhost:8000",
+    // doc-etl-api preloads its embedding model, so a search is a query embedding
+    // plus an in-memory scan (~50-200ms). Retrieval is awaited before prompt
+    // construction, so an over-long timeout costs first-token latency on every
+    // turn while the service is down.
+    searchTimeoutMs: parsePositiveInt(process.env.DOC_ETL_SEARCH_TIMEOUT_MS, 1_500),
   },
 };

@@ -1,4 +1,5 @@
 import type { AppConfig } from "./index";
+import { parsePositiveInt } from "./env";
 
 export const productionConfig: AppConfig = {
   env: "production",
@@ -53,5 +54,8 @@ export const productionConfig: AppConfig = {
   },
   docEtl: {
     apiUrl: process.env.DOC_ETL_API_URL || "http://localhost:8000",
+    // See development.ts — keep this tight; it is paid on every turn while the
+    // service is unreachable.
+    searchTimeoutMs: parsePositiveInt(process.env.DOC_ETL_SEARCH_TIMEOUT_MS, 1_500),
   },
 };

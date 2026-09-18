@@ -6,15 +6,22 @@ export interface KnowledgeChunk {
   score?: number;
 }
 
-interface DocEtlSearchResponse {
-  results?: Array<{
-    text: string;
-    source?: string;
-    score?: number;
-  }>;
+/**
+ * The subset of doc-etl-api's `SearchResult` (`doc_etl_api/schemas.py`) that
+ * this client reads. The server also returns `source_id` and `source_type` —
+ * declare a field here only when something consumes it, so this interface
+ * cannot drift into describing fields the server does not actually send.
+ */
+interface DocEtlSearchResult {
+  text?: string;
+  source_name?: string;
+  score?: number;
 }
 
-const DEFAULT_TIMEOUT_MS = 5_000;
+interface DocEtlSearchResponse {
+  results?: DocEtlSearchResult[];
+}
+
 const DEFAULT_TOP_K = 3;
 
 /**
@@ -28,7 +35,7 @@ export async function searchKnowledge(
 ): Promise<KnowledgeChunk[]> {
   const url = `${config.docEtl.apiUrl}/search`;
   const abortController = new AbortController();
-  const timeoutId = setTimeout(() => abortController.abort(), DEFAULT_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => abortController.abort(), config.docEtl.searchTimeoutMs);
 
   try {
     const response = await fetch(url, {
@@ -50,9 +57,21 @@ export async function searchKnowledge(
     const data = (await response.json()) as DocEtlSearchResponse;
     const results = data.results ?? [];
 
+    // Every doc-etl-api ingestion path sets `source_name`, including the startup
+    // bootstrap, so a missing one means the /search contract has drifted. Warn
+    // rather than substituting a value: a placeholder renders as legitimate
+    // attribution and makes the drift look like real data.
+    const unattributed = results.filter((r) => !r.source_name).length;
+    if (unattributed) {
+      console.warn(
+        `[Knowledge] ${unattributed}/${results.length} chunk(s) had no source_name — ` +
+          "the doc-etl-api /search contract may have changed"
+      );
+    }
+
     return results.map((r) => ({
       text: r.text ?? "",
-      source: r.source ?? "unknown",
+      source: r.source_name ?? "",
       score: r.score,
     }));
   } catch (err) {

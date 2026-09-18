@@ -50,7 +50,8 @@ export interface AppConfig {
     };
   };
   docEtl: {
-    apiUrl: string; // Document ETL service URL for knowledge retrieval
+    apiUrl: string;          // Document ETL service URL for knowledge retrieval
+    searchTimeoutMs: number; // per-request timeout for POST /search
   };
 }
 
