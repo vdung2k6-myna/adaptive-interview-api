@@ -28,11 +28,17 @@ export {
   synthesizeLongText,
   resolveVoice,
   resolveEngineForLanguage,
+  hasUnclosedCodeFence,
   type SynthesizeResult,
   type SynthesizeLongTextOptions,
   type SynthesizeLongTextResult,
   type InterviewLanguage,
 } from "./text-processing";
+export {
+  SentenceExtractor,
+  type ExtractedSentence,
+  type SentenceExtractorOptions,
+} from "./sentence-extractor";
 
 /**
  * Log a warning if audio services are unreachable.
@@ -49,7 +55,7 @@ export async function logAudioHealth(): Promise<void> {
       "[audio.cpp] STT health check failed. Transcription will not work."
     );
   }
-  if (!ttsHealthy.kokoro && !ttsHealthy.piper) {
+  if (!ttsHealthy.kokoro && !ttsHealthy.piper && !ttsHealthy.supertonic) {
     console.warn(
       "[Audio Gateway] TTS health check failed. Speech synthesis will not work."
     );
@@ -59,6 +65,9 @@ export async function logAudioHealth(): Promise<void> {
     }
     if (!ttsHealthy.piper) {
       console.warn("[Audio Gateway] Piper engine is unreachable.");
+    }
+    if (!ttsHealthy.supertonic) {
+      console.warn("[Audio Gateway] Supertonic engine is unreachable.");
     }
   }
 }

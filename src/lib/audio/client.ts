@@ -16,8 +16,8 @@ export interface TranscriptionResult {
 }
 
 export interface SynthesizeOptions {
-  engine?: "kokoro" | "piper";
-  voice?: string;
+  engine?: "kokoro" | "piper" | "supertonic";
+  voice: string;
   model?: string;
   signal?: AbortSignal;
 }
@@ -114,7 +114,7 @@ export class AudioGatewayClient {
   /**
    * Check if the audio gateway is reachable and which engines are healthy.
    */
-  async healthCheck(): Promise<{ kokoro: boolean; piper: boolean }> {
+  async healthCheck(): Promise<{ kokoro: boolean; piper: boolean; supertonic: boolean }> {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
@@ -124,19 +124,21 @@ export class AudioGatewayClient {
       clearTimeout(timeout);
 
       if (!res.ok) {
-        return { kokoro: false, piper: false };
+        return { kokoro: false, piper: false, supertonic: false };
       }
 
       const data = (await res.json()) as {
         kokoro?: boolean;
         piper?: boolean;
+        supertonic?: boolean;
       };
       return {
         kokoro: data.kokoro ?? false,
         piper: data.piper ?? false,
+        supertonic: data.supertonic ?? false,
       };
     } catch {
-      return { kokoro: false, piper: false };
+      return { kokoro: false, piper: false, supertonic: false };
     }
   }
 
@@ -150,11 +152,8 @@ export class AudioGatewayClient {
     const payload: Record<string, string | undefined> = {
       text,
       engine: options?.engine ?? config.audio.defaultEngine,
+      voice: options?.voice ?? config.audio.defaultVoice,
     };
-    // Only send voice if explicitly provided; downstream services use their own defaults
-    if (options?.voice) {
-      payload.voice = options.voice;
-    }
     if (options?.model) {
       payload.model = options.model;
     }

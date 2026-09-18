@@ -3,7 +3,7 @@
 Audio Gateway (Unified TTS)
 
 Provides a single HTTP endpoint for text-to-speech synthesis.
-Internally routes to Kokoro or Piper based on the `engine` parameter.
+Internally routes to Kokoro, Piper, or Supertonic based on the `engine` parameter.
 
 Endpoints:
   POST /v1/audio/speech    - Synthesize text to WAV audio
@@ -22,6 +22,7 @@ from pydantic import BaseModel
 # ── Configuration ──────────────────────────────────────────────────────
 KOKORO_URL = os.environ.get("KOKORO_URL", "http://localhost:8081")
 PIPER_URL = os.environ.get("PIPER_URL", "http://localhost:8083")
+SUPERTONIC_URL = os.environ.get("SUPERTONIC_URL", "http://localhost:8084")
 PORT = int(os.environ.get("PORT", "8082"))
 HOST = os.environ.get("HOST", "127.0.0.1")
 
@@ -36,7 +37,6 @@ app.add_middleware(
 )
 
 # ── HTTP client ──────────────────────────────────────────────────────────
-# Reuse client for connection pooling
 _http_client: httpx.AsyncClient | None = None
 
 
@@ -50,8 +50,8 @@ async def _get_client() -> httpx.AsyncClient:
 # ── Request model ──────────────────────────────────────────────────────
 class SynthesizeRequest(BaseModel):
     text: str
-    engine: Literal["kokoro", "piper"] = "kokoro"
-    voice: str | None = None
+    engine: Literal["kokoro", "piper", "supertonic"] = "kokoro"
+    voice: str
     model: str | None = None
 
 
@@ -75,9 +75,8 @@ async def _proxy_to_kokoro(req: SynthesizeRequest) -> Response:
 
     payload: dict[str, str] = {
         "input": req.text,
+        "voice": req.voice,
     }
-    if req.voice:
-        payload["voice"] = req.voice
     if req.model:
         payload["model"] = req.model
 
@@ -105,9 +104,8 @@ async def _proxy_to_piper(req: SynthesizeRequest) -> Response:
 
     payload = {
         "text": req.text,
+        "voice": req.voice,
     }
-    if req.voice:
-        payload["voice"] = req.voice
     # Piper doesn't use 'model' param; voice ID selects the model
 
     try:
@@ -128,6 +126,39 @@ async def _proxy_to_piper(req: SynthesizeRequest) -> Response:
     return Response(content=res.content, media_type="audio/wav")
 
 
+async def _proxy_to_supertonic(req: SynthesizeRequest) -> Response:
+    """Forward request to Supertonic TTS service.
+
+    Supertonic expects: { input: string, voice?: string, model?: string }
+    (same shape as Kokoro, so this mirrors _proxy_to_kokoro).
+    """
+    client = await _get_client()
+
+    payload: dict[str, str] = {
+        "input": req.text,
+        "voice": req.voice,
+    }
+    if req.model:
+        payload["model"] = req.model
+
+    try:
+        res = await client.post(
+            f"{SUPERTONIC_URL}/v1/audio/speech",
+            json=payload,
+            timeout=60.0,
+        )
+    except httpx.ConnectError as exc:
+        raise HTTPException(status_code=502, detail=f"Cannot connect to Supertonic: {exc}")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Supertonic TTS timed out")
+
+    if res.status_code >= 400:
+        detail = res.text or f"Supertonic returned {res.status_code}"
+        raise HTTPException(status_code=502, detail=detail)
+
+    return Response(content=res.content, media_type="audio/wav")
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────
 @app.post("/v1/audio/speech")
 async def synthesize(req: SynthesizeRequest) -> Response:
@@ -139,6 +170,8 @@ async def synthesize(req: SynthesizeRequest) -> Response:
         return await _proxy_to_kokoro(req)
     elif req.engine == "piper":
         return await _proxy_to_piper(req)
+    elif req.engine == "supertonic":
+        return await _proxy_to_supertonic(req)
     else:
         raise HTTPException(status_code=400, detail=f"Unknown engine: {req.engine}")
 
@@ -148,15 +181,17 @@ async def health() -> dict:
     """Aggregated health check across all TTS services."""
     kokoro_ok = await _check_service(KOKORO_URL)
     piper_ok = await _check_service(PIPER_URL)
+    supertonic_ok = await _check_service(SUPERTONIC_URL)
 
-    all_ok = kokoro_ok and piper_ok
-    status = "ok" if all_ok else ("degraded" if (kokoro_ok or piper_ok) else "down")
+    all_ok = kokoro_ok and piper_ok and supertonic_ok
+    status = "ok" if all_ok else ("degraded" if (kokoro_ok or piper_ok or supertonic_ok) else "down")
 
     return {
         "status": status,
         "gateway": True,
         "kokoro": kokoro_ok,
         "piper": piper_ok,
+        "supertonic": supertonic_ok,
     }
 
 

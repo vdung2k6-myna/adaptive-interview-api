@@ -122,7 +122,7 @@ done
 # Also verify by CWD in case pattern-based pgrep missed them
 if [ "$remaining" -eq 0 ]; then
     project_dir=$(pwd)
-    for dir in kokoro-service piper-service audio-gateway; do
+    for dir in kokoro-service piper-service supertonic-service audio-gateway; do
         for pid in $(pgrep -f "python.*main\\.py" 2>/dev/null || true); do
             cwd=$(readlink /proc/$pid/cwd 2>/dev/null || true)
             if [ "$cwd" = "$project_dir/$dir" ] || [ "$cwd" = "$project_dir/$dir/" ]; then

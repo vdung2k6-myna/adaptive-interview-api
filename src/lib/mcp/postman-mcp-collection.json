@@ -1,0 +1,379 @@
+{
+  "info": {
+    "_postman_id": "adaptive-interview-mcp-test",
+    "name": "Adaptive Interview - MCP Test",
+    "description": "Test the MCP Analytics Server at /api/mcp. Run Step 1 first to get a sessionId, then set it in the collection variables before running the other steps.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1. SSE Handshake (GET /api/mcp)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{mcpAuthToken}}",
+            "type": "text"
+          },
+          {
+            "key": "Accept",
+            "value": "text/event-stream",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/mcp",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "mcp"]
+        },
+        "description": "Opens an SSE connection. Look for the endpoint event in the response:\n\nevent: endpoint\ndata: /api/mcp?sessionId=xxx\n\nCopy the sessionId value and paste it into the collection variable 'sessionId'."
+      }
+    },
+    {
+      "name": "2. Initialize",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{mcpAuthToken}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2024-11-05\",\n    \"capabilities\": {},\n    \"clientInfo\": {\n      \"name\": \"postman-test\",\n      \"version\": \"1.0.0\"\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/mcp?sessionId={{sessionId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "mcp"],
+          "query": [
+            {
+              "key": "sessionId",
+              "value": "{{sessionId}}"
+            }
+          ]
+        },
+        "description": "Sends the MCP initialize request. The JSON-RPC response will arrive on the SSE stream (Step 1), not in this POST response body."
+      }
+    },
+    {
+      "name": "3. Initialized Notification",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{mcpAuthToken}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"method\": \"notifications/initialized\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/mcp?sessionId={{sessionId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "mcp"],
+          "query": [
+            {
+              "key": "sessionId",
+              "value": "{{sessionId}}"
+            }
+          ]
+        },
+        "description": "Notification that client initialization is complete. No response expected."
+      }
+    },
+    {
+      "name": "4. Tools List",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{mcpAuthToken}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/list\",\n  \"params\": {}\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/mcp?sessionId={{sessionId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "mcp"],
+          "query": [
+            {
+              "key": "sessionId",
+              "value": "{{sessionId}}"
+            }
+          ]
+        },
+        "description": "Lists all available MCP tools. Check the SSE stream (Step 1) for the response with tool definitions."
+      }
+    },
+    {
+      "name": "5. Call Tool: listPositions",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{mcpAuthToken}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"listPositions\",\n    \"arguments\": {}\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/mcp?sessionId={{sessionId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "mcp"],
+          "query": [
+            {
+              "key": "sessionId",
+              "value": "{{sessionId}}"
+            }
+          ]
+        },
+        "description": "Calls the listPositions tool. The result arrives on the SSE stream."
+      }
+    },
+    {
+      "name": "6. Call Tool: listSessions",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{mcpAuthToken}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 4,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"listSessions\",\n    \"arguments\": {\n      \"limit\": 10\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/mcp?sessionId={{sessionId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "mcp"],
+          "query": [
+            {
+              "key": "sessionId",
+              "value": "{{sessionId}}"
+            }
+          ]
+        },
+        "description": "Calls the listSessions tool with a limit of 10 results."
+      }
+    },
+    {
+      "name": "7. Call Tool: searchCandidatesBySkill",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{mcpAuthToken}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 5,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"searchCandidatesBySkill\",\n    \"arguments\": {\n      \"skill\": \"JavaScript\",\n      \"limit\": 5\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/mcp?sessionId={{sessionId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "mcp"],
+          "query": [
+            {
+              "key": "sessionId",
+              "value": "{{sessionId}}"
+            }
+          ]
+        },
+        "description": "Calls the searchCandidatesBySkill tool to search for candidates with JavaScript skill."
+      }
+    },
+    {
+      "name": "8. Call Tool: listCampaigns",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{mcpAuthToken}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 6,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"listCampaigns\",\n    \"arguments\": {}\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/mcp?sessionId={{sessionId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "mcp"],
+          "query": [
+            {
+              "key": "sessionId",
+              "value": "{{sessionId}}"
+            }
+          ]
+        },
+        "description": "Calls the listCampaigns tool."
+      }
+    },
+    {
+      "name": "9. Call Tool: getCampaignAnalytics",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{mcpAuthToken}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 7,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"getCampaignAnalytics\",\n    \"arguments\": {\n      \"campaignId\": \"00000000-0000-0000-0000-000000000000\"\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/mcp?sessionId={{sessionId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "mcp"],
+          "query": [
+            {
+              "key": "sessionId",
+              "value": "{{sessionId}}"
+            }
+          ]
+        },
+        "description": "Calls the getCampaignAnalytics tool. Replace the campaignId with a real UUID from your database."
+      }
+    },
+    {
+      "name": "10. Health Check (no auth)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": ["{{baseUrl}}"],
+          "path": ["health"]
+        },
+        "description": "Simple health check to verify the backend is running. No auth required."
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:4000",
+      "type": "string",
+      "description": "Your backend API base URL"
+    },
+    {
+      "key": "mcpAuthToken",
+      "value": "mcp-dev-secret-mcp-dev-secret",
+      "type": "string",
+      "description": "MCP auth token from your .env file (MCP_AUTH_TOKEN)"
+    },
+    {
+      "key": "sessionId",
+      "value": "",
+      "type": "string",
+      "description": "Filled in after running Step 1. Paste the sessionId from the SSE endpoint event here."
+    }
+  ]
+}

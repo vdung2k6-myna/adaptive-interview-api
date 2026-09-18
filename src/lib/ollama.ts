@@ -10,6 +10,7 @@ export interface OllamaGenerateOptions {
   model?: string;
   messages: OllamaMessage[];
   temperature?: number;
+  repeat_penalty?: number;
 }
 
 export interface GenerateStreamResult {
@@ -94,6 +95,7 @@ export async function generateChatResponse(
       stream: false,
       options: {
         temperature: options.temperature ?? 0.7,
+        repeat_penalty: options.repeat_penalty ?? 1.1,
       },
     });
 
@@ -168,6 +170,7 @@ export function generateChatResponseStream(
           stream: true,
           options: {
             temperature: options.temperature ?? 0.7,
+            repeat_penalty: options.repeat_penalty ?? 1.1,
           },
         });
 

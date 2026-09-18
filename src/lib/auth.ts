@@ -15,11 +15,12 @@ interface AuthRequestLike {
 
 function getAuthHeader(req: AuthRequestLike): string | undefined {
   const h = req.headers;
+  const author = "Authorization";
   if (typeof h.get === "function") {
-    return h.get("authorization") || undefined;
+    return h.get(author.toLowerCase()) || undefined;
   }
   // Express-style headers
-  const raw = h["authorization"] || h["Authorization"];
+  const raw = h[author.toLowerCase()] || h[author];
   return typeof raw === "string" ? raw : undefined;
 }
 
@@ -36,11 +37,12 @@ export function validateApiAuth(request: AuthRequestLike): boolean {
   }
 
   const authHeader = getAuthHeader(request);
-  if (!authHeader?.startsWith("Bearer ")) {
+  const bearer = "Bearer ";
+  if (!authHeader?.startsWith(bearer)) {
     return false;
   }
 
-  return authHeader.slice(7) === token;
+  return authHeader.slice(bearer.length) === token;
 }
 
 /**

@@ -693,18 +693,61 @@ event: done
 data: {}
 ```
 
-**Client disconnect handling:**
+---
 
-If the client closes the SSE connection (e.g. user clicks Stop), the server detects the socket close and stops remaining synthesis immediately. No further `sentence` or `done` events are emitted after disconnect.
+## Voice Agent
+
+### `POST /api/voice-agent/stream`
+
+**Ephemeral voice/text chat with a configurable AI agent.** No session, candidate, or position is required. Conversations are not persisted.
+
+The endpoint accepts either an audio recording (voice input) or a `text` field (text input), plus agent configuration. On the first turn, omit both `audio` and `text` to receive the agent's opening message.
+
+**Request:** `multipart/form-data`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `audio` | `Blob` (`audio/wav` or `audio/webm`) | No | User voice recording. Omit on first turn or when using text input. |
+| `text` | `string` | No | User text message. Alternative to `audio`. |
+| `language` | `"english"` \| `"vietnamese"` | Yes | Conversation language and TTS voice selector. |
+| `engine` | `"kokoro"` \| `"piper"` | Yes | Requested TTS engine (runtime may force an engine based on `language`). |
+| `systemPrompt` | `string` | Yes | Agent behavior/persona prompt. |
+| `history` | `JSON string` | Yes | Array of `{ role: "agent" \| "user", content: string }`. |
+
+**Response:** `text/event-stream`
+
+| Event | Data Shape | Description |
+|-------|-----------|-------------|
+| `user` | `{ text, messageId }` | Transcribed user audio or the provided `text`. Omitted on the first turn. |
+| `sentence` | `{ index, text, audioData }` | A synthesized agent sentence as base64 WAV. `audioData` is `null` if synthesis failed. |
+| `done` | `{ messageId, fullText }` | Agent response complete. |
+| `error` | `{ message }` | Fatal error (stream terminates). |
 
 **Text preprocessing:**
 
-Markdown formatting is stripped before synthesis. Long sentences are split into ~60-character chunks at strong boundaries (`:`, `;`, `,`, `space`). If a chunk exceeds the engine's phoneme limit, it is recursively halved and retried; successful WAV halves are concatenated so no audio is lost.
+Same Markdown stripping and sentence splitting as the voice interview endpoints. The engine and voice are resolved via `resolveEngineForLanguage(engine, language)` and `resolveVoice(engine, language)`.
+
+**History cap:**
+
+The backend keeps only the most recent `VOICE_AGENT_MAX_HISTORY` exchanges in the LLM context (default `20`). Older pairs are dropped from the prompt, but the caller may keep the full local history for display.
+
+**Example SSE flow:**
+
+```
+event: user
+data: {"text":"Explain closures.","messageId":"user-1"}
+
+event: sentence
+data: {"index":0,"text":"A closure is a function that remembers the variables from its surrounding scope.","audioData":"UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA..."}
+
+event: done
+data: {"messageId":"agent-1","fullText":"A closure is a function that remembers the variables from its surrounding scope."}
+```
 
 **Status Codes:**
 
 - `200` — SSE stream opened (errors delivered as `event: error`)
-- `400` — Missing text
+- `400` — Missing `systemPrompt` or invalid configuration
 
 ---
 

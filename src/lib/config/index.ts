@@ -31,7 +31,7 @@ export interface AppConfig {
     sttUrl: string;        // audio.cpp server (STT)
     gatewayUrl: string;      // Audio Gateway (TTS)
     sttModel: string;
-    defaultEngine: "kokoro" | "piper"; // default TTS engine
+    defaultEngine: "kokoro" | "piper" | "supertonic"; // default TTS engine
     defaultVoice: string;   // voice ID, e.g. "default_name" (kokoro) or "vi_VN-vais1000-medium" (piper)
     timeoutMs: number;
     voices: {
@@ -43,7 +43,14 @@ export interface AppConfig {
         english: string;
         vietnamese: string;
       };
+      supertonic: {
+        english: string;
+        vietnamese: string;
+      };
     };
+  };
+  docEtl: {
+    apiUrl: string; // Document ETL service URL for knowledge retrieval
   };
 }
 

@@ -6,6 +6,7 @@ import { buildPrompt, PromptMessage } from "@/lib/prompts";
 import { generateChatResponseStream, embedText } from "@/lib/ollama";
 import { storeMessageEmbedding } from "@/lib/embeddings";
 import { OllamaError } from "@/lib/errors";
+import { stripMarkdown } from "@/lib/audio";
 
 const router = Router();
 
@@ -123,7 +124,7 @@ router.post("/", async (req, res) => {
           res.write(value);
         }
 
-        const fullText = getFullText();
+        const fullText = stripMarkdown(getFullText());
         console.log("[POST /api/messages] First question stream complete:", fullText.substring(0, 100));
 
         await db.insert(messages).values({
@@ -253,7 +254,7 @@ router.post("/", async (req, res) => {
         res.write(value);
       }
 
-      const fullText = getFullText();
+      const fullText = stripMarkdown(getFullText());
       console.log("[POST /api/messages] Follow-up stream complete:", fullText.substring(0, 100));
 
       await db.insert(messages).values({

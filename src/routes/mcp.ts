@@ -1,5 +1,7 @@
 import { Router } from "express";
+import type { Request, Response, NextFunction } from "express";
 import { createMcpServer } from "@/lib/mcp/server";
+import { validateMcpAuth } from "@/lib/mcp/auth";
 import {
   ExpressSseTransport,
   registerTransport,
@@ -11,10 +13,22 @@ import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 const router = Router();
 
 /**
+ * MCP-specific auth middleware. Runs here because /api/mcp is mounted
+ * above the global apiAuthMiddleware in src/index.ts.
+ */
+function mcpAuthMiddleware(req: Request, res: Response, next: NextFunction) {
+  if (!validateMcpAuth(req as unknown as Request)) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  next();
+}
+
+/**
  * GET /api/mcp
  * Establishes an SSE connection for the MCP protocol.
  */
-router.get("/", async (_req, res) => {
+router.get("/", mcpAuthMiddleware, async (_req, res) => {
   const transport = new ExpressSseTransport();
   transport.bind(res);
 
@@ -44,7 +58,7 @@ router.get("/", async (_req, res) => {
  * Receives JSON-RPC messages from the client and forwards them
  * to the active SSE transport identified by the sessionId query param.
  */
-router.post("/", async (req, res) => {
+router.post("/", mcpAuthMiddleware, async (req, res) => {
   const sessionId = req.query.sessionId as string | undefined;
 
   if (!sessionId) {

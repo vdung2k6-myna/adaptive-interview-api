@@ -12,6 +12,7 @@ REM Default ports (must match start-audio-services.bat)
 if "%AUDIOCPP_PORT%"=="" set AUDIOCPP_PORT=8080
 if "%KOKORO_PORT%"=="" set KOKORO_PORT=8081
 if "%PIPER_PORT%"=="" set PIPER_PORT=8083
+if "%SUPERTONIC_PORT%"=="" set SUPERTONIC_PORT=8084
 if "%GATEWAY_PORT%"=="" set GATEWAY_PORT=8082
 
 set "KILLED_ANY=0"
@@ -47,7 +48,7 @@ REM Method 2: Fallback - by window title
 REM ---------------------------------------------------------------
 echo [Window title] Checking for services by window title...
 
-for %%T in ("audio.cpp STT" "Kokoro TTS" "Piper TTS" "Audio Gateway") do (
+for %%T in ("audio.cpp STT" "Kokoro TTS" "Piper TTS" "Supertonic TTS" "Audio Gateway") do (
     for /f "tokens=2 delims=," %%a in ('tasklist /fi "WINDOWTITLE eq %%~T" /fo csv /nh 2^>nul') do (
         if "%%~a" neq "" (
             echo   Stopping '%%~T' by window title [PID %%~a]...
@@ -96,7 +97,7 @@ REM ---------------------------------------------------------------
 echo.
 set "REMAINING=0"
 
-for %%P in (%AUDIOCPP_PORT% %KOKORO_PORT% %PIPER_PORT% %GATEWAY_PORT%) do (
+for %%P in (%AUDIOCPP_PORT% %KOKORO_PORT% %PIPER_PORT% %SUPERTONIC_PORT% %GATEWAY_PORT%) do (
     netstat -ano | findstr ":%%P " | findstr /i "LISTENING" >nul
     if !errorlevel! equ 0 (
         echo   [WARN] Port %%P is still in use

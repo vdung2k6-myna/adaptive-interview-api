@@ -96,7 +96,7 @@ def get_tts():
 class SpeechRequest(BaseModel):
     model: str = "tts"
     input: str
-    voice: str = ""
+    voice: str
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────

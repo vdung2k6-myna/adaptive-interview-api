@@ -1,5 +1,6 @@
 import { OllamaMessage } from "./ollama";
 import { getRequirementCoverage } from "./embeddings";
+import { KnowledgeChunk } from "./knowledge";
 
 export interface PromptSession {
   id: string;
@@ -42,10 +43,8 @@ function getMaxPromptTurnChars(): number {
 }
 
 function buildSystemPrompt(language: "english" | "vietnamese" = "english"): string {
-  const languageInstruction =
-    language === "vietnamese"
-      ? "- Conduct the entire interview in Vietnamese. Questions, explanations, and replies must be in Vietnamese only."
-      : "- Conduct the entire interview in English. Questions, explanations, and replies must be in English only.";
+  const lang = language.charAt(0).toUpperCase().concat(language.slice(1));
+  const languageInstruction = `- Conduct the entire interview in ${lang}. Questions, explanations, and replies must be in Vietnamese only.`;
 
   return `You are an experienced technical interviewer conducting a structured interview.
 
@@ -53,7 +52,6 @@ Rules:
 - Generate one concise interview question at a time.
 - No preamble, no explanation.
 - Use Markdown formatting.
-- If you include code examples, specify the language after the opening backticks (e.g., \`\`\`python, \`\`\`go).
 - Keep questions relevant to the position requirements and the candidate's background.
 - Prioritize technical questions that probe the position requirements and the candidate's stated skills.
 - Ask behavioral or situational questions only as natural follow-ups to a technical answer, or after the core technical requirements have been covered.
@@ -118,6 +116,90 @@ function trimTurnMessages(turns: OllamaMessage[], maxChars: number): OllamaMessa
 
   const keptMiddle = middle.slice(middle.length - keepCount);
   return [first, ...keptMiddle, last];
+}
+
+export interface VoiceAgentMessage {
+  role: "agent" | "user";
+  content: string;
+}
+
+/**
+ * Format knowledge chunks as a numbered list with source attribution.
+ * Example: `1. [interview-guide.pdf] The STAR method is...`
+ */
+export function formatKnowledgeChunks(chunks: KnowledgeChunk[]): string {
+  if (!chunks.length) return "";
+  const lines = chunks.map(
+    (chunk, idx) => `${idx + 1}. [${chunk.source}] ${chunk.text}`
+  );
+  return `Relevant knowledge:\n${lines.join("\n")}`;
+}
+
+/**
+ * Build a generic voice-agent prompt from a user-supplied system prompt,
+ * language rule, and conversation history. No position/candidate context.
+ * Optional knowledgeContext prepends a "Relevant knowledge:" section to
+ * the system prompt so the LLM can reference indexed documents.
+ */
+export function buildVoiceAgentPrompt(
+  systemPrompt: string,
+  language: "english" | "vietnamese" = "english",
+  history: VoiceAgentMessage[] = [],
+  knowledgeContext?: KnowledgeChunk[]
+): OllamaMessage[] {
+  const languageInstruction = `- Conduct the entire conversation in ${language}. Replies must be in ${language} only.`;
+
+  const knowledgeSection =
+    knowledgeContext && knowledgeContext.length
+      ? `${formatKnowledgeChunks(knowledgeContext)}\n\n`
+      : "";
+
+  const systemContent = `${systemPrompt}
+
+${knowledgeSection}Rules:
+${languageInstruction}
+- Keep replies concise and conversational.
+- Use Markdown only when it helps clarity.`;
+
+  const historyMessages = history.map((m) => ({
+    role: m.role === "agent" ? ("assistant" as const) : ("user" as const),
+    content: m.content,
+  }));
+
+  // Some cloud endpoints (e.g. kimi-k2.6:cloud via Ollama proxy) require the
+  // final message to be from the user role, otherwise they return empty content.
+  // Only append the prompt when history is empty or ends with an agent message;
+  // if the user just spoke, their message is already the final user message.
+  const lastRole = historyMessages[historyMessages.length - 1]?.role;
+  if (!lastRole || lastRole === "assistant") {
+    historyMessages.push({ role: "user", content: "Please respond." });
+  }
+
+  const messages: OllamaMessage[] = [
+    { role: "system", content: systemContent },
+    ...historyMessages,
+  ];
+  return messages;
+}
+
+/**
+ * Return a history slice suitable for the LLM context, capped at a soft
+ * number of user+agent exchanges. Oldest pairs are dropped first.
+ */
+export function trimVoiceAgentHistory(
+  history: VoiceAgentMessage[],
+  maxExchanges: number
+): VoiceAgentMessage[] {
+  if (maxExchanges <= 0 || history.length === 0) return history;
+  // Each exchange is one agent + one user message. We keep the most recent
+  // `maxExchanges` agent messages plus their corresponding user messages.
+  const agentIndices: number[] = [];
+  history.forEach((m, idx) => {
+    if (m.role === "agent") agentIndices.push(idx);
+  });
+  if (agentIndices.length <= maxExchanges) return history;
+  const keepFromIndex = agentIndices[agentIndices.length - maxExchanges];
+  return history.slice(keepFromIndex);
 }
 
 export async function buildPrompt(

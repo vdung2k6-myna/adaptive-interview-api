@@ -33,7 +33,7 @@ export const developmentConfig: AppConfig = {
     sttUrl: process.env.AUDIOCPP_BASE_URL || "http://localhost:8080",
     gatewayUrl: process.env.AUDIO_GATEWAY_URL || "http://localhost:8082",
     sttModel: process.env.AUDIOCPP_STT_MODEL || "stt",
-    defaultEngine: (process.env.DEFAULT_TTS_ENGINE as "kokoro" | "piper") || "kokoro",
+    defaultEngine: (process.env.DEFAULT_TTS_ENGINE as "kokoro" | "piper" | "supertonic") || "supertonic",
     defaultVoice: process.env.DEFAULT_VOICE || "default_name",
     timeoutMs: 60_000,
     voices: {
@@ -45,6 +45,13 @@ export const developmentConfig: AppConfig = {
         english: process.env.PIPER_VOICE_ENGLISH || "en_US-lessac-medium",
         vietnamese: process.env.PIPER_VOICE_VIETNAMESE || "",
       },
+      supertonic: {
+        english: process.env.SUPERTONIC_VOICE_ENGLISH || "F1",
+        vietnamese: process.env.SUPERTONIC_VOICE_VIETNAMESE || "F1",
+      },
     },
+  },
+  docEtl: {
+    apiUrl: process.env.DOC_ETL_API_URL || "http://localhost:8000",
   },
 };

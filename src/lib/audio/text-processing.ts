@@ -16,6 +16,16 @@ import { splitSentences } from "./split-sentences";
 import type { SynthesizeOptions } from "./client";
 import config from "@/lib/config";
 
+/**
+ * Return true if the text has an unmatched opening fenced code block marker.
+ * Used during streaming TTS to avoid speaking partial fence content (including
+ * the language tag) before the closing fence arrives.
+ */
+export function hasUnclosedCodeFence(text: string): boolean {
+  const fenceMatches = text.match(/```/g);
+  return !!fenceMatches && fenceMatches.length % 2 === 1;
+}
+
 export interface SynthesizeResult {
   urlPath: string;
   text: string;
@@ -25,15 +35,14 @@ export type InterviewLanguage = "english" | "vietnamese";
 
 /**
  * Resolve the voice ID for a given TTS engine and interview language.
- * Returns undefined when the configured voice is empty, which tells the caller
- * to use the service's own default (preserves existing Vietnamese behavior).
+ * Falls back to the configured default voice if no engine-specific voice is set.
  */
 export function resolveVoice(
-  engine: "kokoro" | "piper",
+  engine: "kokoro" | "piper" | "supertonic",
   language: InterviewLanguage
-): string | undefined {
-  const voice = config.audio.voices[engine][language]?.trim();
-  return voice || undefined;
+): string {
+  const voice = config.audio.voices[engine]?.[language]?.trim();
+  return voice || config.audio.defaultVoice;
 }
 
 /**
@@ -42,16 +51,17 @@ export function resolveVoice(
  * Engine ↔ Language mapping is forced at runtime because the deployed voice
  * models are language-specific:
  * - English interviews must use Piper (only English voices are installed there).
- * - Vietnamese interviews must use Kokoro (only Vietnamese voices are installed there).
  */
 export function resolveEngineForLanguage(
-  requestedEngine: "kokoro" | "piper" | undefined,
+  requestedEngine: "kokoro" | "piper" | "supertonic" | undefined,
   language: InterviewLanguage
-): "kokoro" | "piper" {
+): "kokoro" | "piper" | "supertonic" {
   if (language === "english") {
-    return "piper";
+    // When a specific engine was requested (including supertonic), honor it.
+    // Otherwise fall back to piper for English since kokoro only has Vietnamese voices.
+    return requestedEngine ?? "piper";
   }
-  return "kokoro";
+  return requestedEngine ?? "kokoro";
 }
 
 /**
@@ -108,6 +118,11 @@ function hasSynthesizableContent(text: string): boolean {
 export function stripMarkdown(text: string): string {
   return (
     text
+      // Empty fenced code blocks (language tag but no content).
+      // Some models confuse the interview-language instruction with a code-block
+      // language tag and emit ```vietnamese``` or ```english```. Remove them
+      // entirely before handling blocks that contain actual code.
+      .replace(/```[a-zA-Z0-9_+-]*```/g, "")
       // Fenced code blocks: keep code content, remove fence and optional language tag.
       // The LLM sometimes emits CRLF or literal "\n" after the language tag instead of
       // a plain newline (e.g., ```markdown\r\nWhat is...? or ```markdown\nWhat is...?).
@@ -157,6 +172,9 @@ export function stripMarkdown(text: string): string {
       // punctuation (handled by getPauseMs in the audio queue) provides
       // the natural pause between paragraphs.
       .replace(/\n/g, " ")
+      // Unicode bullets that survive line-start stripping (e.g. inline
+      // after newline collapse, or emitted by some LLMs as • instead of -).
+      .replace(/•/g, "")
       // Remove stray backticks that may remain from malformed inline code fences.
       // Other markdown characters are handled by the explicit replacements above;
       // a bare backtick is the only common leftover that is clearly a formatting
@@ -396,7 +414,7 @@ export function normalizeNumbersForKokoro(text: string): string {
  * pronounce them. Piper and other engines receive the original text unchanged.
  */
 export function normalizeTextForEngine(text: string, engine?: string): string {
-  const normalized = stripMarkdown(text);
+  let normalized = stripMarkdown(text);
   if ((engine ?? "kokoro") === "kokoro") {
     return normalizeNumbersForKokoro(normalized);
   }

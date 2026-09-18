@@ -159,7 +159,7 @@ _load_voices()
 # ── Request model ──────────────────────────────────────────────────────
 class SynthesizeRequest(BaseModel):
     text: str
-    voice: str | None = None
+    voice: str
     speaker_id: int | None = None  # For multi-speaker models
 
 

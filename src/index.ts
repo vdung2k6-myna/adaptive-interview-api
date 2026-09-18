@@ -13,6 +13,7 @@ import campaignsRoutes from "./routes/campaigns";
 import messagesRoutes from "./routes/messages";
 import evaluationsRoutes from "./routes/evaluations";
 import voiceRoutes from "./routes/voice";
+import voiceAgentRoutes from "./routes/voice-agent";
 import mcpRoutes from "./routes/mcp";
 
 const app = express();
@@ -47,6 +48,9 @@ app.get("/health", (_req, res) => {
 // Audio static files — public, served before auth
 app.use("/audio", express.static(process.env.AUDIO_STORAGE_DIR || "/tmp/audio"));
 
+// MCP endpoint — handles its own auth (MCP_AUTH_TOKEN)
+app.use("/api/mcp", mcpRoutes);
+
 // Auth middleware (protects all routes below)
 app.use(apiAuthMiddleware);
 
@@ -58,7 +62,7 @@ app.use("/api/campaigns", campaignsRoutes);
 app.use("/api/messages", messagesRoutes);
 app.use("/api/evaluations", evaluationsRoutes);
 app.use("/api/voice", voiceRoutes);
-app.use("/api/mcp", mcpRoutes);
+app.use("/api/voice-agent", voiceAgentRoutes);
 
 // Error handler
 app.use(errorHandler);

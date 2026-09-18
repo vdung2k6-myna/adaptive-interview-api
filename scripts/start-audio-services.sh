@@ -24,14 +24,16 @@ fi
 AUDIOCPP_PORT="${AUDIOCPP_PORT:-8080}"
 KOKORO_PORT="${KOKORO_PORT:-8081}"
 PIPER_PORT="${PIPER_PORT:-8083}"
+SUPERTONIC_PORT="${SUPERTONIC_PORT:-8084}"
 GATEWAY_PORT="${GATEWAY_PORT:-8082}"
 
 # Default URLs for gateway
 KOKORO_URL="${KOKORO_URL:-http://localhost:$KOKORO_PORT}"
 PIPER_URL="${PIPER_URL:-http://localhost:$PIPER_PORT}"
+SUPERTONIC_URL="${SUPERTONIC_URL:-http://localhost:$SUPERTONIC_PORT}"
 
 # ── STT: audio.cpp (primary) ─────────────────
-echo "[1/4] Starting audio.cpp STT on port $AUDIOCPP_PORT..."
+echo "[1/5] Starting audio.cpp STT on port $AUDIOCPP_PORT..."
 
 STT_STARTED=0
 AUDIOCPP_FOUND=0
@@ -81,7 +83,7 @@ if [ "$STT_STARTED" -eq 0 ]; then
 fi
 
 # ── Kokoro TTS ──────────────────────────
-echo "[2/4] Starting Kokoro TTS on port $KOKORO_PORT..."
+echo "[2/5] Starting Kokoro TTS on port $KOKORO_PORT..."
 
 if [ -f "kokoro-service/.venv/bin/python" ]; then
     echo "  Using kokoro-service via .venv"
@@ -98,7 +100,7 @@ fi
 sleep 3
 
 # ── Piper TTS ───────────────────────────
-echo "[3/4] Starting Piper TTS on port $PIPER_PORT..."
+echo "[3/5] Starting Piper TTS on port $PIPER_PORT..."
 
 if [ -f "piper-service/main.py" ]; then
     if [ -f "piper-service/.venv/bin/python" ]; then
@@ -116,17 +118,36 @@ fi
 
 sleep 5
 
+# ── Supertonic TTS ──────────────────────
+echo "[4/5] Starting Supertonic TTS on port $SUPERTONIC_PORT..."
+
+if [ -f "supertonic-service/main.py" ]; then
+    if [ -f "supertonic-service/.venv/bin/python" ]; then
+        echo "  Using supertonic-service via .venv"
+        (cd supertonic-service && PORT=$SUPERTONIC_PORT .venv/bin/python main.py &)
+        SUPERTONIC_PID=$!
+    else
+        echo "  Using supertonic-service via system Python"
+        (cd supertonic-service && PORT=$SUPERTONIC_PORT python main.py &)
+        SUPERTONIC_PID=$!
+    fi
+else
+    echo -e "  ${YELLOW}[SKIP]${NC} supertonic-service not found."
+fi
+
+sleep 5
+
 # ── Audio Gateway ─────────────────────
-echo "[4/4] Starting Audio Gateway on port $GATEWAY_PORT..."
+echo "[5/5] Starting Audio Gateway on port $GATEWAY_PORT..."
 
 if [ -f "audio-gateway/main.py" ]; then
     if [ -f "audio-gateway/.venv/bin/python" ]; then
         echo "  Using audio-gateway via .venv"
-        (cd audio-gateway && PORT=$GATEWAY_PORT KOKORO_URL=$KOKORO_URL PIPER_URL=$PIPER_URL .venv/bin/python main.py &)
+        (cd audio-gateway && PORT=$GATEWAY_PORT KOKORO_URL=$KOKORO_URL PIPER_URL=$PIPER_URL SUPERTONIC_URL=$SUPERTONIC_URL .venv/bin/python main.py &)
         GATEWAY_PID=$!
     else
         echo "  Using audio-gateway via system Python"
-        (cd audio-gateway && PORT=$GATEWAY_PORT KOKORO_URL=$KOKORO_URL PIPER_URL=$PIPER_URL python main.py &)
+        (cd audio-gateway && PORT=$GATEWAY_PORT KOKORO_URL=$KOKORO_URL PIPER_URL=$PIPER_URL SUPERTONIC_URL=$SUPERTONIC_URL python main.py &)
         GATEWAY_PID=$!
     fi
 else
@@ -137,11 +158,12 @@ echo
 echo "=========================================="
 echo -e "${GREEN}Audio services startup complete${NC}"
 if [ "$STT_STARTED" -eq 1 ]; then
-    echo "  STT:       http://localhost:$AUDIOCPP_PORT"
+    echo "  STT:        http://localhost:$AUDIOCPP_PORT"
 fi
-echo "  Kokoro:    http://localhost:$KOKORO_PORT"
-echo "  Piper:     http://localhost:$PIPER_PORT"
-echo "  Gateway:   http://localhost:$GATEWAY_PORT"
+echo "  Kokoro:     http://localhost:$KOKORO_PORT"
+echo "  Piper:      http://localhost:$PIPER_PORT"
+echo "  Supertonic: http://localhost:$SUPERTONIC_PORT"
+echo "  Gateway:    http://localhost:$GATEWAY_PORT"
 echo "=========================================="
 echo
 echo "Press Ctrl+C to stop all services..."
@@ -164,6 +186,9 @@ cleanup() {
     fi
     if [ -n "${KOKORO_PID:-}" ]; then
         kill "$KOKORO_PID" 2>/dev/null || true
+    fi
+    if [ -n "${SUPERTONIC_PID:-}" ]; then
+        kill "$SUPERTONIC_PID" 2>/dev/null || true
     fi
     wait
     echo "All services stopped."

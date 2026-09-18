@@ -18,16 +18,18 @@ REM Default ports (override via env vars)
 if "%AUDIOCPP_PORT%"=="" set AUDIOCPP_PORT=8080
 if "%KOKORO_PORT%"=="" set KOKORO_PORT=8081
 if "%PIPER_PORT%"=="" set PIPER_PORT=8083
+if "%SUPERTONIC_PORT%"=="" set SUPERTONIC_PORT=8084
 if "%GATEWAY_PORT%"=="" set GATEWAY_PORT=8082
 
 REM Default URLs for gateway
 if "%KOKORO_URL%"=="" set KOKORO_URL=http://localhost:%KOKORO_PORT%
 if "%PIPER_URL%"=="" set PIPER_URL=http://localhost:%PIPER_PORT%
+if "%SUPERTONIC_URL%"=="" set SUPERTONIC_URL=http://localhost:%SUPERTONIC_PORT%
 
 REM ---------------------------------------------------------------
 REM STT: audio.cpp (primary)
 REM ---------------------------------------------------------------
-echo [1/4] Starting audio.cpp STT on port %AUDIOCPP_PORT%...
+echo [1/5] Starting audio.cpp STT on port %AUDIOCPP_PORT%...
 
 set "STT_STARTED=0"
 set "AUDIOCPP_FOUND=0"
@@ -68,7 +70,7 @@ timeout /t 5 /nobreak > nul
 REM ---------------------------------------------------------------
 REM Kokoro TTS
 REM ---------------------------------------------------------------
-echo [2/4] Starting Kokoro TTS on port %KOKORO_PORT%...
+echo [2/5] Starting Kokoro TTS on port %KOKORO_PORT%...
 
 if exist "kokoro-service\.venv\Scripts\python.exe" goto :kokoro_via_venv
 if exist "kokoro-service\main.py" goto :kokoro_via_system
@@ -91,7 +93,7 @@ timeout /t 3 /nobreak > nul
 REM ---------------------------------------------------------------
 REM Piper TTS
 REM ---------------------------------------------------------------
-echo [3/4] Starting Piper TTS on port %PIPER_PORT%...
+echo [3/5] Starting Piper TTS on port %PIPER_PORT%...
 
 if exist "piper-service\main.py" goto :piper_exists
 echo   [SKIP] piper-service not found.
@@ -110,9 +112,30 @@ if exist "piper-service\.venv\Scripts\python.exe" (
 timeout /t 5 /nobreak > nul
 
 REM ---------------------------------------------------------------
+REM Supertonic TTS
+REM ---------------------------------------------------------------
+echo [4/5] Starting Supertonic TTS on port %SUPERTONIC_PORT%...
+
+if exist "supertonic-service\main.py" goto :supertonic_exists
+echo   [SKIP] supertonic-service not found.
+goto :supertonic_done
+
+:supertonic_exists
+if exist "supertonic-service\.venv\Scripts\python.exe" (
+    echo   Using supertonic-service via .venv
+    start "Supertonic TTS" /d supertonic-service .venv\Scripts\python main.py
+) else (
+    echo   Using supertonic-service via system Python
+    start "Supertonic TTS" /d supertonic-service python main.py
+)
+
+:supertonic_done
+timeout /t 5 /nobreak > nul
+
+REM ---------------------------------------------------------------
 REM Audio Gateway
 REM ---------------------------------------------------------------
-echo [4/4] Starting Audio Gateway on port %GATEWAY_PORT%...
+echo [5/5] Starting Audio Gateway on port %GATEWAY_PORT%...
 
 if exist "audio-gateway\main.py" goto :gateway_exists
 echo   [SKIP] audio-gateway not found.
@@ -132,10 +155,11 @@ if exist "audio-gateway\.venv\Scripts\python.exe" (
 echo.
 echo ==========================================
 echo Audio services started in separate windows:
-if "%STT_STARTED%"=="1" echo   STT:     http://localhost:%AUDIOCPP_PORT%
-echo   Kokoro:  http://localhost:%KOKORO_PORT%
-echo   Piper:   http://localhost:%PIPER_PORT%
-echo   Gateway: http://localhost:%GATEWAY_PORT%
+if "%STT_STARTED%"=="1" echo   STT:        http://localhost:%AUDIOCPP_PORT%
+echo   Kokoro:     http://localhost:%KOKORO_PORT%
+echo   Piper:      http://localhost:%PIPER_PORT%
+echo   Supertonic: http://localhost:%SUPERTONIC_PORT%
+echo   Gateway:    http://localhost:%GATEWAY_PORT%
 echo ==========================================
 echo.
 echo Press any key to exit this launcher (services keep running)...

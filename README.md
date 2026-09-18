@@ -62,13 +62,15 @@ curl http://localhost:4000/health
 | `AUDIO_STORAGE_DIR` | No | Audio file storage path (default: `/tmp/audio`) |
 | `AUDIOCPP_BASE_URL` | No | audio.cpp STT server URL |
 | `AUDIO_GATEWAY_URL` | No | Audio Gateway TTS server URL |
-| `DEFAULT_TTS_ENGINE` | No | `kokoro` or `piper` (default: `kokoro`) |
+| `DEFAULT_TTS_ENGINE` | No | `kokoro`, `piper`, or `supertonic` (default: `kokoro`) |
 | `DEFAULT_VOICE` | No | Voice ID (default: `default_voice`) |
 | `EMBEDDING_SIMILARITY_THRESHOLD` | No | Default: `0.75` |
 | `KOKORO_VOICE_ENGLISH` | No | Kokoro voice for English sessions (e.g. `af_heart`) |
 | `KOKORO_VOICE_VIETNAMESE` | No | Kokoro voice for Vietnamese sessions |
 | `PIPER_VOICE_ENGLISH` | No | Piper voice for English sessions (e.g. `en_US-lessac-medium`) |
 | `PIPER_VOICE_VIETNAMESE` | No | Piper voice for Vietnamese sessions |
+| `SUPERTONIC_VOICE_ENGLISH` | No | Supertonic voice for English sessions (default: `default`) |
+| `SUPERTONIC_VOICE_VIETNAMESE` | No | Supertonic voice for Vietnamese sessions |
 
 ## Testing with curl
 
@@ -120,7 +122,8 @@ Voice interviews require an audio stack with three services plus an external STT
 | **audio.cpp** | 8080 | External | Speech-to-text (STT) transcription |
 | **Kokoro** | 8081 | `kokoro-service/` | Text-to-speech (TTS) — fast, high quality |
 | **Piper** | 8083 | `piper-service/` | Text-to-speech (TTS) — multiple voices |
-| **Audio Gateway** | 8082 | `audio-gateway/` | Unified TTS proxy — routes to Kokoro or Piper |
+| **Supertonic** | 8084 | `supertonic-service/` | Text-to-speech (TTS) — open-source, 31 languages, 44.1kHz |
+| **Audio Gateway** | 8082 | `audio-gateway/` | Unified TTS proxy — routes to Kokoro, Piper, or Supertonic |
 
 ```bash
 # Start all audio services

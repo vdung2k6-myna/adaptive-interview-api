@@ -150,10 +150,10 @@ router.post("/start", async (req, res) => {
 
     let questionText: string;
     try {
-      questionText = await generateChatResponse({
+      questionText = stripMarkdown(await generateChatResponse({
         messages: prompt,
         temperature: 0.7,
-      });
+      }));
     } catch (err) {
       console.error("[POST /api/voice/start] LLM error:", err);
       if (err instanceof OllamaError) {
@@ -429,10 +429,10 @@ router.post("/turn", upload.single("audio"), async (req, res) => {
 
     let questionText: string;
     try {
-      questionText = await generateChatResponse({
+      questionText = stripMarkdown(await generateChatResponse({
         messages: prompt,
         temperature: 0.7,
-      });
+      }));
     } catch (err) {
       console.error("[POST /api/voice/turn] LLM error:", err);
       if (err instanceof OllamaError) {
@@ -979,7 +979,7 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
       .values({
         sessionId,
         role: "interviewer",
-        content: fullText,
+        content: cleanFullText,
         audioUrl: interviewerAudioUrl,
         audioFormat: combinedFormat,
       })
@@ -997,7 +997,7 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
         maxTurns: session.maxTurns,
       },
       messageId: interviewerMsgRows[0].id,
-      fullText,
+      fullText: cleanFullText,
       audioUrl: interviewerAudioUrl || null,
     });
 

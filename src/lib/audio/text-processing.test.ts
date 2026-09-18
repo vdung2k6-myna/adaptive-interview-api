@@ -348,6 +348,17 @@ describe("stripMarkdown", () => {
       "What is the role of karma?"
     );
   });
+
+  it("strips empty fenced code block with language tag", () => {
+    assert.equal(
+      stripMarkdown("Hãy mô tả? ```vietnamese```"),
+      "Hãy mô tả?"
+    );
+    assert.equal(
+      stripMarkdown("What is Node.js? ```english```"),
+      "What is Node.js?"
+    );
+  });
 });
 
 function makeWavBuffer(payload: string): Buffer {
@@ -393,7 +404,7 @@ describe("synthesizeLongText", () => {
     const buffers = new Map([[text, makeWavBuffer("short")]]);
     const result = await synthesizeLongText(
       text,
-      { engine: "kokoro" },
+      { engine: "kokoro", voice: "af_heart" },
       undefined,
       makeMockSynthesizer(buffers)
     );
@@ -418,7 +429,7 @@ describe("synthesizeLongText", () => {
 
     const result = await synthesizeLongText(
       text,
-      { engine: "kokoro" },
+      { engine: "kokoro", voice: "af_heart" },
       undefined,
       synthesizeFn
     );
@@ -448,7 +459,7 @@ describe("synthesizeLongText", () => {
 
     const result = await synthesizeLongText(
       text,
-      { engine: "kokoro" },
+      { engine: "kokoro", voice: "af_heart" },
       undefined,
       synthesizeFn
     );
@@ -460,7 +471,7 @@ describe("synthesizeLongText", () => {
     const buffers = new Map([[text, makeWavBuffer("saved")]]);
     const result = await synthesizeLongText(
       text,
-      { engine: "kokoro", sessionId: "test-session", prefix: "interviewer" },
+      { engine: "kokoro", voice: "af_heart", sessionId: "test-session", prefix: "interviewer" },
       undefined,
       makeMockSynthesizer(buffers)
     );
@@ -481,7 +492,7 @@ describe("synthesizeLongText", () => {
 
     const result = await synthesizeLongText(
       text,
-      { engine: "kokoro" },
+      { engine: "kokoro", voice: "af_heart" },
       undefined,
       synthesizeFn
     );
@@ -512,7 +523,7 @@ describe("synthesizeLongText", () => {
       async () => {
         await synthesizeLongText(
           text,
-          { engine: "kokoro", sessionId: "abort-session", prefix: "interviewer" },
+          { engine: "kokoro", voice: "af_heart", sessionId: "abort-session", prefix: "interviewer" },
           controller.signal,
           synthesizeFn
         );
