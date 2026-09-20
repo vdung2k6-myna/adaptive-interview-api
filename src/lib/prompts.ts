@@ -44,7 +44,7 @@ function getMaxPromptTurnChars(): number {
 
 function buildSystemPrompt(language: "english" | "vietnamese" = "english"): string {
   const lang = language.charAt(0).toUpperCase().concat(language.slice(1));
-  const languageInstruction = `- Conduct the entire interview in ${lang}. Questions, explanations, and replies must be in Vietnamese only.`;
+  const languageInstruction = `- Conduct the entire interview in ${lang}. Questions, explanations, and replies must be in ${lang} only.`;
 
   return `You are an experienced technical interviewer conducting a structured interview.
 

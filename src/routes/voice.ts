@@ -1,4 +1,4 @@
-import { Router, type Response } from "express";
+import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { db } from "@/lib/db";
 import { interviewSessions, candidates, positions, messages } from "@/lib/schema";
@@ -19,10 +19,20 @@ import {
   concatWavBuffers,
   resolveVoice,
   resolveEngineForLanguage,
+  SentenceStream,
   type SynthesizeOptions,
 } from "@/lib/audio";
 
 const upload = multer({ storage: multer.memoryStorage() });
+
+/**
+ * The collaborators a caller may replace. Only `speak-stream` needs one: it
+ * synthesizes chunk by chunk and emits the audio inline, so its SSE contract is
+ * only testable with a synthesizer a test supplies (design D8).
+ */
+export interface VoiceRouteDeps {
+  synthesizeSpeechWithFallback: typeof synthesizeSpeechWithFallback;
+}
 
 const router = Router();
 
@@ -1069,7 +1079,21 @@ router.post("/speak", async (req, res) => {
 });
 
 /* ── POST /api/voice/speak-stream ───────────────────────────────── */
-router.post("/speak-stream", async (req, res) => {
+/**
+ * Register the endpoint on `router`, taking its synthesizer from `deps` — the
+ * seam that lets a test drive this route's SSE contract without an audio
+ * gateway (design D8). The path, the event sequence, and the transport guards
+ * are unchanged.
+ */
+function registerSpeakStream(router: Router, deps: VoiceRouteDeps): void {
+  router.post("/speak-stream", (req, res) => handleSpeakStream(req, res, deps));
+}
+
+async function handleSpeakStream(
+  req: Request,
+  res: Response,
+  deps: VoiceRouteDeps
+): Promise<void> {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
@@ -1117,43 +1141,49 @@ router.post("/speak-stream", async (req, res) => {
       voice: resolveVoice(resolvedEngine, resolvedLanguage),
       signal: abortController.signal,
     };
-    let chunkIndex = 0;
-
-    for (const sentenceText of sentences) {
-      for (const chunk of splitForTTS(sentenceText)) {
+    // The chunk pipeline is the shared core (D1): it owns the index, the
+    // `splitForTTS` chunking and the null-audio rule, while the wire stays here.
+    // This route is the caller that hands the core a whole text's sentences up
+    // front, one `push` each.
+    const stream = new SentenceStream({
+      synthesize: (chunk) =>
+        deps.synthesizeSpeechWithFallback(chunk, ttsOptions, 0, abortController.signal),
+      signal: abortController.signal,
+      // The transport guard belongs here, not in the core, which never sees
+      // `res` (D5). A response that has already ended means nothing may be
+      // written; the core stops on the same signal from `res.on("close")`.
+      onChunk: ({ index, text, buffer }) => {
         if (res.writableEnded || abortController.signal.aborted) {
           return;
         }
-
-        let buffer: Buffer | null = null;
-        try {
-          buffer = await synthesizeSpeechWithFallback(chunk, ttsOptions, 0, abortController.signal);
-        } catch (err) {
-          // No synthesizable content (e.g. pure punctuation) and unrecoverable TTS
-          // errors are emitted as a null audioData chunk so the frontend can skip
-          // them without stalling the sentence index sequence.
-          if (
-            !(err instanceof Error) ||
-            err.name !== "AbortError"
-          ) {
-            console.warn(
-              `[POST /api/voice/speak-stream] TTS skipped for chunk ${chunkIndex}:`,
-              err instanceof Error ? err.message : err
-            );
-          }
-        }
-
-        if (res.writableEnded || abortController.signal.aborted) {
-          return;
-        }
-
         sendSseEvent(res, "sentence", {
-          index: chunkIndex,
-          text: chunk,
+          index,
+          text,
           audioData: buffer ? buffer.toString("base64") : null,
         });
-        chunkIndex++;
-      }
+      },
+      // No synthesizable content (e.g. pure punctuation) and unrecoverable TTS
+      // errors arrive here as a failed chunk: the core emits it as null audio at
+      // its own index so the frontend can skip it without stalling the sentence
+      // index sequence (D4), and this only reports it. An abort is not a failure
+      // and never reaches here.
+      onError: (err, { index }) => {
+        console.warn(
+          `[POST /api/voice/speak-stream] TTS skipped for chunk ${index}:`,
+          err instanceof Error ? err.message : err
+        );
+      },
+    });
+
+    for (const sentenceText of sentences) {
+      await stream.push(sentenceText);
+    }
+    await stream.flush();
+
+    // A disconnected client gets no `done`: the response is already gone, and
+    // the closing event is this route's own, after the drain (D5).
+    if (res.writableEnded || abortController.signal.aborted) {
+      return;
     }
 
     sendSseEvent(res, "done", {});
@@ -1169,6 +1199,20 @@ router.post("/speak-stream", async (req, res) => {
     }
     res.end();
   }
-});
+}
 
-export default router;
+/**
+ * `/api/voice` — the interview session's voice routes plus the two speak
+ * endpoints. `synthesizeSpeechWithFallback` is the one collaborator a caller may
+ * replace (design D8). Every other route stays registered exactly as it was, on
+ * the same router instance and paths, so `src/index.ts`'s mount is unchanged.
+ */
+export function createVoiceRouter(overrides: Partial<VoiceRouteDeps> = {}): Router {
+  const deps: VoiceRouteDeps = { synthesizeSpeechWithFallback, ...overrides };
+  const composed = Router();
+  composed.use(router);
+  registerSpeakStream(composed, deps);
+  return composed;
+}
+
+export default createVoiceRouter();

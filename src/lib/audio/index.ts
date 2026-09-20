@@ -39,6 +39,11 @@ export {
   type ExtractedSentence,
   type SentenceExtractorOptions,
 } from "./sentence-extractor";
+export {
+  SentenceStream,
+  type ChunkEvent,
+  type SentenceStreamOptions,
+} from "./sentence-stream";
 
 /**
  * Log a warning if audio services are unreachable.
