@@ -30,3 +30,13 @@ kokoro-service/models/
 .DS_Store
 *.pem
 openspec*
+scratch-e2e/body.txt
+scratch-e2e/chunks.json
+scratch-e2e/headers.txt
+scratch-e2e/search.json
+scratch-e2e/silence.wav
+scratch-e2e/systemPrompt.txt
+scratch-e2e/text.txt
+scratch-e2e/topics.json
+scratch-e2e/turnA.answer.txt
+scratch-e2e/turnB.answer.txt

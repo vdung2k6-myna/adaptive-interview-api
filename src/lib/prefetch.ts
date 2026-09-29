@@ -3,6 +3,7 @@ import type {
   KnowledgeChunk,
   KnowledgeSearch,
   KnowledgeSearchOutcome,
+  SearchOptions,
 } from "@/lib/knowledge";
 
 export const DEFAULT_PREFETCH_TOP_K = 3;
@@ -25,8 +26,13 @@ export interface PrefetchStore {
    * nothing. A failure is never identified, because an `{ ok: false }` held here
    * would be the one route by which a refusal is served later as a retrieval
    * (D9).
+   *
+   * `options` is the search's, forwarded unchanged: a hold issued for a
+   * material-reply persona is asked to carry the section its turn will speak,
+   * and one issued for the generating path asks for nothing extra. The hold
+   * itself stores no options — the section rides on the chunks (design.md D2, D6).
    */
-  issue(input: string, collections?: string[]): Promise<string | null>;
+  issue(input: string, collections?: string[], options?: SearchOptions): Promise<string | null>;
 
   /**
    * Take the held chunks for `id` when `submittedInput` is exactly the input it
@@ -61,8 +67,8 @@ export function createPrefetchStore(options: {
   const holds = new Map<string, HeldPrefetch>();
 
   return {
-    async issue(input, collections = []) {
-      const outcome: KnowledgeSearchOutcome = await search(input, topK, collections);
+    async issue(input, collections = [], options) {
+      const outcome: KnowledgeSearchOutcome = await search(input, topK, collections, options);
       if (!outcome.ok) {
         return null;
       }

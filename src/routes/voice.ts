@@ -6,6 +6,7 @@ import { eq } from "drizzle-orm";
 import { buildPrompt, type PromptMessage } from "@/lib/prompts";
 import { generateChatResponse, generateChatResponseStream } from "@/lib/ollama";
 import { OllamaError } from "@/lib/errors";
+import config from "@/lib/config";
 import {
   transcribeAudio,
   saveAudio,
@@ -20,18 +21,63 @@ import {
   resolveVoice,
   resolveEngineForLanguage,
   SentenceStream,
+  sweepStaleSegments,
+  SEGMENT_MARKER,
   type SynthesizeOptions,
 } from "@/lib/audio";
 
 const upload = multer({ storage: multer.memoryStorage() });
 
 /**
- * The collaborators a caller may replace. Only `speak-stream` needs one: it
- * synthesizes chunk by chunk and emits the audio inline, so its SSE contract is
- * only testable with a synthesizer a test supplies (design D8).
+ * The collaborators a caller may replace. `speak-stream` needs its synthesizer
+ * because it emits audio inline, so its SSE contract is only testable with one a
+ * test supplies (design D8). A *turn* needs the three things it reaches before it
+ * has anything of its own — the session it is recorded against, the file the
+ * recording is written to, and the transcription of that file — because those
+ * arrive first: without them there is no configuration in which a test can drive
+ * a turn at all, which is why this module's STT path had no coverage.
  */
 export interface VoiceRouteDeps {
   synthesizeSpeechWithFallback: typeof synthesizeSpeechWithFallback;
+  transcribeAudio: typeof transcribeAudio;
+  saveAudio: typeof saveAudio;
+  /** The session a turn belongs to, or why it cannot be recorded. */
+  sessionForTurn: (sessionId: string) => Promise<SessionForTurn>;
+}
+
+/** A session a turn may be recorded against, or the refusal to answer with. The
+ * refusals are values rather than responses because the two routes report them
+ * differently: `/turn` as JSON, `/stream` as an SSE event. */
+export type SessionForTurn =
+  | { ok: true; session: typeof interviewSessions.$inferSelect }
+  | { ok: false; status: number; error: string };
+
+/**
+ * The session checks both turn routes make, in the order they make them. Kept as
+ * one function rather than duplicated per route, and taking only the id, so the
+ * whole of a turn's own data access stays in the routes.
+ */
+async function sessionForTurn(sessionId: string): Promise<SessionForTurn> {
+  const sessionRows = await db
+    .select()
+    .from(interviewSessions)
+    .where(eq(interviewSessions.id, sessionId));
+
+  if (sessionRows.length === 0) {
+    return { ok: false, status: 404, error: "Session not found" };
+  }
+
+  const session = sessionRows[0];
+
+  if (session.mode !== "voice") {
+    return { ok: false, status: 403, error: "Session is not in voice mode" };
+  }
+
+  if (session.status === "completed") {
+    return { ok: false, status: 403, error: "Interview has already concluded" };
+  }
+
+  return { ok: true, session };
 }
 
 const router = Router();
@@ -50,11 +96,32 @@ function sendSseEvent(res: Response, event: string, data: unknown) {
 }
 
 /**
- * Delete all audio files associated with saved URL paths.
- * Used to clean up partially-synthesized chunks when a client disconnects.
+ * Delete all audio files associated with saved URL paths, right now.
+ *
+ * Only for the case where the client that was told about them is provably gone:
+ * the response has been aborted or has already ended, so there is nobody left to
+ * fetch them. Everywhere else a turn's segment files are left to
+ * `sweepStaleSegments`, which removes them by age — an announcement and an
+ * immediate delete in adjacent ticks is what made an announced segment
+ * unretrievable in the first place, and a client that is still connected may
+ * still be fetching one (design D2).
  */
 async function cleanupSavedAudio(urls: string[]): Promise<void> {
   await Promise.all(urls.map((url) => deleteAudio(url).catch(() => undefined)));
+}
+
+/**
+ * Reclaim a turn's segment files that have aged out, best-effort.
+ *
+ * Called where the turn ends and the client may still be connected, in place of
+ * deleting the segments just announced. The window comes from config so it is
+ * one knob rather than a constant per call site, and a sweep that finds nothing
+ * aged out — the normal case — costs one directory read.
+ */
+async function sweepAgedSegments(): Promise<void> {
+  await sweepStaleSegments(config.audio.segmentRetentionMs).catch((err) => {
+    console.warn("[POST /api/voice/stream] Segment sweep failed:", err);
+  });
 }
 
 /**
@@ -235,7 +302,7 @@ router.post("/start", async (req, res) => {
 });
 
 /* ── POST /api/voice/turn ───────────────────────────────────────── */
-router.post("/turn", upload.single("audio"), async (req, res) => {
+async function handleTurn(req: Request, res: Response, deps: VoiceRouteDeps): Promise<void> {
   const abortController = new AbortController();
   const onDisconnect = () => {
     if (!abortController.signal.aborted && !res.writableEnded) {
@@ -257,31 +324,18 @@ router.post("/turn", upload.single("audio"), async (req, res) => {
       return;
     }
 
-    const sessionRows = await db
-      .select()
-      .from(interviewSessions)
-      .where(eq(interviewSessions.id, sessionId));
+    const found = await deps.sessionForTurn(sessionId);
 
-    if (sessionRows.length === 0) {
-      res.status(404).json({ error: "Session not found" });
+    if (!found.ok) {
+      res.status(found.status).json({ error: found.error });
       return;
     }
 
-    const session = sessionRows[0];
-
-    if (session.mode !== "voice") {
-      res.status(403).json({ error: "Session is not in voice mode" });
-      return;
-    }
-
-    if (session.status === "completed") {
-      res.status(403).json({ error: "Interview has already concluded" });
-      return;
-    }
+    const session = found.session;
 
     const audioExt = audioFile.mimetype === "audio/wav" ? "wav" : "webm";
     const audioBuffer = audioFile.buffer;
-    const { filePath: candidateAudioPath, urlPath: candidateAudioUrl } = await saveAudio(
+    const { filePath: candidateAudioPath, urlPath: candidateAudioUrl } = await deps.saveAudio(
       sessionId,
       audioBuffer,
       "candidate",
@@ -291,12 +345,24 @@ router.post("/turn", upload.single("audio"), async (req, res) => {
     let transcription: string;
     let sttConfidence: number | undefined;
     try {
-      const sttResult = await transcribeAudio(candidateAudioPath);
+      const sttResult = await deps.transcribeAudio(candidateAudioPath);
       transcription = sttResult.text;
       sttConfidence = sttResult.confidence;
     } catch (err) {
       console.error("[POST /api/voice/turn] STT error:", err);
       res.status(500).json({ error: "Failed to transcribe audio. Please try again." });
+      return;
+    }
+
+    // Heard nothing. The STT client reports this as an empty transcript rather
+    // than throwing, which is the right shape for an answer that was not given —
+    // but it must not be stored: an empty candidate message would enter the
+    // transcript and the scoring as a real answer, and the next question would be
+    // generated from it. 400 rather than 500, since the service answered, and a
+    // code as well as a message so the client can say it in the reader's language.
+    if (!transcription) {
+      console.error("[POST /api/voice/turn] STT returned no words");
+      res.status(400).json({ code: "no_speech", error: "No speech detected. Please try again." });
       return;
     }
 
@@ -515,10 +581,10 @@ router.post("/turn", upload.single("audio"), async (req, res) => {
     console.error("[POST /api/voice/turn] UNEXPECTED ERROR:", err);
     res.status(500).json({ error: err instanceof Error ? err.message : "Failed to process voice turn" });
   }
-});
+}
 
 /* ── POST /api/voice/stream ─────────────────────────────────────── */
-router.post("/stream", upload.single("audio"), async (req, res) => {
+async function handleStreamTurn(req: Request, res: Response, deps: VoiceRouteDeps): Promise<void> {
   // Set SSE headers immediately
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -554,34 +620,19 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
       return;
     }
 
-    const sessionRows = await db
-      .select()
-      .from(interviewSessions)
-      .where(eq(interviewSessions.id, sessionId));
+    const found = await deps.sessionForTurn(sessionId);
 
-    if (sessionRows.length === 0) {
-      sendSseEvent(res, "error", { message: "Session not found" });
+    if (!found.ok) {
+      sendSseEvent(res, "error", { message: found.error });
       res.end();
       return;
     }
 
-    const session = sessionRows[0];
-
-    if (session.mode !== "voice") {
-      sendSseEvent(res, "error", { message: "Session is not in voice mode" });
-      res.end();
-      return;
-    }
-
-    if (session.status === "completed") {
-      sendSseEvent(res, "error", { message: "Interview has already concluded" });
-      res.end();
-      return;
-    }
+    const session = found.session;
 
     const audioExt = audioFile.mimetype === "audio/wav" ? "wav" : "webm";
     const audioBuffer = audioFile.buffer;
-    const { filePath: candidateAudioPath, urlPath: candidateAudioUrl } = await saveAudio(
+    const { filePath: candidateAudioPath, urlPath: candidateAudioUrl } = await deps.saveAudio(
       sessionId,
       audioBuffer,
       "candidate",
@@ -591,12 +642,28 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
     let transcription: string;
     let sttConfidence: number | undefined;
     try {
-      const sttResult = await transcribeAudio(candidateAudioPath);
+      const sttResult = await deps.transcribeAudio(candidateAudioPath);
       transcription = sttResult.text;
       sttConfidence = sttResult.confidence;
     } catch (err) {
       console.error("[POST /api/voice/stream] STT error:", err);
       sendSseEvent(res, "error", { message: "Failed to transcribe audio. Please try again." });
+      res.end();
+      return;
+    }
+
+    // Heard nothing — see the `/api/voice/turn` note above: the same empty
+    // transcript reaches here as a value rather than a throw, and storing it would
+    // put a candidate answer in the transcript that was never given. A `notice`
+    // rather than an `error`, for the reason the voice-agent route gives: nothing
+    // failed. The `/turn` route has no side channel to be gentle on — its 400
+    // carries the same code for the client to read.
+    if (!transcription) {
+      console.error("[POST /api/voice/stream] STT returned no words");
+      sendSseEvent(res, "notice", {
+        code: "no_speech",
+        message: "No speech detected. Please try again.",
+      });
       res.end();
       return;
     }
@@ -645,7 +712,7 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
           signal: abortController.signal,
         };
         const ttsBuffer = await synthesizeSpeechWithFallback(completionText, ttsOptions, 0, abortController.signal);
-        const { urlPath } = await saveAudio(sessionId, ttsBuffer, "interviewer", "wav");
+        const { urlPath } = await deps.saveAudio(sessionId, ttsBuffer, "interviewer", "wav");
         interviewerAudioUrl = urlPath;
       } catch (err) {
         if (err instanceof Error && err.name === "AbortError") {
@@ -794,10 +861,10 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
           if (fmt === "bin") {
             return { index: idx, buffer: null, text: sentenceText, urlPath: null };
           }
-          const { urlPath } = await saveAudio(
+          const { urlPath } = await deps.saveAudio(
             sessionId,
             buffer,
-            `interviewer-chunk-${idx}`,
+            `${SEGMENT_MARKER}-${idx}`,
             fmt
           );
           // Track the URL immediately so cleanup can find it even if the route exits before .then() fires.
@@ -882,7 +949,9 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
 
     if (llmError) {
       console.error("[POST /api/voice/stream] LLM error:", llmError);
-      await cleanupSavedAudio(savedUrls);
+      // The client is still connected, so segments announced before the stream
+      // broke may still be in flight — the sweep is what removes them, not this.
+      await sweepAgedSegments();
       sendSseEvent(res, "error", {
         message:
           llmError instanceof OllamaError
@@ -895,7 +964,8 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
 
     const fullText = getFullText().trim() || accumulatedText.trim();
     if (!fullText) {
-      await cleanupSavedAudio(savedUrls);
+      // As above: still connected, so nothing announced is deleted here.
+      await sweepAgedSegments();
       sendSseEvent(res, "error", { message: "LLM returned empty response" });
       res.end();
       return;
@@ -964,21 +1034,23 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
             validBuffers.length === 1
               ? validBuffers[0]
               : concatWavBuffers(validBuffers, 0.3);
-          const { urlPath } = await saveAudio(sessionId, combinedBuffer, "interviewer", "wav");
+          const { urlPath } = await deps.saveAudio(sessionId, combinedBuffer, "interviewer", "wav");
           interviewerAudioUrl = urlPath;
           combinedFormat = "wav";
         } else {
           const fmt = detectAudioFormat(validBuffers[0]);
-          const { urlPath } = await saveAudio(sessionId, validBuffers[0], "interviewer", fmt);
+          const { urlPath } = await deps.saveAudio(sessionId, validBuffers[0], "interviewer", fmt);
           interviewerAudioUrl = urlPath;
           combinedFormat = fmt;
         }
 
-        // Combined file is now the canonical audio; temporary chunk files are no longer needed.
-        if (savedUrls.length > 0) {
-          await cleanupSavedAudio(savedUrls).catch(() => undefined);
-          savedUrls.length = 0;
-        }
+        // The combined file is now the canonical audio, so the segments are
+        // redundant — but not yet unneeded. The last segment was announced a
+        // few ticks ago and its client may still be fetching it, so the turn
+        // ends by sweeping what has aged out instead of deleting what it just
+        // announced (design D2). The canonical file is not a segment and is
+        // never in the sweep's path.
+        await sweepAgedSegments();
       } catch (err) {
         console.error("[POST /api/voice/stream] Audio concat error:", err);
       }
@@ -1014,7 +1086,10 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
     res.end();
   } catch (err) {
     console.error("[POST /api/voice/stream] UNEXPECTED ERROR:", err);
-    await cleanupSavedAudio(savedUrls);
+    // Whether the client is still there is unknown here, and deleting on a
+    // connected client is the failure this change exists to remove — so the
+    // sweep reclaims, and anything too young is left for the next turn.
+    await sweepAgedSegments();
     try {
       sendSseEvent(res, "error", {
         message: err instanceof Error ? err.message : "Failed to process voice turn",
@@ -1024,7 +1099,7 @@ router.post("/stream", upload.single("audio"), async (req, res) => {
     }
     res.end();
   }
-});
+}
 
 /* ── POST /api/voice/speak ──────────────────────────────────────── */
 router.post("/speak", async (req, res) => {
@@ -1079,6 +1154,17 @@ router.post("/speak", async (req, res) => {
 });
 
 /* ── POST /api/voice/speak-stream ───────────────────────────────── */
+/**
+ * Register the turn routes on `router`, taking the session lookup, the audio
+ * store and the transcriber from `deps` — the seam that lets a test drive a turn
+ * with no Postgres, no audio directory and no STT service. Paths, bodies, status
+ * codes and event sequences are unchanged.
+ */
+function registerTurnRoutes(router: Router, deps: VoiceRouteDeps): void {
+  router.post("/turn", upload.single("audio"), (req, res) => handleTurn(req, res, deps));
+  router.post("/stream", upload.single("audio"), (req, res) => handleStreamTurn(req, res, deps));
+}
+
 /**
  * Register the endpoint on `router`, taking its synthesizer from `deps` — the
  * seam that lets a test drive this route's SSE contract without an audio
@@ -1208,9 +1294,16 @@ async function handleSpeakStream(
  * the same router instance and paths, so `src/index.ts`'s mount is unchanged.
  */
 export function createVoiceRouter(overrides: Partial<VoiceRouteDeps> = {}): Router {
-  const deps: VoiceRouteDeps = { synthesizeSpeechWithFallback, ...overrides };
+  const deps: VoiceRouteDeps = {
+    synthesizeSpeechWithFallback,
+    transcribeAudio,
+    saveAudio,
+    sessionForTurn,
+    ...overrides,
+  };
   const composed = Router();
   composed.use(router);
+  registerTurnRoutes(composed, deps);
   registerSpeakStream(composed, deps);
   return composed;
 }

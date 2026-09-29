@@ -15,7 +15,16 @@ export {
 } from "./client";
 export { transcribeAudio } from "./stt";
 export { synthesizeSpeech, synthesizeSentences } from "./tts";
-export { saveAudio, readAudio, audioExists, deleteAudio, urlPathToFilePath, detectAudioFormat } from "./storage";
+export {
+  saveAudio,
+  readAudio,
+  audioExists,
+  deleteAudio,
+  urlPathToFilePath,
+  detectAudioFormat,
+  sweepStaleSegments,
+  SEGMENT_MARKER,
+} from "./storage";
 export { splitSentences, extractNewSentences } from "./split-sentences";
 export { concatWavBuffers, isValidWav } from "./wav-utils";
 export {

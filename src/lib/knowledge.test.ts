@@ -31,6 +31,20 @@ function stubRejectingFetch(err: Error): void {
   });
 }
 
+/** Every URL the client requested, for the tests that are about the request
+ * rather than about the answer. Answers an empty content read. */
+function captureRequestUrls(): string[] {
+  const urls: string[] = [];
+  mock.method(globalThis, "fetch", async (...args: unknown[]) => {
+    urls.push(String(args[0]));
+    return new Response(JSON.stringify({ chunks: [] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+  return urls;
+}
+
 /** Silence warnings and hand back what was warned, for the noisy outcomes. */
 function captureWarnings(): string[] {
   const warnings: string[] = [];
@@ -73,6 +87,167 @@ describe("searchKnowledge", () => {
       warnings.some((w) => w.includes("source_name")),
       `expected a warning naming source_name, got ${JSON.stringify(warnings)}`
     );
+  });
+
+  /* ── the routing metadata a hit needs to locate its own source ───── */
+
+  it("carries a hit's address, collections, position and score through the parse", async () => {
+    const address = "https%3A%2F%2Fvi.wikipedia.org%2Fwiki%2FTr%E1%BA%A1ng_Qu%E1%BB%B3nh";
+    stubFetch(200, {
+      results: [
+        {
+          text: "Trạng Quỳnh là một nhân vật truyện cười dân gian.",
+          score: 0.68,
+          source_name: "Trạng Quỳnh – Wikipedia",
+          address,
+          collections: ["truyen-kiem-hiep", "kiem-hiep"],
+          position: 7,
+        },
+      ],
+    });
+
+    const chunks = expectOk(await searchKnowledge("Trạng Quỳnh", 1));
+
+    assert.deepEqual(chunks[0], {
+      text: "Trạng Quỳnh là một nhân vật truyện cười dân gian.",
+      source: "Trạng Quỳnh – Wikipedia",
+      score: 0.68,
+      address,
+      collections: ["truyen-kiem-hiep", "kiem-hiep"],
+      position: 7,
+      section: undefined,
+      sectionSize: undefined,
+    });
+  });
+
+  it("carries a hit's section and its stated size through the parse", async () => {
+    // The section repeats the hit's own text among its chunks, so the passage can
+    // be spoken from them alone, and `section_size` is the service's own count
+    // rather than the length of the list it sent — the two differ exactly when
+    // the expansion was bounded, which is the fact the material gate refuses on.
+    stubFetch(200, {
+      results: [
+        {
+          text: "## SÚNG SĂN\nMột người thợ săn nọ...",
+          score: 0.71,
+          source_name: "101-Truyen-Cuoi-Dan-Gian-Viet-Nam.txt",
+          address: "101-Truyen-Cuoi-Dan-Gian-Viet-Nam.txt",
+          collections: ["truyen-cuoi"],
+          position: 14,
+          section: [
+            { text: "## SÚNG SĂN\nMột người thợ săn nọ...", position: 14 },
+            { text: "## SÚNG SĂN\n...bèn bắn vào bụi rậm.", position: 15 },
+            { text: "## SÚNG SĂN\nNgười đi đường cười ồ.", position: 16 },
+          ],
+          section_size: 3,
+        },
+      ],
+    });
+
+    const chunks = expectOk(await searchKnowledge("súng săn", 1, ["truyen-cuoi"], { expand: "section" }));
+
+    assert.deepEqual(chunks[0].section, [
+      { text: "## SÚNG SĂN\nMột người thợ săn nọ...", position: 14 },
+      { text: "## SÚNG SĂN\n...bèn bắn vào bụi rậm.", position: 15 },
+      { text: "## SÚNG SĂN\nNgười đi đường cười ồ.", position: 16 },
+    ]);
+    assert.equal(chunks[0].sectionSize, 3);
+  });
+
+  it("reads a section the service reported as shorter than it really holds", async () => {
+    // A bounded expansion: the list is capped, `section_size` is not. Reading the
+    // size off the list would report this as a complete section, which is what
+    // makes the two fields separate facts rather than one repeated.
+    stubFetch(200, {
+      results: [
+        {
+          text: "## Chiêu thức\nChiêu thứ nhất...",
+          score: 0.64,
+          source_name: "kiem-hiep.txt",
+          section: [{ text: "## Chiêu thức\nChiêu thứ nhất...", position: 15 }],
+          section_size: 17,
+        },
+      ],
+    });
+
+    const chunks = expectOk(await searchKnowledge("chiêu thức", 1));
+
+    assert.equal(chunks[0].section?.length, 1);
+    assert.equal(chunks[0].sectionSize, 17, "the size is the service's, not the list's");
+  });
+
+  it("drops a section entry that carries no position rather than ordering it blindly", async () => {
+    // The section is joined in reading order, and an entry with no position
+    // cannot say where its text belongs. Dropping it leaves the section shorter
+    // than the size reported, which the gate already refuses — so a malformed
+    // entry degrades to a generated reply, never to a passage in the wrong order.
+    captureWarnings();
+    stubFetch(200, {
+      results: [
+        {
+          text: "## SÚNG SĂN\nMột người thợ săn nọ...",
+          score: 0.71,
+          source_name: "101-Truyen-Cuoi-Dan-Gian-Viet-Nam.txt",
+          section: [
+            { text: "## SÚNG SĂN\nMột người thợ săn nọ...", position: 14 },
+            { text: "## SÚNG SĂN\n...bèn bắn vào bụi rậm." },
+          ],
+          section_size: 2,
+        },
+      ],
+    });
+
+    const chunks = expectOk(await searchKnowledge("súng săn", 1));
+
+    assert.equal(chunks[0].section?.length, 1);
+    assert.equal(chunks[0].sectionSize, 2);
+  });
+
+  it("parses a hit from a service that predates the routing metadata", async () => {
+    // The degraded deployment of 7.3: an older /search sends neither the
+    // address, the collections nor the position, and every turn that follows
+    // must generate rather than fail. Parsing is where that has to survive, so
+    // the absent fields are asserted as absent rather than defaulted here — a
+    // caller distinguishes "no collections reported" from "this source is in
+    // none", and only the service can say which it meant.
+    stubFetch(200, {
+      results: [{ text: "An older service's chunk.", score: 0.6, source_name: "guide.pdf" }],
+    });
+
+    const chunks = expectOk(await searchKnowledge("star method", 1));
+
+    assert.equal(chunks[0].text, "An older service's chunk.");
+    assert.equal(chunks[0].source, "guide.pdf");
+    assert.equal(chunks[0].score, 0.6, "the score the type already declared is still read");
+    assert.equal(chunks[0].address, undefined);
+    assert.equal(chunks[0].collections, undefined);
+    assert.equal(chunks[0].position, undefined);
+    assert.equal(chunks[0].section, undefined);
+    assert.equal(chunks[0].sectionSize, undefined);
+  });
+
+  it("keeps a source that is in no collection apart from a service that reported none", async () => {
+    stubFetch(200, {
+      results: [
+        {
+          text: "An untagged source's chunk.",
+          score: 0.6,
+          source_name: "notes.txt",
+          address: "notes.txt",
+          collections: [],
+          position: 0,
+        },
+      ],
+    });
+
+    const chunks = expectOk(await searchKnowledge("notes", 1));
+
+    assert.deepEqual(
+      chunks[0].collections,
+      [],
+      "a source in no collection and a service that said nothing about collections are different facts"
+    );
+    assert.equal(chunks[0].position, 0, "position zero is a position, not a missing one");
   });
 
   /* ── the four failure reasons, one test each ─────────────────────── */
@@ -188,6 +363,112 @@ describe("searchKnowledge", () => {
     );
   });
 
+  /* ── the knowledge section's directive ───────────────────────────── */
+
+  const DIRECTIVE_CHUNKS = [
+    {
+      text: "The STAR method structures answers as Situation, Task, Action, Result.",
+      source: "interview-guide.pdf",
+    },
+    {
+      text: "Behavioral questions probe past experience rather than hypotheticals.",
+      source: "behavioral-questions.pdf",
+    },
+  ];
+
+  /**
+   * The section's prose with the numbered chunk lines dropped — what is left is
+   * the directive rather than the material it accompanies.
+   */
+  function directiveOf(system: string): string {
+    const section = system.slice(
+      system.indexOf("Relevant knowledge:"),
+      system.indexOf("Rules:")
+    );
+    return section
+      .split("\n")
+      .filter((line) => !/^\d+\.\s/.test(line))
+      .join("\n");
+  }
+
+  it("directs the model to base its reply on the chunks", () => {
+    const system = buildVoiceAgentPrompt(
+      "You are an interview coach.",
+      "english",
+      [],
+      DIRECTIVE_CHUNKS
+    )[0].content;
+    const directive = directiveOf(system);
+
+    assert.ok(system.includes("Relevant knowledge:"), "the section keeps its label");
+    assert.ok(
+      /relevan/i.test(directive) && /material|chunks/i.test(directive),
+      `the directive must scope itself to material relevant to the turn; got ${directive}`
+    );
+    assert.ok(
+      /prefer/i.test(directive),
+      `the directive must prefer the material's terminology and specifics; got ${directive}`
+    );
+    assert.ok(
+      /contradict/i.test(directive),
+      `the directive must forbid contradicting the material — this is what makes it authoritative; got ${directive}`
+    );
+    assert.ok(
+      /not cover|doesn't cover|does not cover/i.test(directive),
+      `the directive must leave the persona free to reply when the material misses the turn; got ${directive}`
+    );
+  });
+
+  it("adds nothing at all when there are no chunks", () => {
+    // Pinned literally, so an edit that moves the directive somewhere
+    // unconditional — the Rules block, say — fails here rather than silently
+    // changing every no-knowledge turn.
+    const expected = `You are an interview coach.
+
+Rules:
+- Conduct the entire conversation in english. Replies must be in english only.
+- Keep replies concise and conversational.
+- Use Markdown only when it helps clarity.`;
+
+    const omitted = buildVoiceAgentPrompt(
+      "You are an interview coach.",
+      "english",
+      [],
+      undefined
+    );
+    const empty = buildVoiceAgentPrompt("You are an interview coach.", "english", [], []);
+
+    assert.equal(
+      omitted[0].content,
+      expected,
+      "a turn with no chunks must build exactly the prompt it builds with no retrieval at all"
+    );
+    assert.deepEqual(
+      empty,
+      omitted,
+      "a successful empty result and no search at all are the same prompt"
+    );
+  });
+
+  it("carries no citation instruction, because the reply is spoken", () => {
+    const system = buildVoiceAgentPrompt(
+      "You are an interview coach.",
+      "english",
+      [],
+      DIRECTIVE_CHUNKS
+    )[0].content;
+    const directive = directiveOf(system);
+
+    assert.ok(
+      !directive.includes("["),
+      `a bracketed source name survives stripMarkdown and is read aloud; got ${directive}`
+    );
+    assert.ok(
+      !/cite|citation/i.test(directive),
+      `the directive must not ask for citations; got ${directive}`
+    );
+  });
+
   /* ── the request body ────────────────────────────────────────────── */
 
   function captureRequestBody(): Record<string, unknown>[] {
@@ -233,5 +514,32 @@ describe("searchKnowledge", () => {
       `an unscoped search must stay today's request; got ${JSON.stringify(sent[0])}`
     );
     assert.deepEqual(Object.keys(sent[0]).sort(), ["query", "top_k"]);
+  });
+
+  it("sends the expansion only when the caller asks for a section", async () => {
+    // The material locator's request: scoped, one result, and a section. The
+    // generating path's search — the case above — sends no such field, which is
+    // what keeps its request byte-identical to the one it has always sent.
+    const sent = captureRequestBody();
+
+    await searchKnowledge("súng săn", 1, ["truyen-cuoi"], { expand: "section" });
+
+    assert.deepEqual(sent[0], {
+      query: "súng săn",
+      top_k: 1,
+      collections: ["truyen-cuoi"],
+      expand: "section",
+    });
+  });
+
+  it("omits the expansion when the options carry none", async () => {
+    const sent = captureRequestBody();
+
+    await searchKnowledge("star method", 3, ["truyen-kiem-hiep"], {});
+
+    assert.ok(
+      !("expand" in sent[0]),
+      `an unasked-for expansion would change the generating path's request; got ${JSON.stringify(sent[0])}`
+    );
   });
 });

@@ -193,6 +193,15 @@ Migrations live in `migrations/` and are applied with Drizzle Kit:
 npx drizzle-kit migrate
 ```
 
+Drizzle records what it has applied in `drizzle.__drizzle_migrations`, and
+decides what to apply from that table alone — it is not compared against the
+schema. A database whose tables were created some other way (SQL run by hand,
+`drizzle-kit push`) has an empty bookkeeping table, so `migrate` replays
+`0000_initial` and fails on the first table that already exists; drizzle-kit
+prints nothing when it does. See
+[docs/SETUP.md § 4](SETUP.md#4-run-database-migrations) for the baseline repair
+(`node scripts/db-baseline.mjs --apply`).
+
 ### Migration history
 
 | File | Description |
@@ -201,6 +210,8 @@ npx drizzle-kit migrate
 | `migrations/0001_add_evaluation_jobs.sql` | Adds `evaluation_jobs` table |
 | `migrations/0002_set_null_fk.sql` | Changes `evaluation_jobs.result_id` FK to `ON DELETE SET NULL` |
 | `migrations/0003_certain_multiple_man.sql` | Adds `language` column to `interview_sessions` |
+| `migrations/0004_add_personas.sql` | Creates `personas` and seeds it with the voice agent's personas, every one in `generate` answer mode |
+
 
 ## Vector Search
 

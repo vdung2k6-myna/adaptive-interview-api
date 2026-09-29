@@ -1,5 +1,5 @@
 import type { AppConfig } from "./index";
-import { parsePositiveInt } from "./env";
+import { parseList, parsePositiveInt, parseUnitInterval } from "./env";
 
 export const productionConfig: AppConfig = {
   env: "production",
@@ -37,6 +37,12 @@ export const productionConfig: AppConfig = {
     defaultEngine: (process.env.DEFAULT_TTS_ENGINE as "kokoro" | "piper" | "supertonic") || "supertonic",
     defaultVoice: process.env.DEFAULT_VOICE || "default_name",
     timeoutMs: 60_000,
+    // 5 minutes — half development's, because what multiplies here is disk:
+    // window times turns in flight. Still two orders of magnitude more than a
+    // segment needs to survive being fetched, and a window set too short fails
+    // toward unavailable audio, which the client's canonical-audio recovery
+    // covers.
+    segmentRetentionMs: parsePositiveInt(process.env.AUDIO_SEGMENT_RETENTION_MS, 5 * 60_000),
     voices: {
       kokoro: {
         english: process.env.KOKORO_VOICE_ENGLISH || "af_heart",
@@ -57,5 +63,19 @@ export const productionConfig: AppConfig = {
     // See development.ts — keep this tight; it is paid on every turn while the
     // service is unreachable.
     searchTimeoutMs: parsePositiveInt(process.env.DOC_ETL_SEARCH_TIMEOUT_MS, 1_500),
+  },
+  material: {
+    // Empty until a deployment says otherwise, which is what makes the material
+    // path safe to ship: with no speakable collection, every turn generates
+    // exactly as it does today, so a deployment that has never measured its own
+    // corpus cannot begin speaking stored passages by inheriting a default (D5).
+    //
+    // Setting this to a blank value is the same decision said explicitly, and
+    // `parseList` honours it as such.
+    collections: parseList(process.env.MATERIAL_COLLECTIONS, []),
+    // See development.ts for the measurement. Unread while the speakable set is
+    // empty, and defaulted here so that turning a collection on does not also
+    // require choosing a floor in the same change.
+    scoreFloor: parseUnitInterval(process.env.MATERIAL_SCORE_FLOOR, 0.55),
   },
 };

@@ -710,9 +710,13 @@ The endpoint accepts either an audio recording (voice input) or a `text` field (
 | `audio` | `Blob` (`audio/wav` or `audio/webm`) | No | User voice recording. Omit on first turn or when using text input. |
 | `text` | `string` | No | User text message. Alternative to `audio`. |
 | `language` | `"english"` \| `"vietnamese"` | Yes | Conversation language and TTS voice selector. |
-| `engine` | `"kokoro"` \| `"piper"` | Yes | Requested TTS engine (runtime may force an engine based on `language`). |
+| `engine` | `"kokoro"` \| `"piper"` \| `"supertonic"` | Yes | Requested TTS engine (runtime may force an engine based on `language`). |
 | `systemPrompt` | `string` | Yes | Agent behavior/persona prompt. |
 | `history` | `JSON string` | Yes | Array of `{ role: "agent" \| "user", content: string }`. |
+| `enabledTopics` | `JSON string` \| repeated field | No | Topic labels the turn may draw knowledge from (see `GET /api/personas` for a persona's own list). Absent or empty means the search is unscoped. |
+| `answerMode` | `"generate"` \| `"material"` | No | How this turn's reply is produced. Anything other than `"material"` generates, so omitting it is exactly the previous behaviour. See [Material replies](#material-replies). |
+| `prefetchId` | `string` | No | A prefetch (`POST /api/voice-agent/prefetch`) whose located chunks this turn should reuse instead of searching again. |
+| `speak` | `"0"` | No | Set to `"0"` to skip TTS synthesis: `sentence` events still arrive with `audioData: null`. |
 
 **Response:** `text/event-stream`
 
@@ -748,6 +752,101 @@ data: {"messageId":"agent-1","fullText":"A closure is a function that remembers 
 
 - `200` — SSE stream opened (errors delivered as `event: error`)
 - `400` — Missing `systemPrompt` or invalid configuration
+
+### Material replies
+
+A turn whose request carries `answerMode: "material"` is answered from the indexed material rather than by the language model: the turn's search locates one result, expanded to that result's whole section, and the section's stored text is the reply — no model request is made at all. The reply is emitted through the same `sentence` and `done` events a generated one uses, so a client needs no change to render it.
+
+A materially-answered turn requires **all** of:
+
+| Condition | Where it comes from |
+|-----------|---------------------|
+| The request asks for material (`answerMode: "material"`) | The client, from the persona's catalog entry |
+| The search returns a hit | The turn's `enabledTopics` scoped search |
+| That hit's source is in a collection named by `MATERIAL_COLLECTIONS` | Server config — a request cannot widen this |
+| That hit's score is at or above `MATERIAL_SCORE_FLOOR` | Server config |
+| The hit carries its whole section — present, non-empty, and as many chunks as `section_size` states | The search's `expand: "section"`, and the service version behind it |
+
+When any of them fails, the turn is generated exactly as it is on a deployment without this feature, and the log says which condition failed (`Material path did not answer this turn (<reason>); generating instead`). The same fallback covers a service too old to expand a section, a section returned short of the size the service stated (`section_incomplete`), and a section whose text is empty — a material turn is never worse off than a generated one.
+
+The passage arrives with the search that located it: a material turn issues no second request, so there is no content read whose failure could answer a turn.
+
+**Configuration, and what "unset" means:**
+
+- `MATERIAL_COLLECTIONS` — comma-separated collection names whose stored text is clean enough to be spoken aloud as stored. **Unset in production, which means the empty set, and an empty set means every reply is generated** however a request asks; the material path is then inert. Development defaults to the two wiki collections; `truyen-cuoi` is deliberately absent because its stored text is OCR-corrupted.
+- `MATERIAL_SCORE_FLOOR` — how close a hit must be to be spoken, in `[0, 1]`. Unset defaults to `0.55`. Unread while the speakable set is empty.
+
+The floor's default is measured rather than guessed, and re-measuring is a task after any corpus or embedding-model change:
+
+```bash
+node scripts/measure-material-floor.mjs     # needs doc-etl-api up (DOC_ETL_API_URL)
+```
+
+It sends 24 queries — 8 naming a story in the speakable set, 8 asking vaguely, 8 plainly off-topic — through the same `top_k: 1` request a material turn's locator sends, and writes the scores to `D:/tmp/material-floor.json`. Measured on the development corpus (23 Sep 2026): named on-topic 0.635–0.677, vaguely on-topic 0.480–0.596, off-topic 0.380–0.531. The named and off-topic bands do not overlap, so any floor in `(0.531, 0.635]` separates them; the default `0.55` refuses none of the named queries, 3 of the 8 vague ones and none of the 8 off-topic ones.
+
+### `POST /api/voice-agent/prefetch`
+
+**Run a turn's knowledge search before the turn is submitted.** The client calls this while the user types; the id it returns is then sent as `prefetchId` on `POST /api/voice-agent/stream`, and the turn reuses the held result instead of searching again. A prefetch is speculative and never fails the turn it was meant for — every way of holding nothing answers `{ prefetchId: null }`.
+
+**Request:** `application/json`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `text` | `string` | Yes | The input being prefetched. Trimmed here and at the submitting turn, identically, so the two sides compare as the same text; a prefetch is reused only for the exact input it was issued for. |
+| `enabledTopics` | `string[]` | Yes | Topic labels scoping the search, folded to collection names exactly as on the stream endpoint. Absent or folding to no collection means nothing is searched and `prefetchId` is `null`. |
+| `answerMode` | `"generate"` \| `"material"` | No | The persona's mode for the turn this prefetch is meant for. **Omitting it is valid** and searches exactly as before this field existed. It is an optimization, not a dependency: with `"material"` the held hits carry the section a material turn speaks, so that turn reuses the hold and issues no search; omitted, the held hits carry no section, the material turn declines the hold and issues its own locator search — one search it would otherwise have skipped, and the same one it issues whenever no prefetch is held. See [Material replies](#material-replies). |
+
+**Response:**
+
+```json
+{ "prefetchId": "0f1e2d3c-..." }
+```
+
+`prefetchId` is `null` when there was nothing to hold: no `text`, no topic resolving to a collection, or a search that timed out, could not reach doc-etl-api, or was refused.
+
+**Status Codes:**
+
+- `200` — Always, including when nothing was held
+- `401` — Missing or invalid auth token, when `API_AUTH_TOKEN` is set
+
+---
+
+## Personas
+
+### `GET /api/personas`
+
+**The personas the voice agent can be run as, served as a catalog.** Read-only and seeded by the schema migration: there is no route that creates, modifies or deletes a persona, and the catalog can only change by a migration. `POST /api/voice-agent/stream` takes a persona's `systemPrompt`, `enabledTopics` and `answerMode` as ordinary turn fields, so a session is started by sending the persona's own values.
+
+**Response:** `application/json` — an array ordered by the catalog's sort order.
+
+```json
+[
+  {
+    "id": "friendly-partner",
+    "label": "Friendly Partner",
+    "emoji": "🤝",
+    "defaultPrompt": "Act as a friendly personal conversation partner...",
+    "knowledgeTopics": ["Story teller", "Behavioral Questions", "Truyện cười"],
+    "answerMode": "generate"
+  }
+]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `string` | Stable identifier. A client resolves a `?persona=<id>` link against it. |
+| `label` | `string` | Display name. |
+| `emoji` | `string` | Display emoji, possibly empty. |
+| `defaultPrompt` | `string` | The `systemPrompt` to start a session with. |
+| `knowledgeTopics` | `string[]` | Topic labels the session may enable — the values to send as `enabledTopics`. |
+| `answerMode` | `"generate"` \| `"material"` | How the persona's replies are produced. A persona stored without one is reported as `"generate"`. |
+
+**Note:** the catalog is not translated and does not vary by locale — a persona's text is its own.
+
+**Status Codes:**
+
+- `200` — the catalog
+- `401` — missing or invalid credential on a deployment with `API_AUTH_TOKEN` set
 
 ---
 

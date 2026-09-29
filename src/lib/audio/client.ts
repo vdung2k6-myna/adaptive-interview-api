@@ -55,6 +55,11 @@ export class AudioCppClient {
    * Speech-to-text: send an audio file and receive transcription.
    * @param audioPath Absolute path to the audio file on disk.
    * @param model Optional model override.
+   *
+   * An empty `text` is an answer rather than an error: no words were heard. The
+   * caller knows what that means for its own turn — a session opener has nothing
+   * to transcribe in the first place, a voice turn heard silence, and an interview
+   * answer was not given — so this returns it and leaves the decision there.
    */
   async transcribe(audioPath: string, model?: string): Promise<TranscriptionResult> {
     const formData = new FormData();
@@ -81,12 +86,15 @@ export class AudioCppClient {
       }
 
       const data = (await res.json()) as { text?: string; confidence?: number };
-      if (!data.text) {
-        throw new Error("STT returned empty transcription");
-      }
-
+      // No words is not a failure. Throwing here made a silent recording — or one
+      // the model could find no words in — reach every caller looking exactly like
+      // a dead STT service, and each of them then reported a failed transcription
+      // to a user who had simply not spoken. A 200 with no text is the service
+      // working and hearing nothing; a service that is actually down answers
+      // non-200 above, which is the error it looks like. Whitespace is trimmed
+      // because a transcript of blank air is the same absent answer as none.
       return {
-        text: data.text,
+        text: (data.text ?? "").trim(),
         confidence: data.confidence,
       };
     } catch (err) {

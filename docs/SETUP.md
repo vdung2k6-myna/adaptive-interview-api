@@ -114,6 +114,24 @@ psql $DATABASE_URL -f migrations/0000_initial.sql
 # Apply subsequent migrations as needed
 ```
 
+**If you take the manual path, baseline the bookkeeping afterwards.** `drizzle-kit
+migrate` decides what to apply from `drizzle.__drizzle_migrations` alone, and
+applying SQL by hand writes no rows there — so the next `migrate` replays
+`0000_initial` and dies on the first `CREATE TABLE` whose table already exists.
+It does so **silently**: drizzle-kit's migrate progress view renders a rejection
+with the same "applying migrations..." text as progress, so `npm run db:migrate`
+just exits 1 with no message. Baseline instead of re-running anything:
+
+```bash
+node scripts/db-baseline.mjs          # verify each migration's objects are present; write nothing
+node scripts/db-baseline.mjs --apply  # record what is verified as present
+```
+
+The same script repairs any database that was built by hand or by
+`drizzle-kit push`, and it refuses to record a migration whose objects are not
+in the database rather than marking unapplied work as applied. A database that
+has only ever been migrated by `drizzle-kit migrate` never needs it.
+
 ## 5. Seed Sample Data
 
 ```bash
