@@ -6,7 +6,8 @@ wrappers under `*-service/`) is licensed under the **MIT License** (see
 
 That MIT grant covers the source tracked in this repository. It does **not**
 cover the model weights, voice files, or third-party runtime dependencies
-described below, and it does **not** describe what a built image contains.
+described below, and it does **not** describe what a deployment of this
+software contains.
 
 ## Source tree vs. deployment
 

@@ -31,20 +31,6 @@ function stubRejectingFetch(err: Error): void {
   });
 }
 
-/** Every URL the client requested, for the tests that are about the request
- * rather than about the answer. Answers an empty content read. */
-function captureRequestUrls(): string[] {
-  const urls: string[] = [];
-  mock.method(globalThis, "fetch", async (...args: unknown[]) => {
-    urls.push(String(args[0]));
-    return new Response(JSON.stringify({ chunks: [] }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
-  });
-  return urls;
-}
-
 /** Silence warnings and hand back what was warned, for the noisy outcomes. */
 function captureWarnings(): string[] {
   const warnings: string[] = [];
@@ -116,15 +102,14 @@ describe("searchKnowledge", () => {
       collections: ["truyen-kiem-hiep", "kiem-hiep"],
       position: 7,
       section: undefined,
-      sectionSize: undefined,
     });
   });
 
-  it("carries a hit's section and its stated size through the parse", async () => {
-    // The section repeats the hit's own text among its chunks, so the passage can
-    // be spoken from them alone, and `section_size` is the service's own count
-    // rather than the length of the list it sent — the two differ exactly when
-    // the expansion was bounded, which is the fact the material gate refuses on.
+  it("carries a hit's section through the parse as one text with its range and length", async () => {
+    // The section is one object now: the source's own text over the run, the range
+    // it was sliced from, and the length the whole section holds. The gate decides
+    // completeness on `end - start` against `size`, so all four fields have to
+    // survive the parse together.
     stubFetch(200, {
       results: [
         {
@@ -134,73 +119,149 @@ describe("searchKnowledge", () => {
           address: "101-Truyen-Cuoi-Dan-Gian-Viet-Nam.txt",
           collections: ["truyen-cuoi"],
           position: 14,
-          section: [
-            { text: "## SÚNG SĂN\nMột người thợ săn nọ...", position: 14 },
-            { text: "## SÚNG SĂN\n...bèn bắn vào bụi rậm.", position: 15 },
-            { text: "## SÚNG SĂN\nNgười đi đường cười ồ.", position: 16 },
-          ],
-          section_size: 3,
+          section: {
+            text: "## SÚNG SĂN\nMột người thợ săn nọ...\n\n...bèn bắn vào bụi rậm.",
+            start: 1200,
+            end: 1260,
+            size: 60,
+          },
         },
       ],
     });
 
-    const chunks = expectOk(await searchKnowledge("súng săn", 1, ["truyen-cuoi"], { expand: "section" }));
+    const chunks = expectOk(
+      await searchKnowledge("súng săn", 1, ["truyen-cuoi"], { expand: "section" })
+    );
 
-    assert.deepEqual(chunks[0].section, [
-      { text: "## SÚNG SĂN\nMột người thợ săn nọ...", position: 14 },
-      { text: "## SÚNG SĂN\n...bèn bắn vào bụi rậm.", position: 15 },
-      { text: "## SÚNG SĂN\nNgười đi đường cười ồ.", position: 16 },
-    ]);
-    assert.equal(chunks[0].sectionSize, 3);
+    assert.deepEqual(chunks[0].section, {
+      text: "## SÚNG SĂN\nMột người thợ săn nọ...\n\n...bèn bắn vào bụi rậm.",
+      start: 1200,
+      end: 1260,
+      size: 60,
+    });
   });
 
-  it("reads a section the service reported as shorter than it really holds", async () => {
-    // A bounded expansion: the list is capped, `section_size` is not. Reading the
-    // size off the list would report this as a complete section, which is what
-    // makes the two fields separate facts rather than one repeated.
+  it("carries a bounded expansion's stated length rather than reading it off the text", async () => {
+    // A bounded expansion: the text is the window the cap allowed, `size` is the
+    // whole section. Reading the length off the text received would report this as
+    // a complete section, which is what makes the two numbers separate facts — and
+    // what the gate's `end - start === size` is asked.
     stubFetch(200, {
       results: [
         {
           text: "## Chiêu thức\nChiêu thứ nhất...",
           score: 0.64,
           source_name: "kiem-hiep.txt",
-          section: [{ text: "## Chiêu thức\nChiêu thứ nhất...", position: 15 }],
-          section_size: 17,
+          section: {
+            text: "## Chiêu thức\nChiêu thứ nhất...",
+            start: 900,
+            end: 931,
+            size: 4200,
+          },
         },
       ],
     });
 
     const chunks = expectOk(await searchKnowledge("chiêu thức", 1));
+    const section = chunks[0].section;
 
-    assert.equal(chunks[0].section?.length, 1);
-    assert.equal(chunks[0].sectionSize, 17, "the size is the service's, not the list's");
+    assert.equal(section?.size, 4200, "the size is the service's, not the text's");
+    assert.notEqual(
+      (section?.end ?? 0) - (section?.start ?? 0),
+      section?.size,
+      "and it is larger than the window the text occupies, so the passage is refused"
+    );
   });
 
-  it("drops a section entry that carries no position rather than ordering it blindly", async () => {
-    // The section is joined in reading order, and an entry with no position
-    // cannot say where its text belongs. Dropping it leaves the section shorter
-    // than the size reported, which the gate already refuses — so a malformed
-    // entry degrades to a generated reply, never to a passage in the wrong order.
-    captureWarnings();
+  it("reads a section that arrived as the older chunk list as no section at all", async () => {
+    // The shape the service returned before this change: a list of chunks. There is
+    // no passage in it to speak, so it is read as absent — and said out loud, since
+    // a shape this client cannot read is a contract mismatch rather than a service
+    // that chose to send no section.
+    const warnings = captureWarnings();
     stubFetch(200, {
       results: [
         {
           text: "## SÚNG SĂN\nMột người thợ săn nọ...",
           score: 0.71,
           source_name: "101-Truyen-Cuoi-Dan-Gian-Viet-Nam.txt",
-          section: [
-            { text: "## SÚNG SĂN\nMột người thợ săn nọ...", position: 14 },
-            { text: "## SÚNG SĂN\n...bèn bắn vào bụi rậm." },
-          ],
-          section_size: 2,
+          section: [{ text: "## SÚNG SĂN\nMột người thợ săn nọ...", position: 14 }],
         },
       ],
     });
 
     const chunks = expectOk(await searchKnowledge("súng săn", 1));
 
-    assert.equal(chunks[0].section?.length, 1);
-    assert.equal(chunks[0].sectionSize, 2);
+    assert.equal(chunks[0].section, undefined);
+    assert.ok(
+      warnings.some((w) => w.includes("section")),
+      `expected a warning naming the section, got ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it("reads a section missing one of its numbers as no section at all", async () => {
+    // Without `size` the passage cannot be known to be whole, and without its range
+    // it cannot say where its text came from — so the object is not a section this
+    // client can gate on, whatever text it carries.
+    const warnings = captureWarnings();
+    stubFetch(200, {
+      results: [
+        {
+          text: "## Chiêu thức\nChiêu thứ nhất...",
+          score: 0.64,
+          source_name: "kiem-hiep.txt",
+          section: { text: "## Chiêu thức\nChiêu thứ nhất...", start: 40, end: 71 },
+        },
+      ],
+    });
+
+    const chunks = expectOk(await searchKnowledge("chiêu thức", 1));
+
+    assert.equal(chunks[0].section, undefined);
+    assert.ok(warnings.some((w) => w.includes("section")));
+  });
+
+  it("keeps a section whose text is empty apart from a hit that carries none", async () => {
+    // The distinction the object shape makes: an absent section is a hit with
+    // nothing to speak, while a present section with an empty `text` is a section
+    // that holds no words. Only the first is the gate's to refuse; the second is
+    // the reply's, and the two reasons are logged apart.
+    stubFetch(200, {
+      results: [
+        {
+          text: "A chunk of a passage holding no words.",
+          score: 0.66,
+          source_name: "guide.pdf",
+          section: { text: "", start: 10, end: 10, size: 0 },
+        },
+      ],
+    });
+
+    const chunks = expectOk(await searchKnowledge("empty", 1));
+
+    assert.deepEqual(chunks[0].section, { text: "", start: 10, end: 10, size: 0 });
+  });
+
+  it("reads a null section as no section, and not as drift", async () => {
+    // What the service answers for a source indexed before ranges existed: it chose
+    // to send no section, which is the ordinary answer rather than a contract this
+    // client cannot read.
+    const warnings = captureWarnings();
+    stubFetch(200, {
+      results: [
+        {
+          text: "A chunk of a source without ranges.",
+          score: 0.66,
+          source_name: "guide.pdf",
+          section: null,
+        },
+      ],
+    });
+
+    const chunks = expectOk(await searchKnowledge("ranges", 1));
+
+    assert.equal(chunks[0].section, undefined);
+    assert.deepEqual(warnings, [], "a service that sends no section is not warning-worthy");
   });
 
   it("parses a hit from a service that predates the routing metadata", async () => {
@@ -223,7 +284,6 @@ describe("searchKnowledge", () => {
     assert.equal(chunks[0].collections, undefined);
     assert.equal(chunks[0].position, undefined);
     assert.equal(chunks[0].section, undefined);
-    assert.equal(chunks[0].sectionSize, undefined);
   });
 
   it("keeps a source that is in no collection apart from a service that reported none", async () => {

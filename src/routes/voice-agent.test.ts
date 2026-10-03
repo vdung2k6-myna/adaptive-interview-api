@@ -1141,8 +1141,8 @@ describe("POST /api/voice-agent/stream — the material turn", () => {
    *
    * The section's text is deliberately unlike the chunk's own `text` — the
    * search's quote of it — so a test can tell a reply taken from the section
-   * from one built out of the hit itself. One chunk of one is the smallest
-   * complete section `sectionSize` can state. */
+   * from one built out of the hit itself. The range and the stated length agree,
+   * which is what the gate reads as a whole section. */
   const located = (overrides: Partial<KnowledgeChunk> = {}): KnowledgeChunk => ({
     text: "the text the search quoted",
     source: "Trang Quynh",
@@ -1150,8 +1150,12 @@ describe("POST /api/voice-agent/stream — the material turn", () => {
     address: "https://example.org/wiki/A",
     collections: ["truyen-kiem-hiep"],
     position: 3,
-    section: [{ text: SECTION_TEXT, position: 3 }],
-    sectionSize: 1,
+    section: {
+      text: SECTION_TEXT,
+      start: 1200,
+      end: 1200 + SECTION_TEXT.length,
+      size: SECTION_TEXT.length,
+    },
     ...overrides,
   });
 
@@ -1303,7 +1307,7 @@ describe("POST /api/voice-agent/stream — the material turn", () => {
     // The older service, and any search that was not asked to expand: the hit is
     // eligible on every other count, and what it lacks is the passage to speak.
     const h = harness(
-      { ok: true, chunks: [located({ section: undefined, sectionSize: undefined })] },
+      { ok: true, chunks: [located({ section: undefined })] },
       { stream: ["A generated answer."] }
     );
 
@@ -1325,8 +1329,7 @@ describe("POST /api/voice-agent/stream — the material turn", () => {
         ok: true,
         chunks: [
           located({
-            section: [{ text: "the passage's opening.", position: 3 }],
-            sectionSize: 4,
+            section: { text: "the passage's opening.", start: 1200, end: 1221, size: 4200 },
           }),
         ],
       },
@@ -1376,7 +1379,7 @@ describe("POST /api/voice-agent/stream — the material turn", () => {
     let issued = 0;
     const h = harness(() =>
       ++issued === 1
-        ? { ok: true, chunks: [located({ section: undefined, sectionSize: undefined })] }
+        ? { ok: true, chunks: [located({ section: undefined })] }
         : { ok: true, chunks: [located()] }
     );
 

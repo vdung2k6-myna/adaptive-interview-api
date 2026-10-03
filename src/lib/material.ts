@@ -1,8 +1,4 @@
-import type {
-  KnowledgeChunk,
-  KnowledgeSearchOutcome,
-  KnowledgeSectionChunk,
-} from "@/lib/knowledge";
+import type { KnowledgeChunk, KnowledgeSearchOutcome } from "@/lib/knowledge";
 import type { AnswerMode } from "@/lib/personas";
 
 /**
@@ -12,14 +8,16 @@ import type { AnswerMode } from "@/lib/personas";
  * asked for a single result, expanded to that result's whole section, and the
  * section never reaches a prompt, because a material turn has no prompt; the
  * hit supplies the facts the gate decides on — its `collections` and `score` —
- * and the passage to speak, its `section` beside the size the service states
- * for it (design.md D2, D3).
+ * and the passage to speak, its `section`, with the range it was taken from and
+ * the length the service states for the whole of it (design.md D2, D3).
  *
  * Two stages, split because they fail differently and only the first is pure:
  *
- *   selectMaterialHit   the gate — preference ∩ speakability ∩ confidence ∩ a
- *                       section that came back whole (D3)
- *   sectionToReply      the passage — the section joined, its heading once (D4)
+ *   selectMaterialHit      the gate — preference ∩ speakability ∩ confidence ∩
+ *                          a section that came back whole (D3)
+ *   resolveMaterialReply   the passage — the section's own text, which the
+ *                          service sliced from the document rather than this
+ *                          backend joining stored chunks (D4)
  *
  * `resolveMaterialReply` composes them for the route, which is the one caller
  * that wants either a reply or the reason there is none (D9). Nothing here
@@ -68,7 +66,7 @@ export type MaterialSkipReason =
   | "not_speakable" // no collection on the hit is in the speakable set
   | "below_floor" // the hit's score is under the floor, or was not reported
   | "no_section" // the search returned no section for this hit to speak
-  | "section_incomplete"; // the section returned was shorter than the one the service stated
+  | "section_incomplete"; // the section returned was not the length the service stated for it
 
 /** The gate's answer: the hit a turn is to be answered from, or why it is not. */
 export type MaterialSelection =
@@ -97,9 +95,9 @@ export type MaterialOutcome =
  * The gate, as a pure decision: which hit — if any — this turn is answered from.
  *
  * Returns the *hit* rather than its text because eligibility is a question about
- * the passage's provenance and completeness, not about its words: the caller
- * joins the section afterwards, and it is the hit that names the source the
- * reply is attributed to (D3, D4).
+ * the passage's provenance and completeness, not about its words: the reply is
+ * read off the section the hit carries, and it is the hit that names the source
+ * the reply is attributed to (D3, D4).
  *
  * `outcome` is nullable because a material turn whose enabled topics resolve to
  * no collection issues no search at all, and that is a turn with nothing to gate
@@ -168,19 +166,22 @@ function gateReason(hit: KnowledgeChunk, policy: MaterialPolicy): MaterialSkipRe
 
   // The passage, tested last because it is the only condition about the reply
   // rather than about permission to speak it. An absent section is the older
-  // service and the unasked-for search alike: neither can say what this hit's
-  // passage is, so the turn generates rather than speaking the search's quote as
-  // though it were the whole thing.
+  // service, a source holding no range to place the run by, and the unasked-for
+  // search alike: none of them can say what this hit's passage is, so the turn
+  // generates rather than speaking the search's quote as though it were the
+  // whole thing.
   const section = hit.section;
-  if (!section?.length) {
+  if (!section) {
     return "no_section";
   }
 
-  // A bounded expansion returns fewer chunks than the section holds and says how
-  // many it holds in `sectionSize`, so the two agree only when the whole passage
-  // came back. An absent size refuses here too — it is not a size, and a reply
-  // cannot be known to be complete without one.
-  if (section.length !== hit.sectionSize) {
+  // The section is whole exactly when the service's own two numbers agree: the
+  // window the text occupies against the length the whole passage holds. They are
+  // compared rather than the length of the text received because both were
+  // computed by the service in its own units, so nothing on this side — an
+  // encoding, a diacritic, an astral character — can make a whole section look
+  // truncated or a fragment look whole.
+  if (section.end - section.start !== section.size) {
     return "section_incomplete";
   }
 
@@ -188,49 +189,15 @@ function gateReason(hit: KnowledgeChunk, policy: MaterialPolicy): MaterialSkipRe
 }
 
 /**
- * The words of a section: the hit's passage, joined in reading order, with its
- * heading spoken once.
- *
- * Every chunk of a section is stored with the section's heading prefixed to its
- * text, so a seventeen-chunk section repeats that heading seventeen times. The
- * heading is recovered rather than looked up, because the service reports no
- * heading field — only the chunks — by testing whether every chunk opens with
- * the same first line. That test deliberately does not ask whether the line *is*
- * a heading: the operation wanted is "collapse a line every chunk repeats at its
- * head", which is right for a heading and harmless for anything else, and it
- * leaves a heading-less section alone because such a section's chunks share no
- * first line.
- *
- * Reading order is applied here rather than inherited. The service returns the
- * section in order, but the reply's ordering is not something to take on trust
- * when each chunk's position is in hand. The input array is not sorted in place:
- * it is the search's, and a caller may still be reading it.
- */
-export function sectionToReply(chunks: KnowledgeSectionChunk[]): string {
-  if (!chunks.length) return "";
-
-  const ordered = [...chunks].sort((a, b) => a.position - b.position);
-  const firstLine = ordered[0].text.split("\n", 1)[0];
-  const headed = ordered.every((chunk) => chunk.text.split("\n", 1)[0] === firstLine);
-
-  return ordered
-    .map((chunk, index) =>
-      // Only the first keeps the heading; the rest give up the line they repeat.
-      // Slicing the heading's length rather than matching it leaves the newline
-      // that followed it, so one is removed by hand — otherwise every remainder
-      // would open with a blank line.
-      headed && index > 0 ? chunk.text.slice(firstLine.length).replace(/^\r?\n/, "") : chunk.text
-    )
-    .join("\n\n");
-}
-
-/**
  * A material turn's reply, or why it was generated instead.
  *
  * The one entry point the route calls (D9): the gate, then the passage, then
- * either the text to speak or a reason to log and generate. Nothing here reaches
- * the content service — the passage arrived with the search that located it, so
- * there is no second request whose failure could answer a turn (design.md D1).
+ * either the text to speak or a reason to log and generate. The passage needs no
+ * assembling — the service slices it from the document, so the heading that opens
+ * a section is already carried once and a chunk's copy of it is not there to
+ * strip. Nothing here reaches the content service either: the passage arrived with
+ * the search that located it, so there is no second request whose failure could
+ * answer a turn (design.md D1).
  */
 export async function resolveMaterialReply(input: {
   outcome: KnowledgeSearchOutcome | null;
@@ -242,13 +209,14 @@ export async function resolveMaterialReply(input: {
     return selection;
   }
 
-  // The gate proved a section is there, so the empty array is unreachable; it is
-  // what this reads rather than a claim the type system cannot carry.
-  const text = sectionToReply(selection.hit.section ?? []);
+  // The gate proved a section is there, so this reads the text it proved rather
+  // than a section the type system cannot carry; an absent one would be caught by
+  // the emptiness check below as speaking nothing.
+  const text = selection.hit.section?.text ?? "";
 
-  // A whole section of blank chunks would otherwise be spoken as a silence under
-  // a reply that looked like it succeeded. The text itself is untrimmed: what is
-  // spoken is what the index holds.
+  // A whole section of blank characters would otherwise be spoken as a silence
+  // under a reply that looked like it succeeded. The text itself is untrimmed:
+  // what is spoken is what the document holds.
   if (!text.trim()) {
     console.warn(
       `[Material] the section of ${JSON.stringify(selection.hit.source)} holds no text`

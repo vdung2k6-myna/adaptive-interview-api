@@ -35,7 +35,7 @@ export const developmentConfig: AppConfig = {
     gatewayUrl: process.env.AUDIO_GATEWAY_URL || "http://localhost:8082",
     sttModel: process.env.AUDIOCPP_STT_MODEL || "stt",
     defaultEngine: (process.env.DEFAULT_TTS_ENGINE as "kokoro" | "piper" | "supertonic") || "supertonic",
-    defaultVoice: process.env.DEFAULT_VOICE || "default_name",
+    defaultVoice: process.env.DEFAULT_VOICE || "F1",
     timeoutMs: 60_000,
     // 10 minutes — the generous end of "a few minutes". Disk here is one
     // developer's, and the case a tight window would break is exactly the one

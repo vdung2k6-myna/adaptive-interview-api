@@ -13,11 +13,26 @@ import config from "@/lib/config";
  * `score` is optional for the same reason: an unranked chunk is not a confident
  * one, and there is no number that says so.
  */
-/** One chunk of a hit's section, as the search reports it. */
-export interface KnowledgeSectionChunk {
+/**
+ * A hit's section, as the search reports it: the source's own text over the run
+ * of stored chunks the hit belongs to, with the range it was taken from.
+ *
+ * The text is a passage of the document rather than the stored chunks joined, so
+ * a heading every chunk of the run repeats appears in it once, and text the
+ * chunker dropped between them is not missing from it.
+ */
+export interface KnowledgeSection {
+  /** The source's own characters over the section's run of chunks. */
   text: string;
-  /** Zero-based position in the hit's source, in reading order. */
-  position: number;
+  /** Where `text` begins in the source's document, counted in characters. */
+  start: number;
+  /** Where it ends, exclusive: the document sliced at `[start, end)` is `text`. */
+  end: number;
+  /**
+   * How long the whole section is, in characters — so `end - start` smaller than
+   * this is a bounded expansion's fragment rather than the whole passage.
+   */
+  size: number;
 }
 
 export interface KnowledgeChunk {
@@ -45,25 +60,18 @@ export interface KnowledgeChunk {
    */
   position?: number;
   /**
-   * The chunks of this hit's own section, in reading order, when the search was
-   * asked to expand to one. This hit's own text is among them, repeated rather
-   * than referenced, so the passage can be spoken from these chunks alone.
+   * This hit's section, when the search was asked to expand to one: the source's
+   * own text for the run of chunks the hit belongs to, with the range it came
+   * from and the passage's true length.
    *
-   * Absent is not empty: absent means the search asked for no section, or the
-   * service predates the expansion. Both are facts the material gate has to be
-   * able to see, so it generates rather than speaking nothing.
+   * Absent is not empty: absent means the search asked for no section, the
+   * service predates the expansion, or the hit's source holds no section to
+   * return — each a fact the material gate has to be able to see, so it generates
+   * rather than speaking nothing. A present section whose `text` is empty is the
+   * different fact that the run holds no words, which the reply refuses rather
+   * than the gate.
    */
-  section?: KnowledgeSectionChunk[];
-  /**
-   * How many chunks this hit's section really holds, whether or not every one of
-   * them came back with the search — which is what tells a bounded expansion's
-   * fragment from a complete section.
-   *
-   * Zero is what the service sends both when no section was asked for and when
-   * the hit's place in its source could not be established, so a zero is never
-   * on its own a statement that a section exists.
-   */
-  sectionSize?: number;
+  section?: KnowledgeSection;
 }
 
 /**
@@ -80,22 +88,24 @@ interface DocEtlSearchResult {
   address?: string;
   collections?: string[];
   position?: number;
-  section?: DocEtlSectionChunk[];
-  section_size?: number;
+  section?: DocEtlSection | null;
 }
 
 /**
- * `NeighbourChunk` on the service side, as this client reads it.
+ * `SectionExpansion` on the service side (`doc_etl_api/schemas.py`), as this
+ * client reads it.
  *
- * The server declares `position` as required here — unlike the top-level
- * `SearchResult`, where it only began appearing when the routing metadata did —
- * so a section entry that carries none is a malformed response rather than an
- * older service. `readSection` drops one rather than guessing where its text
- * belongs in the passage.
+ * Every field is optional here and checked rather than defaulted: a section
+ * missing one of its numbers cannot say where its text came from or how long the
+ * whole passage is, which are the facts eligibility is decided on. `readSection`
+ * reads such an object as absent rather than filling in a guess — a section that
+ * cannot state its own completeness is refused by the gate.
  */
-interface DocEtlSectionChunk {
+interface DocEtlSection {
   text?: string;
-  position?: number;
+  start?: number;
+  end?: number;
+  size?: number;
 }
 
 interface DocEtlSearchResponse {
@@ -155,24 +165,47 @@ async function readServiceDetail(response: Response): Promise<string> {
 
 /**
  * A hit's section as this client reads it, or `undefined` when the service sent
- * none.
+ * none this can read.
  *
- * An entry whose position is not a number is dropped rather than ordered on a
- * guess: the section is joined in reading order, and an entry with no position
- * cannot say where its text belongs. Dropping one leaves the section shorter
- * than the size the service reported, which is the same fact a bounded
- * expansion produces — so a malformed entry refuses the reply rather than
- * speaking a passage in the wrong order.
+ * A section is read whole or not at all: its numbers are what say where the text
+ * came from and how long the whole passage is, and a section that cannot state
+ * them cannot be known to be complete, so it is read as absent rather than
+ * guessed at. A text that is empty is a section this can read, and one that holds
+ * no words — a fact the reply refuses separately, because it says something other
+ * than "this hit has no section".
  */
-function readSection(raw: DocEtlSectionChunk[] | undefined): KnowledgeSectionChunk[] | undefined {
-  if (!Array.isArray(raw)) return undefined;
+function readSection(raw: DocEtlSection | null | undefined): KnowledgeSection | undefined {
+  // An absent section is the ordinary answer for a search that asked for none,
+  // and `null` is the service saying a source holds no range to place a run by.
+  // Neither is drift, so neither warns.
+  if (raw === null || raw === undefined) return undefined;
 
-  const section: KnowledgeSectionChunk[] = [];
-  for (const entry of raw) {
-    if (typeof entry.position !== "number") continue;
-    section.push({ text: entry.text ?? "", position: entry.position });
+  // A section that arrived as something other than an object is the response
+  // shape of a service older than this client — the one it read sections as a
+  // list from — so it is worth saying out loud rather than degrading in silence.
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    console.warn(
+      "[Knowledge] doc-etl-api sent a `section` that is not an object — the " +
+        "/search contract may have changed"
+    );
+    return undefined;
   }
-  return section;
+
+  const { text, start, end, size } = raw;
+  if (
+    typeof text !== "string" ||
+    typeof start !== "number" ||
+    typeof end !== "number" ||
+    typeof size !== "number"
+  ) {
+    console.warn(
+      "[Knowledge] doc-etl-api sent a `section` missing its text or its " +
+        "range — the /search contract may have changed"
+    );
+    return undefined;
+  }
+
+  return { text, start, end, size };
 }
 
 /**
@@ -301,7 +334,6 @@ export async function searchKnowledge(
         collections: r.collections,
         position: r.position,
         section: readSection(r.section),
-        sectionSize: r.section_size,
       })),
     };
   } catch (err) {

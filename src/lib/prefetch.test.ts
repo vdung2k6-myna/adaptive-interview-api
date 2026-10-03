@@ -73,12 +73,12 @@ describe("createPrefetchStore", () => {
   });
 
   it("holds the sections its chunks carried, storing none of its own", async () => {
+    const SECTION = { text: "a chunk", start: 0, end: 7, size: 7 };
     const sectioned: KnowledgeChunk[] = [
       {
         text: "a chunk",
         source: "guide.pdf",
-        section: [{ text: "a chunk", position: 0 }],
-        sectionSize: 1,
+        section: SECTION,
       },
     ];
     const { store } = storeReturning({ ok: true, chunks: sectioned });
@@ -87,7 +87,7 @@ describe("createPrefetchStore", () => {
 
     assert.deepEqual(
       store.claim(id, "kiem hiep")?.[0].section,
-      [{ text: "a chunk", position: 0 }],
+      SECTION,
       "the section rides on the chunks, so a claim hands it back with them"
     );
   });

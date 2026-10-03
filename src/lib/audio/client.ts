@@ -151,6 +151,39 @@ export class AudioGatewayClient {
   }
 
   /**
+   * The voices the synthesis service reports it holds, or null when the gateway
+   * could not be reached or did not relay a list.
+   *
+   * Null means "cannot tell", which is distinct from an empty array: a
+   * deployment must not read an unreachable audio stack as a voice
+   * misconfiguration.
+   */
+  async voiceCatalog(): Promise<string[] | null> {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(`${this.baseUrl}/health`, {
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (!res.ok) {
+        return null;
+      }
+
+      const data = (await res.json()) as { voices?: unknown };
+      if (!Array.isArray(data.voices)) {
+        return null;
+      }
+      return data.voices.filter(
+        (voice): voice is string => typeof voice === "string"
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Text-to-speech: synthesize audio from text via the gateway.
    * @param text The text to synthesize.
    * @param options Optional engine, voice, voice overrides, and abort signal.

@@ -18,6 +18,14 @@ backend.log
 pipervoices/
 kokoro-service/models/
 
+# Voice style files. These are learned tensors, not configuration: a cloned
+# voice is derived from a recording of a real person, and its metadata names
+# the source recording. The repository does not distribute them - install
+# them per deployment (see supertonic-service/README.md and NOTICE).
+# The *.json rule, not a directory-wide ignore, is what keeps a cloned
+# voiceprint out of git; .gitkeep holds the directory so that rule has a home.
+supertonic-service/voice_styles/*.json
+
 # Python virtual environments and caches
 **/.venv/
 **/__pycache__/
@@ -40,3 +48,4 @@ scratch-e2e/text.txt
 scratch-e2e/topics.json
 scratch-e2e/turnA.answer.txt
 scratch-e2e/turnB.answer.txt
+docs/LICENSE_AUDIT.md

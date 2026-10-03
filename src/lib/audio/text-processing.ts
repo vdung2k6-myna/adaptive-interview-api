@@ -414,7 +414,7 @@ export function normalizeNumbersForKokoro(text: string): string {
  * pronounce them. Piper and other engines receive the original text unchanged.
  */
 export function normalizeTextForEngine(text: string, engine?: string): string {
-  let normalized = stripMarkdown(text);
+  const normalized = stripMarkdown(text);
   if ((engine ?? "kokoro") === "kokoro") {
     return normalizeNumbersForKokoro(normalized);
   }

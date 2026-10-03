@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 
 import {
   resolveMaterialReply,
-  sectionToReply,
   selectMaterialHit,
   type MaterialFallbackReason,
   type MaterialOutcome,
@@ -13,9 +12,9 @@ import type { KnowledgeChunk, KnowledgeSearchOutcome } from "./knowledge";
 
 /**
  * These tests never touch a live doc-etl-api and never read a database. The
- * gate is pure, and the read takes its fetch as a parameter, so both halves are
- * pinned offline — which is the whole reason the decision lives in `src/lib/`
- * rather than inline in the route (design.md D9).
+ * gate is pure and the reply is read off the search's own payload, so both
+ * halves are pinned offline — which is the whole reason the decision lives in
+ * `src/lib/` rather than inline in the route (design.md D9).
  */
 
 /** The development policy: the two wiki collections and the measured floor. */
@@ -24,23 +23,19 @@ const POLICY: MaterialPolicy = { collections: ["truyen-kiem-hiep", "kiem-hiep"],
 /** A located hit, in the shape doc-etl-api reports one. */
 function hit(overrides: Partial<KnowledgeChunk> = {}): KnowledgeChunk {
   return {
-    // Deliberately unlike the stored chunk the reader answers with, so a test can
-    // tell a reply that was read from one that quoted the search (D1).
+    // Deliberately unlike the section's own text, so a test can tell a reply that
+    // spoke the passage from one that quoted the ranked chunk (D1).
     text: "the text the search quoted",
     source: "Trang Quynh",
     score: 0.71,
     address: "https://example.org/wiki/Tr%E1%BA%A1ng_Qu%E1%BB%B3nh",
     collections: ["truyen-kiem-hiep"],
     position: 3,
-    // A located hit carries the passage that answers it, and the search repeats
-    // the hit's own text among the section's chunks — here opening a two-chunk
-    // passage, so a reply built from the first chunk alone is distinguishable
-    // from the reply the section asks for.
-    section: [
-      { text: "the text the search quoted", position: 3 },
-      { text: "...and the rest of the passage.", position: 4 },
-    ],
-    sectionSize: 2,
+    // A located hit carries the passage that answers it: the document's own text
+    // over the run of chunks it belongs to, the range that text was sliced from,
+    // and the length the whole section holds. The span and the stated length agree,
+    // which is what the gate reads as a whole section.
+    section: { text: "the stored passage the hit located.", start: 1200, end: 1235, size: 35 },
     ...overrides,
   };
 }
@@ -70,64 +65,6 @@ function expectReason(outcome: MaterialOutcome): MaterialFallbackReason {
   assert.ok(!outcome.ok, `expected a fallback, got ${JSON.stringify(outcome)}`);
   return outcome.reason;
 }
-
-describe("sectionToReply — the passage", () => {
-  it("speaks a one-chunk section as it stands", () => {
-    assert.equal(sectionToReply([{ text: "## SÚNG SĂN\nMột người thợ săn nọ...", position: 14 }]),
-      "## SÚNG SĂN\nMột người thợ săn nọ...");
-  });
-
-  it("joins a section's chunks in reading order, whatever order they arrived in", () => {
-    const reply = sectionToReply([
-      { text: "Ba.", position: 2 },
-      { text: "Một.", position: 0 },
-      { text: "Hai.", position: 1 },
-    ]);
-
-    assert.equal(reply, "Một.\n\nHai.\n\nBa.");
-  });
-
-  it("speaks a repeated heading once, at the head of the passage", () => {
-    // How the service stores a section: every chunk carries the heading.
-    const reply = sectionToReply([
-      { text: "## SÚNG SĂN\nMột người thợ săn nọ...", position: 14 },
-      { text: "## SÚNG SĂN\n...bèn bắn vào bụi rậm.", position: 15 },
-      { text: "## SÚNG SĂN\nNgười đi đường cười ồ.", position: 16 },
-    ]);
-
-    assert.equal(
-      reply,
-      "## SÚNG SĂN\nMột người thợ săn nọ...\n\n...bèn bắn vào bụi rậm.\n\nNgười đi đường cười ồ."
-    );
-    assert.equal(reply.split("## SÚNG SĂN").length - 1, 1, "the heading is spoken once");
-  });
-
-  it("leaves a heading-less section as it stands", () => {
-    // The run of chunks before a source's first heading: no shared first line, so
-    // there is nothing to collapse and no line to mistake for a heading.
-    const reply = sectionToReply([
-      { text: "Lời nói đầu.", position: 0 },
-      { text: "Phần thứ nhất.", position: 1 },
-    ]);
-
-    assert.equal(reply, "Lời nói đầu.\n\nPhần thứ nhất.");
-  });
-
-  it("collapses only when every chunk opens with the same line", () => {
-    // One chunk differing is enough to say the first line is prose being quoted,
-    // not a heading being repeated.
-    const reply = sectionToReply([
-      { text: "## Chiêu thức\nChiêu thứ nhất...", position: 15 },
-      { text: "Chiêu thứ hai...", position: 16 },
-    ]);
-
-    assert.equal(reply, "## Chiêu thức\nChiêu thứ nhất...\n\nChiêu thứ hai...");
-  });
-
-  it("answers nothing for a section holding no chunks", () => {
-    assert.equal(sectionToReply([]), "");
-  });
-});
 
 describe("selectMaterialHit — the gate", () => {
   it("locates a hit the persona asked for, in a speakable collection, at or above the floor", () => {
@@ -265,11 +202,11 @@ describe("selectMaterialHit — the gate", () => {
   });
 
   it("generates when the hit carries no section", () => {
-    // The older service and the unasked-for search alike: neither can say what
-    // this hit's passage is, so the search's quote is not spoken as the whole of
-    // it.
+    // The older service, a source holding no range to place the run by, and the
+    // unasked-for search alike: none can say what this hit's passage is, so the
+    // search's quote is not spoken as the whole of it.
     const selection = selectMaterialHit({
-      outcome: located(hit({ section: undefined, sectionSize: undefined })),
+      outcome: located(hit({ section: undefined })),
       answerMode: "material",
       policy: POLICY,
     });
@@ -278,29 +215,33 @@ describe("selectMaterialHit — the gate", () => {
     assert.equal(selection.reason, "no_section");
   });
 
-  it("generates when the section came back empty and reported no size", () => {
-    // The `0 === 0` case an equality test alone would pass: the service sends
-    // zero both for a search that asked for no section and for one whose hit it
-    // could not place in its source, so an empty section is not a passage.
+  it("locates a whole section that holds no words, leaving that refusal to the reply", () => {
+    // The `0 === 0` case is no longer the gate's to refuse: the span and the stated
+    // length are the service's own numbers and they agree, so the section is whole.
+    // A present section holding no words is a different fact from a hit the service
+    // sent no section for, and it is the reply that refuses it — as `text_empty`.
     const selection = selectMaterialHit({
-      outcome: located(hit({ section: [], sectionSize: 0 })),
+      outcome: located(hit({ section: { text: "", start: 10, end: 10, size: 0 } })),
       answerMode: "material",
       policy: POLICY,
     });
 
-    assert.ok(!selection.ok);
-    assert.equal(selection.reason, "no_section");
+    assert.ok(selection.ok, `expected a hit, got ${JSON.stringify(selection)}`);
   });
 
   it("generates when the section did not come back whole", () => {
-    // A bounded expansion: one chunk returned, seventeen stated. An incomplete
-    // joke is worse than a generated one, so the fragment is refused rather than
-    // spoken as though it were the passage.
+    // A bounded expansion: the window the cap allowed, against the length the whole
+    // section holds. An incomplete joke is worse than a generated one, so the
+    // fragment is refused rather than spoken as though it were the passage.
     const selection = selectMaterialHit({
       outcome: located(
         hit({
-          section: [{ text: "## Chiêu thức\nChiêu thứ nhất...", position: 15 }],
-          sectionSize: 17,
+          section: {
+            text: "## Chiêu thức\nChiêu thứ nhất...",
+            start: 900,
+            end: 931,
+            size: 4200,
+          },
         })
       ),
       answerMode: "material",
@@ -311,11 +252,16 @@ describe("selectMaterialHit — the gate", () => {
     assert.equal(selection.reason, "section_incomplete");
   });
 
-  it("generates when the section's size was not reported", () => {
-    // Without a stated size a section cannot be known to be whole, and a reply
-    // that may be a fragment is the state this gate exists to refuse.
+  it("generates when the section's span does not agree with its stated length either way", () => {
+    // An unstated length is refused earlier, by the parse, as no section: without
+    // one the passage cannot be known to be whole. What is left for the gate is the
+    // comparison itself, and it is an equality — a span wider than the length
+    // stated is not a whole section either, so it is refused rather than trusted
+    // for being the surprising direction.
     const selection = selectMaterialHit({
-      outcome: located(hit({ sectionSize: undefined })),
+      outcome: located(
+        hit({ section: { text: "Một câu chuyện.", start: 1200, end: 1260, size: 30 } })
+      ),
       answerMode: "material",
       policy: POLICY,
     });
@@ -383,33 +329,35 @@ describe("selectMaterialHit — the gate", () => {
 describe("resolveMaterialReply — the reply", () => {
   afterEach(() => mock.restoreAll());
 
-  /** A hit whose section is these chunks, in reading order, with its true size. */
-  function sectioned(...chunks: string[]): KnowledgeChunk {
-    return hit({
-      section: chunks.map((text, position) => ({ text, position: position + 3 })),
-      sectionSize: chunks.length,
-    });
+  /** A hit whose section is this text, as the service sliced it from the document. */
+  function sectioned(text: string): KnowledgeChunk {
+    // The heading appears once because the passage is the source's own characters
+    // over the run of chunks, not those chunks joined: every stored chunk repeats
+    // the heading, and the service's slice is what makes it read once (D4). The
+    // span and the stated length are the text's own width, which is what the gate
+    // reads as a whole section.
+    return hit({ section: { text, start: 1200, end: 1200 + text.length, size: text.length } });
   }
 
-  it("speaks the hit's whole section, not the chunk the search ranked first", async () => {
-    // The unit the archived design got wrong: one chunk of this joke is a third
-    // of it. Every chunk of a section is stored with the heading prefixed, so the
-    // passage is the three together with the heading spoken once.
+  it("speaks the hit's section, with the heading spoken once", async () => {
+    // The unit the archived design got wrong: one chunk of this joke is a third of
+    // it, and every stored chunk carries the heading prefixed. The passage is the
+    // document's own run of characters, so the heading opens it exactly once and
+    // there is no boundary between chunks to join and no repeated heading to strip.
+    const section =
+      "## SÚNG SĂN\nMột người thợ săn nọ...\n\n...bèn bắn vào bụi rậm.\n\nNgười đi đường cười ồ.";
     const outcome = await resolveMaterialReply({
-      outcome: located(
-        sectioned(
-          "## SÚNG SĂN\nMột người thợ săn nọ...",
-          "## SÚNG SĂN\n...bèn bắn vào bụi rậm.",
-          "## SÚNG SĂN\nNgười đi đường cười ồ."
-        )
-      ),
+      outcome: located(sectioned(section)),
       answerMode: "material",
       policy: POLICY,
     });
 
+    const reply = expectReply(outcome);
+    assert.equal(reply, section);
     assert.equal(
-      expectReply(outcome),
-      "## SÚNG SĂN\nMột người thợ săn nọ...\n\n...bèn bắn vào bụi rậm.\n\nNgười đi đường cười ồ."
+      reply.split("## SÚNG SĂN").length - 1,
+      1,
+      "the heading should be spoken once, not once per chunk"
     );
   });
 
@@ -435,12 +383,16 @@ describe("resolveMaterialReply — the reply", () => {
 
   it("generates rather than speaking a fragment of the passage", async () => {
     // The spec's refusal: a bounded expansion's fragment is not spoken as though
-    // it were the whole joke.
+    // it were the whole joke — the service's own two numbers say it is not.
     const outcome = await resolveMaterialReply({
       outcome: located(
         hit({
-          section: [{ text: "## Chiêu thức\nChiêu thứ nhất...", position: 15 }],
-          sectionSize: 17,
+          section: {
+            text: "## Chiêu thức\nChiêu thứ nhất...",
+            start: 900,
+            end: 931,
+            size: 4200,
+          },
         })
       ),
       answerMode: "material",
@@ -462,7 +414,7 @@ describe("resolveMaterialReply — the reply", () => {
     assert.equal(expectReason(outcome), "text_empty");
   });
 
-  it("generates when the section's chunks hold only whitespace", async () => {
+  it("generates when the section holds only whitespace", async () => {
     captureWarnings();
 
     const outcome = await resolveMaterialReply({

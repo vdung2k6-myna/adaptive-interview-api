@@ -32,7 +32,7 @@ export interface AppConfig {
     gatewayUrl: string;      // Audio Gateway (TTS)
     sttModel: string;
     defaultEngine: "kokoro" | "piper" | "supertonic"; // default TTS engine
-    defaultVoice: string;   // voice ID, e.g. "default_name" (kokoro) or "vi_VN-vais1000-medium" (piper)
+    defaultVoice: string;   // voice ID, e.g. "F1" (supertonic) or "af_heart" (kokoro)
     timeoutMs: number;
     /**
      * How long a streamed turn's per-segment files stay on disk after they are

@@ -66,6 +66,37 @@ async def _check_service(url: str) -> bool:
         return False
 
 
+async def _supertonic_status() -> tuple[bool, list[str] | None]:
+    """Reach the Supertonic service once, for both its liveness and its voices.
+
+    That service's /health names the style files it holds. Relaying the list
+    lets a caller check its configured voice names against what is actually
+    loaded without needing an address for the synthesis service itself.
+
+    Returns the liveness flag and, when it answered, the voices it named — or
+    None when it was unreachable or did not name any.
+    """
+    try:
+        client = await _get_client()
+        res = await client.get(f"{SUPERTONIC_URL}/health", timeout=5.0)
+    except Exception:
+        return False, None
+
+    if res.status_code != 200:
+        return False, None
+
+    # It answered, so it is alive. A body this cannot read costs the voice list,
+    # not the liveness — reporting a live service as down would be the worse lie.
+    try:
+        voices = res.json().get("voices")
+    except Exception:
+        return True, None
+
+    if not isinstance(voices, list):
+        return True, None
+    return True, [voice for voice in voices if isinstance(voice, str)]
+
+
 async def _proxy_to_kokoro(req: SynthesizeRequest) -> Response:
     """Forward request to Kokoro TTS service.
 
@@ -178,21 +209,30 @@ async def synthesize(req: SynthesizeRequest) -> Response:
 
 @app.get("/health")
 async def health() -> dict:
-    """Aggregated health check across all TTS services."""
+    """Aggregated health check across all TTS services.
+
+    Carries the Supertonic service's voice list through when it answers, so a
+    caller can read the loaded voices from the gateway it already talks to. The
+    list is absent, not empty, when that service could not be reached — an
+    unreachable service says nothing about which voices are installed.
+    """
     kokoro_ok = await _check_service(KOKORO_URL)
     piper_ok = await _check_service(PIPER_URL)
-    supertonic_ok = await _check_service(SUPERTONIC_URL)
+    supertonic_ok, voices = await _supertonic_status()
 
     all_ok = kokoro_ok and piper_ok and supertonic_ok
     status = "ok" if all_ok else ("degraded" if (kokoro_ok or piper_ok or supertonic_ok) else "down")
 
-    return {
+    payload = {
         "status": status,
         "gateway": True,
         "kokoro": kokoro_ok,
         "piper": piper_ok,
         "supertonic": supertonic_ok,
     }
+    if voices is not None:
+        payload["voices"] = voices
+    return payload
 
 
 # ── Entrypoint ─────────────────────────────────────────────────────────
