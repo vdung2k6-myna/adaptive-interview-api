@@ -11,7 +11,10 @@
 **Mitigation (applied in frontend):**
 - Batch React state updates to ~50ms intervals (reduces re-renders from ~100/sec to ~20/sec)
 - `React.memo` on `MarkdownRenderer` — completed messages skip re-parsing
-- `React.memo` on `MessageBubble` — completed messages skip React's render phase entirely
+
+`MessageBubble` (in the interview page) is **not** memoized: it is a plain function component, and the React Compiler is disabled in that repo, so nothing memoizes it automatically. Completed bubbles are re-rendered along with the streaming one. The 50ms batching is what keeps that affordable; memoizing `MessageBubble` remains an open item.
+
+> This document describes the **frontend** repository (`adaptive-interview`), not this backend. The bottlenecks and metrics below are recorded here for reference because the two are deployed together.
 
 ### 2. Embedding on Critical Path (Backend)
 
@@ -54,9 +57,9 @@ if (performance.now() - lastUpdate >= BATCH_MS) {
 | Component | Wrap | Benefit |
 |---|---|---|
 | `MarkdownRenderer` | `React.memo` | Skips re-parse when `content` unchanged |
-| `MessageBubble` | `React.memo` | Skips render phase for completed messages |
+| `MessageBubble` | *(none)* | Not memoized — see the note above |
 
-**Result:** In a 10-message conversation during streaming, only 1 message (the active one) enters React's render phase.
+**Result:** `MarkdownRenderer` is skipped for every message whose `content` is unchanged, so the per-chunk `marked.parse()` cost does not scale with conversation length.
 
 ### Tree-Shaken Highlight.js (Frontend)
 
@@ -99,7 +102,7 @@ Use React DevTools Profiler to measure:
 
 Look for:
 - `MarkdownRenderer` re-renders — should only re-render for the streaming message
-- `MessageBubble` re-renders — completed messages should be skipped
+- `MessageBubble` re-renders — currently re-renders for every message on each batch; memoizing it is the next win
 
 ### Server-Side (Backend)
 

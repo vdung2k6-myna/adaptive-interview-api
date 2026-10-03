@@ -83,7 +83,7 @@ Use Markdown formatting. If you include code examples, specify the language afte
 Prioritize technical, role-relevant questions early in the interview. Behavioral questions should be natural follow-ups or come after the core technical requirements are covered.
 ```
 
-**Important:** The system prompt is sent as a `user` message (not `system` role) because some cloud/proxy Ollama models don't accept `system` role messages.
+**Role mapping:** the system prompt is sent with `role: "system"` (`src/lib/prompts.ts`), not folded into a user message. Some cloud/proxy models that reject the `system` role are the reason the *final* message is forced to be a `user` turn — when the history is empty or ends with an `assistant` message, a `{ role: "user", content: "Please respond." }` is appended — but the system prompt itself keeps its own role.
 
 When `session.language` is set to `vietnamese`, the system prompt instructs the model to conduct the interview in Vietnamese only.
 
@@ -105,9 +105,11 @@ Custom `OllamaError` class extends `Error` with an HTTP status code:
 | Error | Status | Cause |
 |---|---|---|
 | Connection refused | 500 | Ollama not running |
-| Timeout | 504 | Model is slow or unresponsive |
+| Timeout | 504 | Model is slow or unresponsive (`chatTimeoutMs` / `embedTimeoutMs`) |
 | Invalid JSON | 502 | Ollama returned malformed response |
 | Empty content | 502 | Model returned empty message |
+
+An HTTP error response from Ollama is **passed through with Ollama's own status code**, not remapped — a request for a model that is not pulled surfaces as Ollama's `404`, not as a `500`.
 
 All errors bubble up to API route handlers, which return appropriate HTTP status codes to the client.
 

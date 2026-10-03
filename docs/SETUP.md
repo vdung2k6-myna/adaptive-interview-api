@@ -52,7 +52,7 @@ AUDIO_STORAGE_DIR=/tmp/audio
 AUDIOCPP_BASE_URL=http://localhost:8080
 AUDIO_GATEWAY_URL=http://localhost:8082
 DEFAULT_TTS_ENGINE=kokoro
-DEFAULT_VOICE=default_voice
+DEFAULT_VOICE=af_heart
 
 # Per-language TTS voices (English defaults; leave Vietnamese empty to use service defaults)
 KOKORO_VOICE_ENGLISH=af_heart
@@ -134,14 +134,23 @@ has only ever been migrated by `drizzle-kit migrate` never needs it.
 
 ## 5. Seed Sample Data
 
+There is **no seed script**. `npx tsx src/lib/seed.ts` appeared in earlier
+versions of this guide but that file does not exist in this repository.
+
+Create a sample position and candidate through the API instead:
+
 ```bash
-npx tsx src/lib/seed.ts
+curl -X POST http://localhost:4000/api/positions \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Senior Full Stack Engineer","level":"Senior","requirements":["React","Node.js"]}'
+
+curl -X POST http://localhost:4000/api/candidates \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Jane Doe","email":"jane@example.com","skills":["React","Node.js"],"experienceYears":5}'
 ```
 
-This creates:
-
-- **Position:** Senior Full Stack Engineer
-- **Candidate:** Jane Doe (with skills and CV)
+The one catalog the database does seed itself is the voice agent's `personas`
+table, created and populated by `migrations/0004_add_personas.sql`.
 
 ## 6. Set Up Ollama
 
@@ -185,7 +194,8 @@ Voice interviews require an audio stack (STT + TTS) maintained in this repositor
 | **audio.cpp** | 8080 | External | Speech-to-text (STT) transcription |
 | **Kokoro** | 8081 | `kokoro-service/` | Text-to-speech (TTS) — fast, high quality |
 | **Piper** | 8083 | `piper-service/` | Text-to-speech (TTS) — multiple voices |
-| **Audio Gateway** | 8082 | `audio-gateway/` | Unified TTS proxy — routes to Kokoro or Piper |
+| **Supertonic** | 8084 | `supertonic-service/` | Text-to-speech (TTS) — 31 languages, 44.1kHz, voice cloning |
+| **Audio Gateway** | 8082 | `audio-gateway/` | Unified TTS proxy — routes to Kokoro, Piper, or Supertonic |
 
 ### Setup
 
@@ -202,11 +212,21 @@ cd ../piper-service
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+# piper-tts is a required import but is NOT in requirements.txt (it is
+# GPL-3.0-or-later). Install it explicitly or the service starts with 0 voices:
+pip install piper-tts
 
 # Download the English voice for English interviews (optional if only Vietnamese is needed)
 # Place in ../pipervoices/:
 #   en_US-lessac-medium.onnx
 #   en_US-lessac-medium.onnx.json
+
+# Supertonic (model weights download on first use)
+cd ../supertonic-service
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -c "from supertonic import TTS; _ = TTS()"
 
 # Audio Gateway
 cd ../audio-gateway
@@ -217,9 +237,15 @@ pip install -r requirements.txt
 
 See each service's README for detailed setup:
 
-- [`audio-gateway/README.md`](audio-gateway/README.md)
-- [`kokoro-service/README.md`](kokoro-service/README.md)
-- [`piper-service/README.md`](piper-service/README.md)
+- [`audio-gateway/README.md`](../audio-gateway/README.md)
+- [`kokoro-service/README.md`](../kokoro-service/README.md)
+- [`piper-service/README.md`](../piper-service/README.md)
+- [`supertonic-service/README.md`](../supertonic-service/README.md)
+
+> ⚠️ **Licensing is not uniform across this stack.** The application code is
+> MIT, but the TTS models are not: Supertonic's weights are BigScience Open
+> RAIL-M, `piper-tts` is GPL-3.0-or-later, and each Piper voice has its own
+> license. Read [`NOTICE`](../NOTICE) before distributing a deployment.
 
 **English voice note:** The default English voice mapping expects `en_US-lessac-medium` for Piper and `af_heart` for Kokoro. Piper English voices are downloaded as `.onnx` + `.onnx.json` files into the `pipervoices` directory. Kokoro currently uses the Vietnamese model in this repo; use Piper for English interviews until an English Kokoro model is added.
 

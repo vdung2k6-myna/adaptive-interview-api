@@ -31,6 +31,7 @@ Schema definitions are in `src/lib/schema.ts`. Migrations are in `migrations/`.
 | `campaign_positions` | Many-to-many campaign ↔ position junction |
 | `evaluation_versions` | Post-interview AI evaluations + human calibration |
 | `evaluation_jobs` | Async evaluation job queue |
+| `personas` | Voice-agent persona catalog (id, label, emoji, prompt, topics, answer mode) |
 
 ### `positions`
 
@@ -64,7 +65,7 @@ Schema definitions are in `src/lib/schema.ts`. Migrations are in `migrations/`.
 | `candidate_id` | `uuid` | FK → `candidates.id` |
 | `status` | `text` | `created`, `in_progress`, `completed` |
 | `mode` | `text` | `text` (default) or `voice` |
-| `tts_provider` | `text` | `kokoro` (default) or `piper` |
+| `tts_provider` | `text` | `kokoro` (default), `piper`, or `supertonic` |
 | `language` | `text` | `english` (default) or `vietnamese` |
 | `max_turns` | `integer` | Default `8` |
 | `current_turn` | `integer` | Default `0` |
@@ -185,6 +186,24 @@ Indexes: `evaluation_jobs_session_idx`, `evaluation_jobs_status_idx`.
 
 Indexes: `campaign_positions_campaign_idx`, `campaign_positions_position_idx`.
 
+### `personas`
+
+The voice agent's persona catalog. Unlike the other tables the primary key is a
+**text slug**, not a UUID — `friendly-tutor` and so on — because the ids are
+chosen by the client's own persona list rather than generated here.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `text` | Primary key, a slug (`friendly-tutor`) |
+| `label` | `text` | Not null, display name |
+| `emoji` | `text` | Not null |
+| `default_prompt` | `text` | Not null, the persona's system prompt |
+| `knowledge_topics` | `text[]` | Default `[]`, collections this persona may draw on |
+| `answer_mode` | `text` | Default `generate`; `material` speaks a retrieved passage instead |
+| `sort_order` | `integer` | Default `0` |
+| `created_at` | `timestamptz` | Default `now()` |
+| `updated_at` | `timestamptz` | Default `now()` |
+
 ## Migrations
 
 Migrations live in `migrations/` and are applied with Drizzle Kit:
@@ -211,6 +230,7 @@ prints nothing when it does. See
 | `migrations/0002_set_null_fk.sql` | Changes `evaluation_jobs.result_id` FK to `ON DELETE SET NULL` |
 | `migrations/0003_certain_multiple_man.sql` | Adds `language` column to `interview_sessions` |
 | `migrations/0004_add_personas.sql` | Creates `personas` and seeds it with the voice agent's personas, every one in `generate` answer mode |
+| `migrations/0005_fix_friendly_tutor_topics.sql` | Corrects `friendly-tutor`'s `knowledge_topics` to `{thinking, Truyện cười}` — `0004` copied the client's list short |
 
 
 ## Vector Search
@@ -231,13 +251,15 @@ The default similarity threshold is controlled by `EMBEDDING_SIMILARITY_THRESHOL
 
 ## Seeding
 
-Seed sample data with:
+**There is no seed script in this repository.** Earlier versions of this
+document pointed at `npx tsx src/lib/seed.ts`; that file does not exist and
+never has in this repository's history, and there is no `db:seed` npm script.
+The only data a migration itself seeds is the `personas` catalog
+(`0004_add_personas.sql`, corrected by `0005`).
 
-```bash
-npx tsx src/lib/seed.ts
-```
-
-This creates a sample position and candidate for local development.
+To create a sample position and candidate for local development, either insert
+them through the REST API — `POST /api/positions` and `POST /api/candidates` —
+or write the rows directly with `psql`.
 
 ## Backup & Restore
 
@@ -253,7 +275,7 @@ psql $DATABASE_URL < backup.sql
 
 ## Data Access Rules
 
-- Only `src/lib/db.ts` creates the Drizzle instance.
-- Route handlers import from `src/lib/*.ts`, never directly from `src/lib/db.ts` except through business logic.
-- Raw SQL is limited to vector similarity queries in `src/lib/embeddings.ts`.
-- All other queries use Drizzle's type-safe query builder.
+- Only `src/lib/db.ts` creates the Drizzle instance; everything else imports that instance.
+- Route handlers **do** import `db` and Drizzle operators directly. The intended layering is route handler → business logic, but `src/routes/*.ts` queries the database inline for its own reads and writes, and that is the prevailing pattern in practice.
+- Drizzle's type-safe query builder is the default.
+- Raw `sql` is used where the builder cannot express the query: vector similarity in `src/lib/embeddings.ts`, and the `IN (...)` list expansions in `src/routes/campaigns.ts` and the MCP tools.
