@@ -77,23 +77,6 @@ A style file that cannot be read is reported at startup, listed under
 `unreadable_voices`, and makes `/health` report `degraded`. The styles that did
 read are still served.
 
-## Docker
-
-```bash
-# Build and run directly
-docker build -t supertonic-tts-service:latest .
-docker run -p 8084:8084 supertonic-tts-service:latest
-```
-
-The image sets `SUPERTONIC_CACHE_DIR=/app/supertonic3`, so the weights baked at
-build time and the style directory live at a knowable path. Copy a deployment's
-style files into `supertonic-service/voice_styles/` before building to bake them
-in, or mount one file over the running container to install a voice without
-rebuilding (see the commented example in `docker-compose.audio.yml`).
-
-Mount a *file*, not a directory: a directory mount over `voice_styles/` would
-hide the ten built-in styles.
-
 ## Environment
 
 | Variable | Default      | Description |
@@ -113,8 +96,10 @@ needs no model weights.
 
 ## Note
 
-The `supertonic` PyPI package downloads model weights from HuggingFace on first use.
-The Dockerfile pre-downloads them during build so the container starts faster.
+The `supertonic` PyPI package downloads model weights from HuggingFace on first
+use, so the first start is slower than later ones. Pre-download them with the
+`python -c "from supertonic import TTS; _ = TTS()"` command in
+[Quick Start](#quick-start) if you would rather pay that cost at install time.
 
 ## Licensing
 
@@ -127,9 +112,11 @@ The Python wrapper in this directory is MIT, like the rest of the repository
   `supertonic` package being MIT says nothing about them — that license covers
   the wrapper code that fetches them. Commercial use is permitted, but the
   use-based restrictions must travel downstream as an enforceable provision,
-  and generated speech must be disclosed as machine generated. Because the
-  Dockerfile bakes the weights into the image, **anything that ships that image
-  redistributes them.**
+  and generated speech must be disclosed as machine generated. Note that the
+  weights are downloaded into the cache directory rather than tracked here, but
+  **a deployment that ships them preloaded — a prebuilt filesystem image, a
+  copied cache, a container built from them — redistributes them**, and carries
+  the obligations with it.
 - **Voice style files** are not distributed by this repository, and
   `voice_styles/*.json` is gitignored for that reason. A cloned voice is a
   voiceprint: keep it in the deployment, and do not use it to impersonate its

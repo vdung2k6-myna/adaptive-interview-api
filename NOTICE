@@ -1,35 +1,155 @@
-# NOTICE — Voice Model Licensing
+# NOTICE — Third-Party Licensing
 
-This repository contains application code and does **not** redistribute
-text-to-speech voice model files. Users must obtain and place their own
-model files in the directories indicated below.
+This repository's application code (TypeScript, and the Python service
+wrappers under `*-service/`) is licensed under the **MIT License** (see
+`LICENSE`).
 
-## Code License
+That MIT grant covers the source tracked in this repository. It does **not**
+cover the model weights, voice files, or third-party runtime dependencies
+described below, and it does **not** describe what a built image contains.
 
-The application code (TypeScript / Python service wrappers) in this
-repository is licensed under the **MIT License** (see `LICENSE`).
+## Source tree vs. deployment
 
-## Bundled / Auto-downloaded Model
+An earlier version of this file said the repository "does not redistribute
+text-to-speech voice model files". That is true of the **git tree**, and
+false of a **deployment**:
 
-### Kokoro Vietnamese
-- **Files:** `kokoro_vi.onnx`, `kokoro_vi.pth`, `kokoro_vi_voicepack.pt`
+- The Supertonic weights are not tracked here. The `supertonic` package
+  downloads them into a cache directory (`SUPERTONIC_CACHE_DIR`, default
+  `~/.cache/supertonic3`) on first use — see `supertonic-service/README.md`.
+- A deployment that ships that cache preloaded — a prebuilt filesystem image,
+  a copied cache directory, a container layered on top of it — therefore
+  redistributes the weights.
+- Voice style files are gitignored (§Voice files), but any the deployment
+  installs into its style directory travel with it.
+
+Anyone distributing a deployment is responsible for the obligations of the
+licenses below — not merely for what this repository tracks.
+
+## Model weights
+
+### Supertonic 3 — BigScience Open RAIL-M
+
+- **Where it comes from:** the `supertonic` PyPI package (MIT — that is the
+  wrapper, not the weights) downloads them from
+  https://huggingface.co/Supertone/supertonic-3, pinned by commit SHA in
+  `supertonic/config.py`.
+- **License:** BigScience Open RAIL-M (the Hugging Face model card carries
+  `license: openrail`).
+- **Commercial use:** permitted. The license grants perpetual, worldwide,
+  non-exclusive, no-charge, royalty-free rights, and contemplates paid
+  support.
+- **Obligations that travel with the weights (section 4(a)):** the use-based
+  restrictions must be included **as an enforceable provision** in any
+  agreement governing use or distribution of the model or its derivatives,
+  and downstream users must be notified that they are subject to them.
+- **Use-based restrictions** (Attachment A) include, in the part relevant to
+  a voice interview application:
+  - (e) do not generate or disseminate machine-generated content without
+    clearly disclosing that it is machine generated;
+  - (g) do not impersonate others without consent;
+  - (d) do not produce or spread personally identifiable information usable to
+    harm someone;
+  - (l) do not provide medical advice or interpret medical results;
+  - (m) do not generate information for use in justice administration, law
+    enforcement, immigration, or asylum processes.
+
+This is a summary of the license text, not legal advice. The authoritative
+text is at https://huggingface.co/Supertone/supertonic-3/blob/main/LICENSE.
+
+Because Supertonic is the default TTS engine, **a distribution that does not
+carry these restrictions forward is out of compliance.** That is a property of
+the deployed artifact — the weights it ships — and no file in this repository
+can satisfy it on its own.
+
+### Kokoro Vietnamese — Apache-2.0
+
+- **Files:** `kokoro_vi.onnx`, `kokoro_vi.pth`, `kokoro_vi_voicepack.pt`,
+  `config.json`
 - **Source:** https://huggingface.co/contextboxai/Kokoro-Vietnamese
 - **License:** Apache-2.0
-- **Usage:** The `download_models.py` script fetches these files at
-  install time. Redistribution of the model files themselves is governed
-  by the Apache-2.0 license.
+- **Use:** `kokoro-service/download_models.py` fetches these at install time.
+  They are gitignored (`.gitignore`), so the source tree does not track them;
+  redistribution of the model files themselves is governed by Apache-2.0.
 
-## User-provided Piper Voice Models
+## Voice files
 
-The Piper TTS service loads ONNX voice models from a user-supplied
-directory (`PIPER_MODELS_DIR`). Each voice model has its own independent
-license. The repository **does not** ship or endorse any particular model.
+A Supertonic voice is a style file — a set of learned tensors, not merely a
+configuration. A cloned voice is derived from a recording of a real person,
+and its `metadata` records the source recording it was extracted from.
 
-Users are solely responsible for:
-1. Obtaining voice model files legally.
-2. Complying with the license terms of each voice model they use.
-3. Ensuring their use case (commercial or non-commercial) is permitted
-   by the relevant model license.
+Style files are gitignored (`.gitignore`: `supertonic-service/voice_styles/*.json`).
+Install them per deployment, as described in `supertonic-service/README.md`.
 
-The authors of this repository assume no liability for voice model
-licensing violations by end users.
+Two obligations follow from the model license above and apply to generated
+speech:
+
+1. machine-generated audio must be disclosed as such;
+2. a cloned voice must not be used to impersonate its speaker without that
+   speaker's consent.
+
+## User-provided Piper voice models
+
+The Piper TTS service loads ONNX voice models from a directory the operator
+supplies (`PIPER_MODELS_DIR`, defaulting to `./pipervoices`). Those models are
+not tracked by this repository.
+
+Each voice model has its own license, and the license is **not** the
+`MODEL_CARD` in the model directory: those cards state the license of the
+**dataset** a voice was trained on, which is not by itself a grant covering
+the trained weights. Confirm the terms for each voice you deploy. The
+upstream voice index at https://huggingface.co/rhasspy/piper-voices is the
+starting point.
+
+Users are responsible for obtaining voice models legally and for their use
+case being permitted.
+
+## Runtime dependencies with copyleft or missing terms
+
+These are not tracked or vendored by this repository, but they are pulled in
+at install time and are relevant to anyone building a distribution.
+
+### `piper-tts` — GPL-3.0-or-later
+
+- `piper-service` imports `from piper.voice import PiperVoice`; the service
+  does not work without it.
+- It is **deliberately not declared** in `piper-service/requirements.txt`,
+  which is why a fresh `pip install -r requirements.txt` yields a service that
+  starts with zero voices and refuses every request. Install it yourself.
+- The PyPI `piper-tts` distribution is the **GPL fork**
+  (https://github.com/OHF-voice/piper1-gpl), licensed GPL-3.0-or-later. It
+  bundles the `espeak-ng` engine data (also GPL-3.0) inside the wheel — measured
+  in `piper_tts-1.7.0`: `piper/espeak-ng-data/` (125 language dictionaries) and
+  a compiled `piper/espeakbridge.pyd`. Nothing needs installing separately, and
+  no external `espeak-ng` is consulted.
+- Consequence: the source in `piper-service/` remains MIT, but **a distributed
+  artifact that combines it with `piper-tts` is a GPL-3.0-or-later combined
+  work.** Distributing one means complying with the GPL for that artifact, and
+  it cannot be represented as MIT-licensed as a whole.
+
+### `soundfile` — bundles libsndfile (LGPL)
+
+- `soundfile` itself is BSD-3-Clause, but its wheels ship a `libsndfile`
+  binary under `_soundfile_data/`, alongside a verbatim copy of the
+  **LGPL-2.1** (`_soundfile_data/COPYING`). The package metadata describes
+  libsndfile as "a free, cross-platform, open-source (LGPL) library".
+- The Windows build of soundfile 0.14.0 additionally carries codec code from
+  `libmpg123` (LGPL-2.1), `libVorbis`, and `libFLAC` — measured as strings in
+  `_soundfile_data/libsndfile_x64.dll`. Which codecs a build links varies by
+  version and platform, so check the wheel you actually ship rather than
+  relying on this list.
+- Dynamically loading it is ordinarily workable for an MIT project, but the
+  LGPL notice and source/relink offer are obligations of redistribution, and
+  they are not currently discharged anywhere in this repository.
+
+### `vig2p` — no license declared
+
+- A transitive dependency of `kokoro-vietnamese`
+  (`Requires-Dist: vig2p>=0.1.0`).
+- Its distribution metadata declares no license, ships no `LICENSE` file, and
+  records no author or project URL. Absent an explicit grant, default
+  copyright applies and no redistribution right is granted.
+- Worth resolving upstream before shipping a Kokoro-based distribution.
+
+## Authors of this repository assume no liability for licensing violations by
+end users.

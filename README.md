@@ -191,8 +191,9 @@ must pass on. Read [`NOTICE`](NOTICE) before distributing a build. In short:
 
 - **Supertonic 3 weights** (the default TTS engine) are **BigScience Open
   RAIL-M**. Commercial use is permitted, but the use-based restrictions must
-  be passed downstream as an enforceable provision, and the built Docker image
-  contains the weights.
+  be passed downstream as an enforceable provision, and any deployment that
+  ships the downloaded weights — a preloaded cache or a prebuilt image —
+  redistributes them.
 - **Piper voice models** are user-supplied; each has its own license, and the
   dataset license on a model card is not a grant covering the trained weights.
 - **`piper-tts`** (required at runtime by `piper-service`, not declared in its
