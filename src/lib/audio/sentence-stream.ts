@@ -31,8 +31,9 @@ export interface ChunkEvent {
   index: number;
   /** The text spoken — one of `splitForTTS(sentence)`'s chunks (D6). */
   text: string;
-  /** The audio, or `null` for a chunk that failed. A failure is emitted at its
-   * own index rather than omitted, so the caller's index sequence keeps its
+  /** The audio, or `null` for a chunk that failed — or for one the caller chose
+   * not to synthesize, which is a muted turn. A chunk with no audio is emitted at
+   * its own index rather than omitted, so the caller's index sequence keeps its
    * shape and the client's cursor keeps advancing (D4). */
   buffer: Buffer | null;
 }
@@ -53,8 +54,13 @@ export interface SentenceStreamOptions {
    * A throw is a failed chunk, not a broken stream: it is reported through
    * `onError` and emitted as `buffer: null` (D4). An `AbortError` is treated as
    * the stream having been aborted.
+   *
+   * Answering `null` is the other way to a chunk with no audio, and it is not a
+   * failure: nothing is reported, and the chunk is emitted at its index exactly
+   * as a failed one is — which is how a caller streams a turn's text without
+   * synthesizing any of it.
    */
-  synthesize: (chunk: string) => Promise<Buffer>;
+  synthesize: (chunk: string) => Promise<Buffer | null>;
   /** Called once per chunk, in index order. Emission is the caller's job, so
    * this is where a caller writes its own event. A throw from here is reported
    * through `onError` and does not stop the stream. */

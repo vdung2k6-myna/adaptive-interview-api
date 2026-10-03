@@ -1,72 +1,38 @@
 import "dotenv/config";
 
-import express from "express";
-import cors from "cors";
+import { createApp } from "./app";
+import { unavailableConfiguredVoices } from "./lib/audio/voice-catalog";
 
-import { apiAuthMiddleware } from "./middleware/auth";
-import { errorHandler } from "./middleware/error";
-
-import candidatesRoutes from "./routes/candidates";
-import positionsRoutes from "./routes/positions";
-import sessionsRoutes from "./routes/sessions";
-import campaignsRoutes from "./routes/campaigns";
-import messagesRoutes from "./routes/messages";
-import evaluationsRoutes from "./routes/evaluations";
-import voiceRoutes from "./routes/voice";
-import voiceAgentRoutes from "./routes/voice-agent";
-import mcpRoutes from "./routes/mcp";
-
-const app = express();
 const PORT = process.env.PORT || 4000;
 
-// Middleware
-const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:3000")
-  .split(",")
-  .map((s) => s.trim());
-console.log("[CORS] Allowed origins:", allowedOrigins);
-
-app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (e.g. mobile apps, curl)
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) {
-      console.log(`[CORS] Allowing origin: ${origin}`);
-      return callback(null, true);
-    }
-    console.error(`[CORS] BLOCKED origin: ${origin}. Add it to FRONTEND_URL env var.`);
-    callback(new Error(`CORS blocked origin: ${origin}`));
-  },
-  credentials: true,
-}));
-app.use(express.json());
-
-// Health check — must be BEFORE auth middleware
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", service: "adaptive-interview-api" });
-});
-
-// Audio static files — public, served before auth
-app.use("/audio", express.static(process.env.AUDIO_STORAGE_DIR || "/tmp/audio"));
-
-// MCP endpoint — handles its own auth (MCP_AUTH_TOKEN)
-app.use("/api/mcp", mcpRoutes);
-
-// Auth middleware (protects all routes below)
-app.use(apiAuthMiddleware);
-
-// Routes
-app.use("/api/candidates", candidatesRoutes);
-app.use("/api/positions", positionsRoutes);
-app.use("/api/sessions", sessionsRoutes);
-app.use("/api/campaigns", campaignsRoutes);
-app.use("/api/messages", messagesRoutes);
-app.use("/api/evaluations", evaluationsRoutes);
-app.use("/api/voice", voiceRoutes);
-app.use("/api/voice-agent", voiceAgentRoutes);
-
-// Error handler
-app.use(errorHandler);
-
-app.listen(PORT, () => {
+createApp().listen(PORT, () => {
   console.log(`Adaptive Interview API listening on port ${PORT}`);
+  void reportUnavailableVoices();
 });
+
+/**
+ * Report any configured Supertonic voice the synthesis service does not hold.
+ *
+ * Runs once at boot so a misconfigured voice name is visible before a turn
+ * tries to speak in it. The audio stack is not on this API's boot path, so this
+ * never throws and never blocks startup: when the gateway relays no catalog the
+ * check reports nothing, because an unreachable audio stack says nothing about
+ * which voices are installed.
+ */
+async function reportUnavailableVoices(): Promise<void> {
+  try {
+    const unavailable = await unavailableConfiguredVoices();
+    if (unavailable === null) {
+      return;
+    }
+    for (const voice of unavailable) {
+      console.warn(
+        `[Audio Gateway] Configured Supertonic voice '${voice}' holds no style ` +
+          `in the synthesis service. A turn resolved to it will fail rather ` +
+          `than fall back to another voice.`
+      );
+    }
+  } catch (error) {
+    console.warn("[Audio Gateway] Voice catalog check failed:", error);
+  }
+}

@@ -30,8 +30,19 @@ export interface PromptMessage {
 
 /**
  * Maximum total characters for the assistant/user turn history.
- * This is a hard failsafe to avoid exceeding the model's context window.
- * System message, context user message, and final task message are never trimmed.
+ *
+ * This bounds how much of the interview reaches the model. It does not protect
+ * the model's context window, which is far larger than this: the local model
+ * loads at 131k tokens and the cloud one ignores `num_ctx` outright, against
+ * ~13,500 tokens worst case here.
+ *
+ * The first and last turns are kept unconditionally, so they are spent from this
+ * budget before the middle competes for what is left. When those two alone
+ * exceed it the history is returned as just those two turns and the budget is
+ * exceeded — a turn with no history is worse than one over budget.
+ *
+ * The system message, context user message, and final task message are never
+ * counted or trimmed.
  */
 const DEFAULT_MAX_PROMPT_TURN_CHARS = 24_000;
 
@@ -89,11 +100,18 @@ function buildTurnMessages(messages: PromptMessage[]): OllamaMessage[] {
 }
 
 /**
- * Trim the oldest middle turns when the combined turn history exceeds the
- * configured character budget. Keeps the first turn and the most recent turns.
- * System message, context message, and final task message are not counted or trimmed.
+ * Trim the middle turns when the combined turn history exceeds the configured
+ * character budget. The first and last turns are kept unconditionally and are
+ * charged against the budget; the newest middle turns are then kept while they
+ * fit in what remains, so a turn costs one message at the boundary rather than
+ * the whole middle.
+ *
+ * Returns the history unchanged when it is within budget, or when it is short
+ * enough that there is no middle to drop. Retention is per message rather than
+ * per exchange, so a kept middle can begin mid-exchange: an answer can arrive
+ * without the question it responds to.
  */
-function trimTurnMessages(turns: OllamaMessage[], maxChars: number): OllamaMessage[] {
+export function trimTurnMessages(turns: OllamaMessage[], maxChars: number): OllamaMessage[] {
   const totalChars = turns.reduce((sum, m) => sum + m.content.length, 0);
   if (totalChars <= maxChars) return turns;
   if (turns.length <= 2) return turns; // nothing to drop from the middle
@@ -102,15 +120,16 @@ function trimTurnMessages(turns: OllamaMessage[], maxChars: number): OllamaMessa
   const last = turns[turns.length - 1];
   const middle = turns.slice(1, -1);
 
-  let middleChars = middle.reduce((sum, m) => sum + m.content.length, 0);
+  // What the budget has left for the middle, once the two ends have taken theirs.
+  let remaining = maxChars - first.content.length - last.content.length;
   let keepCount = 0;
   // Keep newest middle turns first
   for (let i = middle.length - 1; i >= 0; i--) {
     const nextChars = middle[i].content.length;
-    if (middleChars + nextChars > maxChars) {
+    if (nextChars > remaining) {
       break;
     }
-    middleChars += nextChars;
+    remaining -= nextChars;
     keepCount++;
   }
 
@@ -136,10 +155,32 @@ export function formatKnowledgeChunks(chunks: KnowledgeChunk[]): string {
 }
 
 /**
+ * The directive that turns retrieved chunks from ambient context into the basis
+ * for the reply.
+ *
+ * It belongs to the knowledge section rather than the `Rules:` block so that it
+ * exists exactly when the section does: a turn with no chunks gets the prompt it
+ * would get with no retrieval at all (design D1).
+ *
+ * It asks for no citation. The reply is spoken, and a bracketed source name the
+ * model echoes reaches synthesis — `stripMarkdown` has no rule for a bare
+ * `[token]` — so a citation would be read aloud (design D5).
+ *
+ * "when it is relevant" and "reply as you normally would" carry the personas
+ * that ask rather than answer: the Interview Coach must ground its questions in
+ * the material, not lecture from it (design D4).
+ */
+const KNOWLEDGE_DIRECTIVE =
+  "Base your reply on the material above when it is relevant to the conversation. " +
+  "Prefer its terminology and specifics over general knowledge, and do not " +
+  "contradict it. If it does not cover the topic, reply as you normally would.";
+
+/**
  * Build a generic voice-agent prompt from a user-supplied system prompt,
  * language rule, and conversation history. No position/candidate context.
  * Optional knowledgeContext prepends a "Relevant knowledge:" section to
- * the system prompt so the LLM can reference indexed documents.
+ * the system prompt, carrying a directive to base the reply on the
+ * indexed documents it names.
  */
 export function buildVoiceAgentPrompt(
   systemPrompt: string,
@@ -149,9 +190,13 @@ export function buildVoiceAgentPrompt(
 ): OllamaMessage[] {
   const languageInstruction = `- Conduct the entire conversation in ${language}. Replies must be in ${language} only.`;
 
+  // The section's own text is the only place that exists exactly when chunks do,
+  // so the directive rides inside it rather than in the unconditional Rules block
+  // below (design D1). `formatKnowledgeChunks` stays a pure formatter and the
+  // "Relevant knowledge:" line stays its first line (design D2, D3).
   const knowledgeSection =
     knowledgeContext && knowledgeContext.length
-      ? `${formatKnowledgeChunks(knowledgeContext)}\n\n`
+      ? `${formatKnowledgeChunks(knowledgeContext)}\n\n${KNOWLEDGE_DIRECTIVE}\n\n`
       : "";
 
   const systemContent = `${systemPrompt}

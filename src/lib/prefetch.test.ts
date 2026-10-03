@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createPrefetchStore, type PrefetchStore } from "./prefetch";
-import type { KnowledgeChunk, KnowledgeSearchOutcome } from "./knowledge";
+import type { KnowledgeChunk, KnowledgeSearchOutcome, SearchOptions } from "./knowledge";
 
 const CHUNKS: KnowledgeChunk[] = [{ text: "a chunk", source: "guide.pdf" }];
 
@@ -9,13 +9,14 @@ interface SearchCall {
   query: string;
   topK?: number;
   collections?: string[];
+  options?: SearchOptions;
 }
 
 function storeReturning(outcome: KnowledgeSearchOutcome) {
   const calls: SearchCall[] = [];
   const store = createPrefetchStore({
-    search: async (query, topK, collections) => {
-      calls.push({ query, topK, collections });
+    search: async (query, topK, collections, options) => {
+      calls.push({ query, topK, collections, options });
       return outcome;
     },
   });
@@ -49,8 +50,46 @@ describe("createPrefetchStore", () => {
     await store.issue("kiem hiep", ["truyen-kiem-hiep"]);
 
     assert.deepEqual(calls, [
-      { query: "kiem hiep", topK: 3, collections: ["truyen-kiem-hiep"] },
+      { query: "kiem hiep", topK: 3, collections: ["truyen-kiem-hiep"], options: undefined },
     ]);
+  });
+
+  it("forwards the search's options, so a hold may carry the section its turn will speak", async () => {
+    const { store, calls } = storeReturning({ ok: true, chunks: CHUNKS });
+
+    await store.issue("kiem hiep", ["truyen-kiem-hiep"], { expand: "section" });
+    await store.issue("kiem hiep", ["truyen-kiem-hiep"]);
+
+    assert.deepEqual(
+      calls[0].options,
+      { expand: "section" },
+      "a hold issued for a material-reply persona asks for the section (D6)"
+    );
+    assert.equal(
+      calls[1].options,
+      undefined,
+      "and a hold issued for the generating path leaves that request unchanged"
+    );
+  });
+
+  it("holds the sections its chunks carried, storing none of its own", async () => {
+    const SECTION = { text: "a chunk", start: 0, end: 7, size: 7 };
+    const sectioned: KnowledgeChunk[] = [
+      {
+        text: "a chunk",
+        source: "guide.pdf",
+        section: SECTION,
+      },
+    ];
+    const { store } = storeReturning({ ok: true, chunks: sectioned });
+
+    const id = (await store.issue("kiem hiep", ["truyen-kiem-hiep"], { expand: "section" })) as string;
+
+    assert.deepEqual(
+      store.claim(id, "kiem hiep")?.[0].section,
+      SECTION,
+      "the section rides on the chunks, so a claim hands it back with them"
+    );
   });
 
   it("holds an empty successful result, because an empty result is an answer", async () => {

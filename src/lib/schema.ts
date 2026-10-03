@@ -134,6 +134,32 @@ export const evaluationJobs = pgTable(
   ]
 );
 
+/**
+ * The personas a voice session can be run as.
+ *
+ * `id` is the identifier the client's built-in list uses too, so a deep link is
+ * valid against either source and no mapping exists between them. It is text
+ * rather than a generated uuid for that reason: the identity is chosen by
+ * whoever writes the persona, not minted here.
+ *
+ * `answerMode` is a preference, not a capability: it says how this persona would
+ * like its replies produced, and the server's own speakable-collection set
+ * decides whether the material can honour it. The two are intersected, which is
+ * why a persona in `material` mode still gets generated replies when its topics
+ * reach only sources the corpus cannot be spoken from.
+ */
+export const personas = pgTable("personas", {
+  id: text("id").primaryKey(),
+  label: text("label").notNull(),
+  emoji: text("emoji").notNull(),
+  defaultPrompt: text("default_prompt").notNull(),
+  knowledgeTopics: text("knowledge_topics").array().notNull().default([]),
+  answerMode: text("answer_mode").notNull().default("generate"),
+  sortOrder: integer("sort_order").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
 export const campaigns = pgTable("campaigns", {
   id: uuid("id").primaryKey().defaultRandom(),
   name: text("name").notNull(),

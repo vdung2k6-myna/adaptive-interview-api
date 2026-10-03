@@ -37,20 +37,22 @@ Evaluations are generated on-demand by the **Express backend** via an **async jo
 
 ```
 1. Client: POST /api/sessions/:id/evaluate
-   └──► Backend returns 202 { jobId, status: "running" }
+   └──► Backend returns 202 { jobId, status: "processing" }
 
 2. Client: GET /api/evaluations/jobs/:jobId  (every 2 seconds)
-   ├──► status: "running"   → keep polling
-   ├──► status: "completed" → fetch evaluation + display result
-   └──► status: "failed"   → display error + allow retry
+   ├──► status: "processing" → keep polling
+   ├──► status: "completed"  → fetch evaluation + display result
+   └──► status: "failed"     → display error + allow retry
 ```
 
 ### API
 
 - **Start:** `POST /api/sessions/:id/evaluate` (optional `{ model: "llama3.2" }` in body)
   - Returns `202 Accepted` with `{ jobId, status }`
+  - If a job for this session is already `processing`, the same `jobId` is returned instead of starting a second run
 - **Poll:** `GET /api/evaluations/jobs/:jobId`
-  - Returns `{ id, status, result?, error? }`
+  - Returns `{ id, sessionId, status, createdAt, updatedAt }`, plus `resultId` and `result` when completed, or `error` when failed
+  - `result` is a reduced form: `{ id, aiScores, aiRecommendation, confidence, strengths, weaknesses, createdAt }`. Use `resultId` with `GET /api/evaluations/versions/:versionId` for the full row
 
 ### Condition
 
@@ -120,7 +122,9 @@ The evaluation response is parsed with a **3-attempt retry strategy** in `src/li
 2. **Attempt 2:** Same prompt + `"CRITICAL: Respond ONLY with valid JSON. No markdown formatting, no extra text."`
 3. **Attempt 3:** Same as attempt 2
 
-If all attempts fail, the raw response is stored with empty scores so it can be reviewed later.
+If every attempt returns unparsable output, the raw response is stored with empty `strengths`/`weaknesses` and null scores so it can be reviewed later.
+
+An `OllamaError` is **not** retried: it aborts the run immediately and fails the job, rather than being stored as an empty evaluation. Only parse failures consume the three attempts.
 
 ### Validation Rules
 

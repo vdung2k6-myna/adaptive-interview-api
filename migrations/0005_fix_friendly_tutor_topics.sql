@@ -1,0 +1,16 @@
+-- Custom SQL migration file, put your code below! --
+-- `0004_add_personas.sql` seeded the catalog from the client's built-in list and
+-- copied `friendly-tutor`'s topics short: the list declares `thinking` before
+-- `Truyện cười`, and the seed left the first one out. `thinking` is a collection
+-- the corpus serves, so this is a topic the persona is missing rather than a
+-- label nothing can answer.
+--
+-- It is a migration of its own rather than an edit to `0004`, for the reason
+-- stated there: a database that already ran that file keeps the old topics,
+-- while a fresh one would get the new — the divergence the comment exists to
+-- prevent.
+--
+-- The order is the client's declaration's order, and it is part of the value:
+-- the guard compares these topics with `deepEqual`, and the page renders the
+-- persona's topics in the order the list declares them.
+UPDATE "personas" SET "knowledge_topics" = ARRAY['thinking', 'Truyện cười'] WHERE "id" = 'friendly-tutor';

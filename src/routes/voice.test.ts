@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { Server } from "node:http";
 import express from "express";
-import { createVoiceRouter, type VoiceRouteDeps } from "./voice";
+import { createVoiceRouter, type VoiceRouteDeps, type SessionForTurn } from "./voice";
 
 interface Harness {
   /** The text of every chunk the route asked to synthesize, in order — what the
@@ -12,6 +12,9 @@ interface Harness {
    * dropped chunk from a reported one. */
   logs: string[];
 }
+
+/** A harness together with the injected dependencies that go with it. */
+type Harnessed = Harness & { deps: Partial<VoiceRouteDeps> };
 
 /**
  * Drive `/speak-stream` with a synthesizer a test supplies, so the endpoint's SSE
@@ -26,7 +29,7 @@ interface Harness {
  */
 function harness(
   reply: (chunk: string, call: number) => Buffer | Promise<Buffer>
-): Harness & { deps: Partial<VoiceRouteDeps> } {
+): Harnessed {
   const calls: string[] = [];
   const logs: string[] = [];
 
@@ -47,6 +50,10 @@ function harness(
 interface Endpoints {
   /** POST here to speak a whole text, streamed back as base64 chunks. */
   speak: string;
+  /** POST here with one audio turn; answers with JSON. */
+  turn: string;
+  /** POST here with one audio turn; answers with an SSE stream. */
+  stream: string;
   /** POST here to start an interview session — the composition guard below. */
   start: string;
   /** Resolves once the server has seen the client's connection close. It is
@@ -80,7 +87,13 @@ async function withServer(
   const base = `http://127.0.0.1:${address.port}/api/voice`;
 
   try {
-    await fn({ speak: `${base}/speak-stream`, start: `${base}/start`, clientDisconnected });
+    await fn({
+      speak: `${base}/speak-stream`,
+      turn: `${base}/turn`,
+      stream: `${base}/stream`,
+      start: `${base}/start`,
+      clientDisconnected,
+    });
   } finally {
     // A test that aborted mid-stream leaves its socket in the client's keep-alive
     // pool, and `close()` would wait out the pool's 4s idle timeout for it.
@@ -158,6 +171,144 @@ function sentences(events: SseEvent[]): SseEvent[] {
  * sentence boundaries. */
 const LONG_SENTENCE =
   "This second sentence is deliberately long enough that the splitter has to break it across more than one chunk.";
+
+/** The session a turn is recorded against, as `sessionForTurn` resolves one. It
+ * is cast rather than spelled out because the row carries a dozen columns these
+ * routes never read from a session that reached the guard under test. */
+const SESSION = {
+  id: "session-1",
+  mode: "voice",
+  status: "in_progress",
+  maxTurns: 5,
+} as unknown as Extract<SessionForTurn, { ok: true }>["session"];
+
+/** What a turn's routes need before they reach STT: a session to resolve and
+ * somewhere to put the audio. The real ones read Postgres and write a file, so
+ * both are faked here — the guard these tests are about sits after them, and the
+ * suite reaches the database nowhere. */
+interface TurnHarness {
+  deps: Partial<VoiceRouteDeps>;
+  /** Every path the route asked STT about, in order. */
+  transcribed: string[];
+}
+
+function turnHarness(
+  harnessed: Harnessed,
+  stt: (audioPath: string) => Promise<{ text: string; confidence?: number }>
+): TurnHarness {
+  const transcribed: string[] = [];
+
+  return {
+    transcribed,
+    deps: {
+      ...harnessed.deps,
+      sessionForTurn: async () => ({ ok: true, session: SESSION }),
+      saveAudio: async () => ({ filePath: "C:/audio/session-1/turn.wav", urlPath: "/audio/turn.wav" }),
+      transcribeAudio: async (audioPath) => {
+        transcribed.push(audioPath);
+        return await stt(audioPath);
+      },
+    },
+  };
+}
+
+/** POST one audio turn and read its whole body. The two routes answer in
+ * different shapes, so this returns the raw text and leaves parsing to the test.
+ * The body is read inside the console capture because the routes log while
+ * answering, and a line logged after the fetch resolves would print. */
+async function postAudioTurn(
+  url: string,
+  harnessed: Harness,
+  sessionId = "session-1"
+): Promise<{ status: number; body: string }> {
+  const form = new FormData();
+  form.append("sessionId", sessionId);
+  form.append("audio", new Blob([new Uint8Array([0, 1, 2, 3])], { type: "audio/wav" }), "turn.wav");
+
+  return await captureConsole(harnessed, async () => {
+    const response = await fetch(url, { method: "POST", body: form });
+    return { status: response.status, body: await response.text() };
+  });
+}
+
+describe("POST /api/voice/turn — a turn nobody spoke into", () => {
+  it("answers 400 with a no_speech code, and speaks nothing", async () => {
+    // An empty transcript is what the STT client now returns for a recording it
+    // found no words in — a 200 from the service, not a failure. The route must
+    // still refuse the turn: stored, it would enter the transcript and the
+    // scoring as a candidate answer that was never given.
+    const h = harness(() => Buffer.alloc(0));
+    const t = turnHarness(h, async () => ({ text: "", confidence: 0.9 }));
+
+    await withServer(t.deps, async (api) => {
+      const response = await postAudioTurn(api.turn, h);
+      const body = JSON.parse(response.body) as { code?: string; error?: string };
+
+      assert.equal(response.status, 400, "silence is the client's to recover from, not the server's to fail on");
+      assert.equal(body.code, "no_speech", "the code is what a client translates; the message is its fallback");
+      assert.match(body.error ?? "", /No speech/i);
+      assert.equal(t.transcribed.length, 1, "the audio must be transcribed before it is judged silent");
+      assert.deepEqual(h.calls, [], "a turn with no words must not reach TTS");
+      assert.ok(
+        h.logs.some((line) => line.includes("STT returned no words")),
+        `the silent turn must be reported server-side too — logged: ${h.logs.join(" | ")}`
+      );
+    });
+  });
+
+  it("still answers 500 for a transcriber that failed", async () => {
+    // The distinction the empty transcript rests on: a service that answered
+    // nothing is not a service that did not answer.
+    const h = harness(() => Buffer.alloc(0));
+    const t = turnHarness(h, async () => {
+      throw new Error("audio gateway is down");
+    });
+
+    await withServer(t.deps, async (api) => {
+      const response = await postAudioTurn(api.turn, h);
+      const body = JSON.parse(response.body) as { code?: string; error?: string };
+
+      assert.equal(response.status, 500);
+      assert.match(body.error ?? "", /Failed to transcribe/i);
+      assert.notEqual(body.code, "no_speech", "a dead service must not be reported as silence");
+    });
+  });
+});
+
+describe("POST /api/voice/stream — a turn nobody spoke into", () => {
+  it("sends one notice, not an error, so the client does not retry the same audio", async () => {
+    const h = harness(() => Buffer.alloc(0));
+    const t = turnHarness(h, async () => ({ text: "", confidence: 0.9 }));
+
+    await withServer(t.deps, async (api) => {
+      const response = await postAudioTurn(api.stream, h);
+      assert.equal(response.status, 200, "an SSE turn has already begun; it ends in-band");
+
+      const events = parseSse(response.body);
+      assert.deepEqual(
+        events.map((event) => event.event),
+        ["notice"],
+        "one notice and nothing else — an error here would make the interview client re-transcribe"
+      );
+      assert.equal(events[0].data.code, "no_speech");
+      assert.match(String(events[0].data.message), /No speech/i);
+      assert.deepEqual(h.calls, [], "a turn with no words must not reach TTS");
+    });
+  });
+
+  it("still sends an error for a transcriber that failed", async () => {
+    const h = harness(() => Buffer.alloc(0));
+    const t = turnHarness(h, async () => {
+      throw new Error("audio gateway is down");
+    });
+
+    await withServer(t.deps, async (api) => {
+      const events = parseSse((await postAudioTurn(api.stream, h)).body);
+      assert.deepEqual(events.map((event) => event.event), ["error"]);
+      assert.match(String(events[0].data.message), /Failed to transcribe/i);
+    });
+  });
+});
 
 describe("POST /api/voice/speak-stream — the chunk contract", () => {
   it("numbers chunks from 0 with no gap, and speaks the text it was given", async () => {
@@ -302,6 +453,51 @@ describe("POST /api/voice/speak-stream — the chunk contract", () => {
       );
       assert.doesNotMatch(received, /event: done/);
     });
+  });
+});
+
+describe("POST /api/voice/speak-stream — audio it ships inline instead of storing", () => {
+  it("names no audio location to fetch, and stores nothing for one", async () => {
+    // This route's audio travels inside the event that announces it, so a client
+    // never retrieves a file for it — which is why it has no part in the race
+    // `keep-turn-audio-playable` fixes: there is no request to lose, and so no
+    // 401 to misread. It was documented as sharing the segment cleanup (design
+    // D4) and it does not: it writes nothing at all.
+    //
+    // That is worth pinning rather than leaving as a coincidence. The day this
+    // route starts naming audio locations, the fetch and its failure modes
+    // arrive with them, and this is the test that fails to say so.
+    const h = harness((chunk) => Buffer.from(`wav:${chunk}`));
+    const stored: string[] = [];
+
+    await withServer(
+      {
+        ...h.deps,
+        saveAudio: async (sessionId, _blob, prefix, ext) => {
+          stored.push(`${sessionId}/${prefix}.${ext}`);
+          return {
+            filePath: `/nowhere/${prefix}.${ext}`,
+            urlPath: `/audio/${sessionId}/${prefix}.${ext}`,
+          };
+        },
+      },
+      async (api) => {
+        const chunks = sentences(await speak(api, h, { text: `One. ${LONG_SENTENCE}` }));
+        assert.ok(chunks.length > 2, "expected a multi-chunk delivery to test against");
+
+        for (const { data } of chunks) {
+          assert.ok(
+            !("audioUrl" in data),
+            `a chunk named an audio location for the client to fetch: ${JSON.stringify(data)}`
+          );
+          assert.ok(
+            "audioData" in data,
+            `a chunk arrived with neither inline audio nor a location: ${JSON.stringify(data)}`
+          );
+        }
+        assert.deepEqual(stored, [], "the route stored audio for a client to come back for");
+      }
+    );
   });
 });
 

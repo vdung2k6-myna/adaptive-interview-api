@@ -27,7 +27,8 @@ Authorization: Bearer <token>
 
 - If `API_AUTH_TOKEN` is set in the backend, every API route returns `401 Unauthorized` without a valid Bearer token.
 - If `API_AUTH_TOKEN` is not set, auth is disabled (backward-compatible for local development).
-- The MCP endpoint (`/api/mcp`) has its own token (`MCP_AUTH_TOKEN`) and checks both tokens when auth is enabled.
+- The MCP endpoint (`/api/mcp`) is **outside** that check. It is mounted before the API auth middleware, so only `MCP_AUTH_TOKEN` is ever consulted for it — `API_AUTH_TOKEN` is not.
+- `MCP_AUTH_TOKEN` is enforced only when it is at least 8 characters long. A missing or shorter token leaves `/api/mcp` **open** while `MCP_ENABLED=true` (`src/lib/mcp/auth.ts` treats a short token as "auth disabled for local dev").
 
 Clients (including the Next.js frontend) are responsible for sending the header. The frontend uses its own `apiFetch()` wrapper, which reads `NEXT_PUBLIC_API_TOKEN`.
 
@@ -291,9 +292,10 @@ Create a new interview session.
 **Optional fields:**
 
 - `mode` (`"text"` or `"voice"`, defaults to `"text"`)
-- `ttsProvider` (`"kokoro"` or `"piper"`, defaults to `"kokoro"`; only used when `mode` is `"voice"`)
+- `ttsProvider` (`"kokoro"`, `"piper"`, or `"supertonic"`, defaults to `"kokoro"`; only used when `mode` is `"voice"`)
 - `language` (`"english"` or `"vietnamese"`, defaults to `"english"`)
-- `maxTurns` (`number`, defaults to `8`)
+
+`maxTurns` is **not** a request field here: the handler reads only the fields above, so a `maxTurns` in the body is ignored and the session keeps the schema default of `8`.
 
 **Response:**
 
@@ -438,27 +440,52 @@ Submit a candidate answer or trigger the first question. Returns a streaming res
 
 **Response:**
 
-Returns a stream of NDJSON chunks:
+Returns a stream of **plain-text** token deltas — the raw model output, not JSON. The response is `Content-Type: text/plain; charset=utf-8`, so concatenate the chunks as they arrive:
 
 ```
-{"message": {"content": "What"}}
-{"message": {"content": " is"}}
-{"message": {"content": " your"}}
-...
+What is your
 ```
 
 **Status Codes:**
 
 - `200` — Stream started
-- `400` — Missing sessionId or invalid request
-- `404` — Session not found
-- `500` — Ollama error
+- `400` — Missing `sessionId`, or `content` missing on a turn that submits an answer
+- `404` — Session not found, or its candidate/position row is gone
+- `503` — Ollama embedding failure (`OllamaError`). Note this is raised while embedding the answer, before the chat stream opens
+- `500` — Stream failed. Once headers are sent the status code is fixed, so a later failure is handled by destroying the connection rather than by a status code: a client sees a truncated body and a closed socket
 
 **Important:** This endpoint returns a stream, not a JSON object. The client must read the response body incrementally.
 
 ---
 
 ## Voice Interview
+
+### Which voice a turn speaks in
+
+The voice is a deployment setting, not a request field: a turn resolves it from
+the configured name for that turn's engine and language (`SUPERTONIC_VOICE_ENGLISH`,
+`KOKORO_VOICE_ENGLISH`, and so on, falling back to `DEFAULT_VOICE`). For the
+Supertonic engine the names a deployment may use are the style files the
+synthesis service holds — its ten built-ins (`F1`–`F5`, `M1`–`M5`) plus any
+style installed alongside them. Read them back from the gateway this API already
+talks to:
+
+```bash
+curl http://localhost:8082/health
+# {"status":"ok", ..., "supertonic":true, "voices":["F1","F2",...,"me"]}
+```
+
+`voices` is absent, not empty, when the synthesis service cannot be reached —
+that says nothing about which voices are installed. At startup the API compares
+its configured Supertonic names against this list and logs each name that holds
+no style.
+
+A Supertonic name that holds no style is a failed turn, not a fallback: the
+synthesis service refuses it rather than speaking in another voice. The one
+request field that can name a voice is `voice` on `POST /api/voice/speak` below;
+an override naming a held-less voice fails the same way.
+
+See [supertonic-service/README.md](../supertonic-service/README.md) for how to install a voice.
 
 ### `POST /api/voice/start`
 
@@ -497,7 +524,10 @@ Generate the first interview question for a voice session, synthesize it to audi
 - `400` — Missing sessionId
 - `404` — Session not found
 - `409` — Session already has messages
-- `503` — Ollama or audio.cpp unavailable
+- `500` — LLM failure
+- `503` — Ollama unavailable
+
+A TTS failure does not fail this request: it is logged and the turn still returns `200`, just without an `audioUrl`.
 
 ---
 
@@ -540,10 +570,13 @@ audio: Blob (audio/webm or audio/wav)
 **Status Codes:**
 
 - `200` — Turn processed successfully
-- `400` — Missing sessionId or audio
+- `400` — Missing sessionId or audio; body carries `code: "no_speech"` when the recording contains no transcribable speech
 - `403` — Session is text mode or already completed
 - `404` — Session not found
-- `500` — STT, TTS, or LLM failure
+- `500` — STT failure
+- `503` — LLM failure (Ollama unavailable)
+
+A TTS failure does not fail this request: it is logged and the turn still returns `200`, just without an interviewer `audioUrl`.
 
 ---
 
@@ -570,7 +603,10 @@ audio: Blob (audio/webm or audio/wav)
 | `candidate` | `{ text, audioUrl, confidence, messageId }` | Candidate transcription stored |
 | `sentence` | `{ index, text, audioUrl }` | A sentence chunk ready to play |
 | `done` | `{ session, messageId, fullText, audioUrl }` | All chunks complete; full audio saved |
+| `notice` | `{ code, message }` | Non-fatal notice; the stream then ends. Currently only `code: "no_speech"`, when the recording held no transcribable speech |
 | `error` | `{ message }` | Fatal error (stream terminates) |
+
+On a session's final turn the closing shape differs: the last question is emitted as a single `sentence` with `index: 0`, and `done` carries only `{ session, messageId }` — no `fullText` and no `audioUrl`.
 
 **Text preprocessing:**
 
@@ -634,8 +670,8 @@ On-demand TTS for transcript replay. Synthesizes any text to speech via the Audi
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `text` | `string` | Yes | Text to synthesize |
-| `engine` | `"kokoro"` \| `"piper"` | No | Default: `"kokoro"` |
-| `voice` | `string` | No | Explicit voice ID override |
+| `engine` | `"kokoro"` \| `"piper"` \| `"supertonic"` | No | Default: `"kokoro"` |
+| `voice` | `string` | No | Explicit voice ID override, passed through as given. The only request field that names a voice; a name the synthesis service holds no style for fails the request rather than being replaced |
 | `language` | `"english"` \| `"vietnamese"` | No | Default: `"english"`; selects the configured voice unless `voice` is provided |
 
 **Response:** `audio/wav` — WAV audio stream.
@@ -648,7 +684,7 @@ Markdown formatting (bold, italic, strikethrough, headers, code blocks, inline c
 
 - `200` — Audio synthesized
 - `400` — Missing text
-- `500` — TTS failure
+- `500` — TTS failure. A failure from the gateway is surfaced as `500`, not as the gateway's own status code.
 
 ---
 
@@ -669,7 +705,7 @@ Markdown formatting (bold, italic, strikethrough, headers, code blocks, inline c
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `text` | `string` | Yes | Text to synthesize |
-| `engine` | `"kokoro"` \| `"piper"` | No | Default: `"kokoro"` |
+| `engine` | `"kokoro"` \| `"piper"` \| `"supertonic"` | No | Default: `"kokoro"` |
 | `language` | `"english"` \| `"vietnamese"` | No | Default: `"english"`; selects the configured voice for the engine |
 
 **Response:** `text/event-stream`
@@ -709,23 +745,31 @@ The endpoint accepts either an audio recording (voice input) or a `text` field (
 |-------|------|----------|-------------|
 | `audio` | `Blob` (`audio/wav` or `audio/webm`) | No | User voice recording. Omit on first turn or when using text input. |
 | `text` | `string` | No | User text message. Alternative to `audio`. |
-| `language` | `"english"` \| `"vietnamese"` | Yes | Conversation language and TTS voice selector. |
-| `engine` | `"kokoro"` \| `"piper"` | Yes | Requested TTS engine (runtime may force an engine based on `language`). |
-| `systemPrompt` | `string` | Yes | Agent behavior/persona prompt. |
-| `history` | `JSON string` | Yes | Array of `{ role: "agent" \| "user", content: string }`. |
+| `language` | `"english"` \| `"vietnamese"` | No | Conversation language and TTS voice selector. Default: `"english"`. |
+| `engine` | `"kokoro"` \| `"piper"` \| `"supertonic"` | No | Requested TTS engine. Default: `"kokoro"`. |
+| `systemPrompt` | `string` | Yes | Agent behavior/persona prompt. The only required field. |
+| `history` | `JSON string` | No | Array of `{ role: "agent" \| "user", content: string }`. Default: `[]`. |
+| `enabledTopics` | `JSON string` \| repeated field | No | Topic labels the turn may draw knowledge from (see `GET /api/personas` for a persona's own list). Absent or empty means the search is unscoped. |
+| `answerMode` | `"generate"` \| `"material"` | No | How this turn's reply is produced. Anything other than `"material"` generates, so omitting it is exactly the previous behaviour. See [Material replies](#material-replies). |
+| `prefetchId` | `string` | No | A prefetch (`POST /api/voice-agent/prefetch`) whose located chunks this turn should reuse instead of searching again. |
+| `speak` | `"0"` | No | Set to `"0"` to skip TTS synthesis: `sentence` events still arrive with `audioData: null`. |
 
 **Response:** `text/event-stream`
 
 | Event | Data Shape | Description |
 |-------|-----------|-------------|
 | `user` | `{ text, messageId }` | Transcribed user audio or the provided `text`. Omitted on the first turn. |
-| `sentence` | `{ index, text, audioData }` | A synthesized agent sentence as base64 WAV. `audioData` is `null` if synthesis failed. |
+| `sentence` | `{ index, text, audioData }` | A synthesized agent sentence as base64 WAV. `audioData` is `null` if synthesis failed, including when `speak=0`. |
+| `text` | `{ text }` | The agent's sentence as plain text, emitted immediately before the matching `sentence` so a client can render it without waiting for synthesis. |
 | `done` | `{ messageId, fullText }` | Agent response complete. |
+| `notice` | `{ code, message }` | Non-fatal notice; the stream then ends. Currently only `code: "no_speech"`, when the recording held no transcribable speech. |
 | `error` | `{ message }` | Fatal error (stream terminates). |
 
 **Text preprocessing:**
 
-Same Markdown stripping and sentence splitting as the voice interview endpoints. The engine and voice are resolved via `resolveEngineForLanguage(engine, language)` and `resolveVoice(engine, language)`.
+The engine and voice are resolved via `resolveEngineForLanguage(engine, language)` and `resolveVoice(engine, language)`.
+
+That resolution defaults the engine before it runs, so this endpoint's own `engine` default (`"kokoro"`) is what applies when the field is absent — the `language`-based fallback inside `resolveEngineForLanguage` is not reached from here.
 
 **History cap:**
 
@@ -749,6 +793,101 @@ data: {"messageId":"agent-1","fullText":"A closure is a function that remembers 
 - `200` — SSE stream opened (errors delivered as `event: error`)
 - `400` — Missing `systemPrompt` or invalid configuration
 
+### Material replies
+
+A turn whose request carries `answerMode: "material"` is answered from the indexed material rather than by the language model: the turn's search locates one result, expanded to that result's whole section, and the section's own text — the passage the service sliced from the source document — is the reply, so no model request is made at all. The reply is emitted through the same `sentence` and `done` events a generated one uses, so a client needs no change to render it.
+
+A materially-answered turn requires **all** of:
+
+| Condition | Where it comes from |
+|-----------|---------------------|
+| The request asks for material (`answerMode: "material"`) | The client, from the persona's catalog entry |
+| The search returns a hit | The turn's `enabledTopics` scoped search |
+| That hit's source is in a collection named by `MATERIAL_COLLECTIONS` | Server config — a request cannot widen this |
+| That hit's score is at or above `MATERIAL_SCORE_FLOOR` | Server config |
+| The hit carries its whole section — present, and the range it was sliced from agrees with the length the service states for it | The search's `expand: "section"`, and the service version behind it |
+
+When any of them fails, the turn is generated exactly as it is on a deployment without this feature, and the log says which condition failed (`Material path did not answer this turn (<reason>); generating instead`). The same fallback covers a service too old to expand a section, a section whose range and stated length disagree — a bounded expansion's fragment (`section_incomplete`) — and a section whose text is empty (`text_empty`) — a material turn is never worse off than a generated one.
+
+The passage arrives with the search that located it: a material turn issues no second request, so there is no content read whose failure could answer a turn.
+
+**Configuration, and what "unset" means:**
+
+- `MATERIAL_COLLECTIONS` — comma-separated collection names whose stored text is clean enough to be spoken aloud as stored. **Unset in production, which means the empty set, and an empty set means every reply is generated** however a request asks; the material path is then inert. Development defaults to the two wiki collections; `truyen-cuoi` is deliberately absent because its stored text is OCR-corrupted.
+- `MATERIAL_SCORE_FLOOR` — how close a hit must be to be spoken, in `[0, 1]`. Unset defaults to `0.55`. Unread while the speakable set is empty.
+
+The floor's default is measured rather than guessed, and re-measuring is a task after any corpus or embedding-model change:
+
+```bash
+node scripts/measure-material-floor.mjs     # needs doc-etl-api up (DOC_ETL_API_URL)
+```
+
+It sends 24 queries — 8 naming a story in the speakable set, 8 asking vaguely, 8 plainly off-topic — through the same `top_k: 1` request a material turn's locator sends, and writes the scores to `D:/tmp/material-floor.json`. Measured on the development corpus (23 Sep 2026): named on-topic 0.635–0.677, vaguely on-topic 0.480–0.596, off-topic 0.380–0.531. The named and off-topic bands do not overlap, so any floor in `(0.531, 0.635]` separates them; the default `0.55` refuses none of the named queries, 3 of the 8 vague ones and none of the 8 off-topic ones.
+
+### `POST /api/voice-agent/prefetch`
+
+**Run a turn's knowledge search before the turn is submitted.** The client calls this while the user types; the id it returns is then sent as `prefetchId` on `POST /api/voice-agent/stream`, and the turn reuses the held result instead of searching again. A prefetch is speculative and never fails the turn it was meant for — every way of holding nothing answers `{ prefetchId: null }`.
+
+**Request:** `application/json`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `text` | `string` | Yes | The input being prefetched. Trimmed here and at the submitting turn, identically, so the two sides compare as the same text; a prefetch is reused only for the exact input it was issued for. |
+| `enabledTopics` | `string[]` | Yes | Topic labels scoping the search, folded to collection names exactly as on the stream endpoint. Absent or folding to no collection means nothing is searched and `prefetchId` is `null`. |
+| `answerMode` | `"generate"` \| `"material"` | No | The persona's mode for the turn this prefetch is meant for. **Omitting it is valid** and searches exactly as before this field existed. It is an optimization, not a dependency: with `"material"` the held hits carry the section a material turn speaks, so that turn reuses the hold and issues no search; omitted, the held hits carry no section, the material turn declines the hold and issues its own locator search — one search it would otherwise have skipped, and the same one it issues whenever no prefetch is held. See [Material replies](#material-replies). |
+
+**Response:**
+
+```json
+{ "prefetchId": "0f1e2d3c-..." }
+```
+
+`prefetchId` is `null` when there was nothing to hold: no `text`, no topic resolving to a collection, or a search that timed out, could not reach doc-etl-api, or was refused.
+
+**Status Codes:**
+
+- `200` — Always, including when nothing was held
+- `401` — Missing or invalid auth token, when `API_AUTH_TOKEN` is set
+
+---
+
+## Personas
+
+### `GET /api/personas`
+
+**The personas the voice agent can be run as, served as a catalog.** Read-only and seeded by the schema migration: there is no route that creates, modifies or deletes a persona, and the catalog can only change by a migration. `POST /api/voice-agent/stream` takes a persona's `systemPrompt`, `enabledTopics` and `answerMode` as ordinary turn fields, so a session is started by sending the persona's own values.
+
+**Response:** `application/json` — an array ordered by the catalog's sort order.
+
+```json
+[
+  {
+    "id": "friendly-partner",
+    "label": "Friendly Partner",
+    "emoji": "🤝",
+    "defaultPrompt": "Act as a friendly personal conversation partner...",
+    "knowledgeTopics": ["Story teller", "Behavioral Questions", "Truyện cười"],
+    "answerMode": "generate"
+  }
+]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `string` | Stable identifier. A client resolves a `?persona=<id>` link against it. |
+| `label` | `string` | Display name. |
+| `emoji` | `string` | Display emoji, possibly empty. |
+| `defaultPrompt` | `string` | The `systemPrompt` to start a session with. |
+| `knowledgeTopics` | `string[]` | Topic labels the session may enable — the values to send as `enabledTopics`. |
+| `answerMode` | `"generate"` \| `"material"` | How the persona's replies are produced. A persona stored without one is reported as `"generate"`. |
+
+**Note:** the catalog is not translated and does not vary by locale — a persona's text is its own.
+
+**Status Codes:**
+
+- `200` — the catalog
+- `401` — missing or invalid credential on a deployment with `API_AUTH_TOKEN` set
+
 ---
 
 ## Audio Gateway (External Service)
@@ -770,28 +909,35 @@ The Audio Gateway is a standalone FastAPI service in `audio-gateway/` that provi
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `text` | `string` | Yes | Text to synthesize |
-| `engine` | `"kokoro"` \| `"piper"` | No | Default: `"kokoro"` |
-| `voice` | `string` | No | Voice ID (passed through to downstream) |
-| `model` | `string` | No | Model override (Kokoro only) |
+| `engine` | `"kokoro"` \| `"piper"` \| `"supertonic"` | No | Default: `"kokoro"` |
+| `voice` | `string` | Yes | Voice ID (passed through to downstream) |
+| `model` | `string` | No | Model override, forwarded to Kokoro and Supertonic. Piper ignores it (the voice ID selects the model there) |
 
 **Response:** `audio/wav` — WAV audio stream.
 
 **Errors:**
 
-- `400` — Missing text or unknown engine
-- `502` — Downstream TTS service error
-- `504` — Downstream TTS timeout
+- `400` — Missing or whitespace-only `text`
+- `422` — Request body failed validation: a missing `voice`, or an `engine` outside the enum. The `Literal` type rejects an unknown engine before the handler runs, so this is what an unknown engine actually returns
+- `502` — Downstream TTS connect error, or a downstream response with status ≥ 400
+- `504` — Downstream TTS timed out (the client timeout is 60s)
 
 ### `GET /health` (Gateway)
+
+Aggregates the three downstream services; the gateway is healthy only when all three answer.
 
 ```json
 {
   "status": "ok",
   "gateway": true,
   "kokoro": true,
-  "piper": true
+  "piper": true,
+  "supertonic": true,
+  "voices": ["F1", "M1"]
 }
 ```
+
+`status` is `"ok"` when every downstream is up, `"degraded"` when at least one is, and `"down"` when none is. `voices` is the Supertonic service's own loaded voice list, relayed so a caller can check its configured voice names against what is installed. The key is **absent** — not empty — when that service could not be reached, since an unreachable service says nothing about which voices are present.
 
 ---
 
@@ -845,7 +991,9 @@ Get the latest evaluation and version history for a completed session.
 **Status Codes:**
 
 - `200` — Success
-- `404` — Evaluation not found
+- `500` — Database error
+
+A session with no evaluations is not an error: the response is `200` with `{"latest": null, "versions": []}`. This endpoint never returns `404`.
 
 ---
 
@@ -881,13 +1029,13 @@ This endpoint is **asynchronous**. It returns immediately with a `jobId` that th
 ```json
 {
   "jobId": "uuid",
-  "status": "running"
+  "status": "processing"
 }
 ```
 
 **Status Codes:**
 
-- `202` — Evaluation job started
+- `202` — Evaluation job started. Also returned when an evaluation for this session is already in progress, in which case the body carries that existing job's `jobId` rather than starting a second one
 - `400` — Interview not completed
 - `404` — Session not found
 - `500` — Ollama error or parse failure
@@ -903,20 +1051,27 @@ Poll the status of an async evaluation job. Call every 2 seconds after receiving
 ```json
 {
   "id": "uuid",
-  "status": "running"
+  "sessionId": "uuid",
+  "status": "processing",
+  "createdAt": "2026-08-08T12:19:58Z",
+  "updatedAt": "2026-08-08T12:19:58Z"
 }
 ```
+
+`status` is `"processing"` while the job runs, then `"completed"` or `"failed"`. A `"completed"` job adds `resultId` and, when that id resolves, a `result` object. A `"failed"` job adds `error`.
 
 When completed:
 
 ```json
 {
   "id": "uuid",
+  "sessionId": "uuid",
   "status": "completed",
+  "createdAt": "2026-08-08T12:19:58Z",
+  "updatedAt": "2026-08-08T12:20:00Z",
+  "resultId": "uuid",
   "result": {
     "id": "uuid",
-    "sessionId": "uuid",
-    "model": "llama3.1",
     "aiScores": {
       "technicalDepth": 4,
       "communicationClarity": 4,
@@ -927,11 +1082,12 @@ When completed:
     "confidence": 82,
     "strengths": ["Strong React knowledge", "Clear communication"],
     "weaknesses": ["Could dig deeper into system design"],
-    "rawResponse": "{\"technical_depth\": 4, ...}",
     "createdAt": "2026-08-08T12:20:00Z"
   }
 }
 ```
+
+The `result` here is a **reduced** form of the version returned by `GET /api/evaluations/:sessionId`: it omits `sessionId`, `model`, `humanScores`, `humanRecommendation`, `humanCalibrated`, `recruiterNotes`, and `rawResponse`. Fetch the full version from `GET /api/evaluations/versions/:versionId` using `resultId` if you need those.
 
 When failed:
 
@@ -1087,8 +1243,7 @@ Fetch a single campaign with its positions and aggregated metrics.
       "title": "Senior Full Stack Engineer",
       "level": "Senior",
       "requirements": ["React", "Node.js"],
-      "createdAt": "2026-08-09T12:00:00Z",
-      "sessionCount": 3
+      "createdAt": "2026-08-09T12:00:00Z"
     }
   ],
   "metrics": {
@@ -1206,10 +1361,9 @@ Accept: text/event-stream
 **Protocol:**
 
 1. Client opens SSE connection
-2. Server sends `endpoint` event with a URL for POSTing messages
-3. Server sends `tools/list` with available tool definitions
-4. Client POSTs `tools/call` messages to the endpoint URL
-5. Server sends results back via SSE `message` events
+2. Server sends `endpoint` event with the URL to POST messages to
+3. Client POSTs JSON-RPC requests to that endpoint — including `tools/list` to enumerate the tools and `tools/call` to invoke one
+4. Server sends each response back over the SSE stream as a `message` event, not on the POST response body
 
 **Status Codes:**
 
@@ -1250,7 +1404,7 @@ List all recruiting campaigns with position and session counts.
 
 **Input:** `{ status?: string }`
 
-**Output:** Array of `{ id, name, description, status, positionCount, sessionCount }`
+**Output:** Array of `{ id, name, description, startDate, endDate, tags, status, createdAt, positionCount, sessionCount }`
 
 ---
 
@@ -1283,9 +1437,11 @@ Get aggregated analytics for a campaign.
 
 List interview sessions with anonymized candidate info.
 
-**Input:** `{ status?: string, limit?: number }`
+**Input:** `{ campaignId?: string, status?: string, limit?: number }`
 
-**Output:** Array of `{ id, positionTitle, level, candidateUuid, status, currentTurn, maxTurns, createdAt }`
+`campaignId` is accepted by the tool's schema but **not applied** — the query is not filtered by campaign. Use `getCampaignAnalytics` for per-campaign figures. `limit` defaults to `50` and is capped at `500`.
+
+**Output:** Array of `{ id, positionTitle, level, candidateUuid, status, currentTurn, maxTurns, createdAt }`, oldest first.
 
 ---
 

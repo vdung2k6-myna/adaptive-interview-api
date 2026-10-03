@@ -24,16 +24,22 @@ The `adaptive-interview-api` is a standalone Express server that provides all da
 │  │  ├─ messages.ts   ← streaming                            │ │
 │  │  ├─ evaluations.ts                                      │ │
 │  │  ├─ voice.ts     ← multipart + SSE                       │ │
+│  │  ├─ voice-agent.ts ← multipart + SSE                     │ │
+│  │  ├─ personas.ts                                        │ │
 │  │  ├─ mcp.ts       ← SSE transport                        │ │
 │  │  └─ audio serving (static /audio/*)                     │ │
 │  └─────────────────────────────────────────────────────────┘ │
 │                               │                               │
 │  ┌────────────────────────────┴────────────────────────────┐ │
 │  │  Business Logic (src/lib/*.ts)                           │ │
-│  │  ├─ prompts.ts       — interview prompt builder         │ │
+│  │  ├─ prompts.ts       — interview + voice-agent prompts  │ │
 │  │  ├─ ollama.ts        — Ollama HTTP client               │ │
 │  │  ├─ evaluation.ts    — scoring prompt + parser          │ │
 │  │  ├─ embeddings.ts    — vector storage + similarity      │ │
+│  │  ├─ knowledge.ts     — knowledge-base search            │ │
+│  │  ├─ material.ts      — material-reply selection         │ │
+│  │  ├─ prefetch.ts      — voice-agent prefetch cache       │ │
+│  │  ├─ personas.ts      — persona definitions              │ │
 │  │  ├─ audio/*.ts       — STT/TTS orchestration            │ │
 │  │  └─ position-queries.ts — position lookup helpers        │ │
 │  └─────────────────────────────────────────────────────────┘ │
@@ -81,7 +87,8 @@ The `adaptive-interview-api` is a standalone Express server that provides all da
 
 ```
 src/
-├── index.ts              # Express server bootstrap, middleware wiring
+├── index.ts              # Express server bootstrap
+├── app.ts                # Express app factory: middleware + route wiring
 ├── routes/
 │   ├── candidates.ts
 │   ├── positions.ts
@@ -90,31 +97,47 @@ src/
 │   ├── messages.ts       # Streaming text interview
 │   ├── evaluations.ts    # Evaluation retrieval + calibration
 │   ├── voice.ts          # Voice turn, stream, TTS
+│   ├── voice-agent.ts    # Ephemeral voice/text agent chat
+│   ├── personas.ts       # Persona list
 │   └── mcp.ts            # MCP SSE transport
 ├── lib/
 │   ├── db.ts             # Drizzle + pg Pool
 │   ├── schema.ts         # Drizzle table definitions
-│   ├── auth.ts           # Bearer token validation
+│   ├── auth.ts           # Bearer token helpers
 │   ├── errors.ts         # Custom error classes
-│   ├── prompts.ts        # Interview prompt builder
+│   ├── prompts.ts        # Interview + voice-agent prompt builders
 │   ├── ollama.ts         # Ollama client
 │   ├── evaluation.ts     # Evaluation prompt + parser
 │   ├── embeddings.ts     # Vector storage + similarity
+│   ├── knowledge.ts      # Knowledge-base search
+│   ├── session-knowledge.ts
+│   ├── material.ts       # Material-reply selection
+│   ├── prefetch.ts       # Voice-agent prefetch cache
+│   ├── personas.ts, personas.client-list.ts
+│   ├── topics.ts         # Requirement/topic coverage
 │   ├── position-queries.ts
+│   ├── config/           # Environment-derived runtime config
+│   ├── mcp/              # MCP server, tools, auth
 │   └── audio/
 │       ├── client.ts     # audio.cpp + Audio Gateway HTTP clients
 │       ├── stt.ts        # Speech-to-text wrapper
 │       ├── tts.ts        # Text-to-speech wrapper
-│       ├── text-processing.ts  # Markdown strip + number normalization + chunking
+│       ├── text-processing.ts    # Markdown strip + number normalization + chunking
 │       ├── split-sentences.ts    # Sentence boundary detection
-│       ├── wav-utils.ts          # WAV header parse + concat
+│       ├── sentence-extractor.ts # Incremental sentence extraction during streaming
+│       ├── sentence-stream.ts    # Per-turn ordered audio stream
 │       ├── sentence-queue.ts     # Server-side audio queue logic
-│       └── storage.ts          # Audio file storage helpers
+│       ├── voice-catalog.ts      # Known voice names per engine
+│       ├── wav-utils.ts          # WAV header parse + concat
+│       └── storage.ts            # Audio file storage helpers
 └── middleware/
     ├── auth.ts           # API auth middleware
-    ├── error.ts          # Global error handler
-    └── mcpAuth.ts        # MCP auth middleware
+    └── error.ts          # Global error handler
 ```
+
+MCP authentication is **not** a `src/middleware/` module: it lives in
+`src/lib/mcp/auth.ts` (`validateMcpAuth`), and the `/api/mcp` mount handles its
+own auth rather than passing through the `/api` middleware.
 
 ## Data Flow: Text Interview
 
@@ -125,7 +148,7 @@ User submits answer (via frontend)
 POST /api/messages
     │
     ▼
-validateApiAuth()
+apiAuthMiddleware()
     │
     ▼
 load session + candidate + position + messages
@@ -140,7 +163,7 @@ buildPrompt(position, candidate, history, covered topics)
 generateChatResponseStream() → Ollama /api/chat stream:true
     │
     ▼
-stream NDJSON chunks via res.write()
+stream raw text deltas via res.write()  (text/plain, not NDJSON)
     │
     ▼
 persist full interviewer message
@@ -223,7 +246,7 @@ Frontend: POST /api/sessions/:id/evaluate
 Backend creates evaluation job
     │
     ▼
-return 202 { jobId, status: "running" }
+return 202 { jobId, status: "processing" }
     │
     ▼
 Frontend polls GET /api/evaluations/jobs/:jobId every 2s
@@ -257,10 +280,10 @@ validateMcpAuth()
 ExpressSseTransport connects to McpServer
     │
     ▼
-Sends endpoint event + tools/list
+Sends endpoint event
     │
     ▼
-Client POSTs tools/call to /api/mcp?sessionId=...
+Client POSTs JSON-RPC requests (tools/list, tools/call) to /api/mcp?sessionId=...
     │
     ▼
 Tool handler queries DB via Drizzle
@@ -283,10 +306,14 @@ Express Backend
     │ POST /v1/audio/speech { text, engine, voice }
     ▼
 Audio Gateway (port 8082)
-    ├─ engine=kokoro ──▶ Kokoro TTS (port 8081)
-    │   voice resolved from session.language → config.audio.voices.kokoro
-    └─ engine=piper  ──▶ Piper TTS (port 8083)
-        voice resolved from session.language → config.audio.voices.piper
+    ├─ engine=kokoro     ──▶ Kokoro TTS (port 8081)
+    ├─ engine=piper      ──▶ Piper TTS (port 8083)
+    └─ engine=supertonic ──▶ Supertonic TTS (port 8084)
+
+The voice is not resolved here: the backend passes a voice ID the gateway
+forwards unchanged. That ID was chosen earlier by `resolveVoice(engine,
+language)` from `config.audio.voices[engine][language]`, falling back to
+`config.audio.defaultVoice`.
 
 Express Backend
     │ POST /v1/audio/transcriptions
@@ -308,9 +335,9 @@ Every `interview_sessions` row stores `language` (`english` \| `vietnamese`, def
 
 | Middleware | File | Purpose |
 |------------|------|---------|
-| CORS | `src/index.ts` | Allow requests from `FRONTEND_URL` |
-| API Auth | `src/middleware/auth.ts` | Validate `Authorization: Bearer` against `API_AUTH_TOKEN` |
-| MCP Auth | `src/middleware/mcpAuth.ts` | Validate MCP token |
+| CORS | `src/app.ts` | Allow requests from `FRONTEND_URL` |
+| API Auth | `src/middleware/auth.ts` | `apiAuthMiddleware` — validates `Authorization: Bearer` against `API_AUTH_TOKEN`, scoped to the `/api` mount only |
+| MCP Auth | `src/lib/mcp/auth.ts` | `validateMcpAuth` — validates `MCP_AUTH_TOKEN`; the `/api/mcp` mount handles its own auth and is registered *before* `/api` |
 | Error Handler | `src/middleware/error.ts` | Catch unhandled errors and return JSON |
 
 ## Environment Configuration
@@ -329,12 +356,15 @@ Runtime configuration is loaded from `.env` via `dotenv`. Key variables:
 | `AUDIO_STORAGE_DIR` | Audio file storage path |
 | `AUDIOCPP_BASE_URL` | STT server URL |
 | `AUDIO_GATEWAY_URL` | TTS gateway URL |
-| `DEFAULT_TTS_ENGINE` | `kokoro` or `piper` |
-| `DEFAULT_VOICE` | Default voice ID |
+| `DEFAULT_TTS_ENGINE` | `kokoro`, `piper`, or `supertonic` (default `supertonic`) |
+| `DEFAULT_VOICE` | Default voice ID (default `F1`) |
 | `KOKORO_VOICE_ENGLISH` | English voice ID for Kokoro (default `af_heart`) |
 | `PIPER_VOICE_ENGLISH` | English voice ID for Piper (default `en_US-lessac-medium`) |
+| `SUPERTONIC_VOICE_ENGLISH` | English voice ID for Supertonic (empty = service default) |
 | `KOKORO_VOICE_VIETNAMESE` | Override Vietnamese voice ID for Kokoro (empty = service default) |
 | `PIPER_VOICE_VIETNAMESE` | Override Vietnamese voice ID for Piper (empty = service default) |
+| `SUPERTONIC_VOICE_VIETNAMESE` | Override Vietnamese voice ID for Supertonic (empty = service default) |
+| `MATERIAL_COLLECTIONS` | Knowledge collections the material-reply search is scoped to |
 | `FRONTEND_URL` | CORS origin |
 | `PORT` | Server port (default 4000) |
 

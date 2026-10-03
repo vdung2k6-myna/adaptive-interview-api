@@ -29,6 +29,20 @@
       "when": 1787836500514,
       "tag": "0003_certain_multiple_man",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1790146830793,
+      "tag": "0004_add_personas",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790658943629,
+      "tag": "0005_fix_friendly_tutor_topics",
+      "breakpoints": true
     }
   ]
 }

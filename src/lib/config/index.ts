@@ -32,8 +32,17 @@ export interface AppConfig {
     gatewayUrl: string;      // Audio Gateway (TTS)
     sttModel: string;
     defaultEngine: "kokoro" | "piper" | "supertonic"; // default TTS engine
-    defaultVoice: string;   // voice ID, e.g. "default_name" (kokoro) or "vi_VN-vais1000-medium" (piper)
+    defaultVoice: string;   // voice ID, e.g. "F1" (supertonic) or "af_heart" (kokoro)
     timeoutMs: number;
+    /**
+     * How long a streamed turn's per-segment files stay on disk after they are
+     * written. It only has to outlast a client's fetch of a segment it has just
+     * been told about — seconds — so the value is margin against a slow fetch,
+     * not a playback budget. Deleting segments the moment their turn ended is
+     * what made an announced segment unretrievable; see D2 of
+     * `keep-turn-audio-playable`.
+     */
+    segmentRetentionMs: number;
     voices: {
       kokoro: {
         english: string;
@@ -52,6 +61,28 @@ export interface AppConfig {
   docEtl: {
     apiUrl: string;          // Document ETL service URL for knowledge retrieval
     searchTimeoutMs: number; // per-request timeout for POST /search
+  };
+  /**
+   * The material reply policy: which stored collections may be spoken verbatim,
+   * and how confident a hit must be before one is.
+   *
+   * A policy rather than a service setting, which is why it is not part of
+   * `docEtl`: the set describes the corpus, and the floor is a judgement about
+   * it that was measured on one corpus with one embedding model. Both are read
+   * per turn, so both are cheap to change without a deploy of code.
+   */
+  material: {
+    /**
+     * The collections whose stored text may be spoken as it is stored. A hit
+     * whose source belongs to none of these cannot be a material reply, however
+     * confident the hit is.
+     */
+    collections: string[];
+    /**
+     * The score a hit must reach to be spoken. Biased high on purpose — see the
+     * measurement on this value in development.ts.
+     */
+    scoreFloor: number;
   };
 }
 

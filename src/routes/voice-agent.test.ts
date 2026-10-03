@@ -3,13 +3,18 @@ import assert from "node:assert/strict";
 import type { Server } from "node:http";
 import express from "express";
 import { createVoiceAgentRouter, type VoiceAgentDeps } from "./voice-agent";
-import type { KnowledgeChunk, KnowledgeSearchOutcome } from "../lib/knowledge";
+import { DEFAULT_PREFETCH_TOP_K } from "../lib/prefetch";
+import type { KnowledgeChunk, KnowledgeSearchOutcome, SearchOptions } from "../lib/knowledge";
 import { SentenceExtractor } from "../lib/audio/sentence-extractor";
 
 interface SearchCall {
   query: string;
   topK?: number;
   collections?: string[];
+  /** The options the route passed with the search, or `undefined` when it passed
+   * none — which is every generating turn's search, and is what keeps that
+   * request body byte-identical to what it was (design.md D5). */
+  options?: SearchOptions;
 }
 
 interface Harness {
@@ -18,6 +23,10 @@ interface Harness {
   searches: SearchCall[];
   /** Every message array the route gave the LLM, flattened to text. */
   prompts: string[];
+  /** Every message array the route gave the *non-streaming* generate — the
+   * fallback a cloud model with empty streaming content triggers. Separate from
+   * `prompts` so "no model was asked" can be asserted over both. */
+  nonStreaming: string[];
   /** Everything the route logged, so a test can assert on a drop or a query. */
   logs: string[];
   /** What the route did, in order — `"search"` and `"transcribe"` — so a test
@@ -71,10 +80,14 @@ function harness(
      * the text it belongs to. Defaults to the empty buffer the route then
      * base64-encodes to `""`, which is what the existing tests expect. */
     synthesize?: (chunk: string, call: number) => Buffer | Promise<Buffer>;
+    /** What the fake STT hears. Defaults to words; `""` is a silent recording,
+     * which the client reports as an empty transcript rather than an error. */
+    transcription?: string;
   } = {}
 ): Harness {
   const searches: SearchCall[] = [];
   const prompts: string[] = [];
+  const nonStreaming: string[] = [];
   const logs: string[] = [];
   const events: string[] = [];
   const synthCalls: string[] = [];
@@ -84,12 +97,13 @@ function harness(
   return {
     searches,
     prompts,
+    nonStreaming,
     logs,
     events,
     synthCalls,
     deps: {
-      searchKnowledge: async (query, topK, collections) => {
-        const call = { query, topK, collections };
+      searchKnowledge: async (query, topK, collections, options) => {
+        const call = { query, topK, collections, options };
         searches.push(call);
         events.push("search");
         if (settings.neverSettles?.(call)) {
@@ -99,7 +113,7 @@ function harness(
       },
       transcribeAudio: async () => {
         events.push("transcribe");
-        return { text: "transcribed words", confidence: 0.9 };
+        return { text: settings.transcription ?? "transcribed words", confidence: 0.9 };
       },
       generateChatResponseStream: (options) => {
         prompts.push(options.messages.map((m) => m.content).join("\n---\n"));
@@ -113,7 +127,10 @@ function harness(
           getFullText: () => fullText,
         };
       },
-      generateChatResponse: async () => "",
+      generateChatResponse: async (options) => {
+        nonStreaming.push(options.messages.map((m) => m.content).join("\n---\n"));
+        return "";
+      },
       synthesizeSpeechWithFallback: async (chunk) => {
         const call = synthCalls.length;
         synthCalls.push(chunk);
@@ -398,6 +415,64 @@ describe("POST /api/voice-agent/stream — retrieved chunks in the prompt", () =
       assert.ok(!h.prompts[0].includes("Relevant knowledge:"));
     });
   });
+
+  it("carries the directive into the prompt alongside the chunks", async () => {
+    const chunks: KnowledgeChunk[] = [
+      { text: "Hold the hilt with both hands.", source: "sword-guide.pdf" },
+    ];
+    const h = harness({ ok: true, chunks });
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, {
+        text: "grip?",
+        history: LATER_TURN,
+        enabledTopics: ["Truyện kiếm hiệp"],
+      });
+
+      assert.match(
+        h.prompts[0],
+        /base your reply on the material above when it is relevant/i,
+        `a turn that retrieved chunks must direct the model to use them; got ${h.prompts[0]}`
+      );
+    });
+  });
+
+  it("carries no directive on a turn that has no chunks", async () => {
+    // The three ways a turn reaches the prompt with nothing: no topics at all, a
+    // successful empty result, and a search that failed to obtain a result. The
+    // directive rides inside the section, so none of them may carry it — this is
+    // the route-level half of the invariant the unit test pins (design D1).
+    const cases: Array<{
+      label: string;
+      reply: KnowledgeSearchOutcome;
+      topics?: string[];
+    }> = [
+      { label: "no topics", reply: { ok: true, chunks: [] } },
+      { label: "empty result", reply: { ok: true, chunks: [] }, topics: ["Truyện kiếm hiệp"] },
+      { label: "failed search", reply: { ok: false, reason: "timeout" }, topics: ["Truyện kiếm hiệp"] },
+    ];
+
+    for (const c of cases) {
+      const h = harness(c.reply);
+
+      await withServer(h.deps, async (api) => {
+        await sendTurn(api.stream, h, {
+          text: "grip?",
+          history: LATER_TURN,
+          ...(c.topics ? { enabledTopics: c.topics } : {}),
+        });
+
+        assert.ok(
+          !/base your reply on the material/i.test(h.prompts[0]),
+          `${c.label}: a turn with no chunks must carry no directive; got ${h.prompts[0]}`
+        );
+        assert.ok(
+          !h.prompts[0].includes("Relevant knowledge:"),
+          `${c.label}: and no knowledge section`
+        );
+      });
+    }
+  });
 });
 
 describe("POST /api/voice-agent/stream — request validation", () => {
@@ -413,6 +488,35 @@ describe("POST /api/voice-agent/stream — request validation", () => {
 
       assert.match(sse, /event: error/);
       assert.equal(h.searches.length, 0, "nothing must be spent on an invalid turn");
+    });
+  });
+
+  it("ends a turn whose audio transcribed to nothing, before any search or LLM call", async () => {
+    // Silence used to arrive as a throw from the STT client, so it read as a dead
+    // service: the turn fell into the outer catch and the user was shown "STT
+    // returned empty transcription". Heard nothing is an answer, and the turn it
+    // belongs to has nothing to ground, answer or speak — so it must end on
+    // purpose, here, rather than be handed to the LLM as a history with no new
+    // question in it (which the agent would answer all over again).
+    const h = harness({ ok: true, chunks: [] }, { transcription: "" });
+
+    await withServer(h.deps, async (api) => {
+      const sse = await sendAudioTurn(api.stream, h, { history: LATER_TURN });
+      const events = parseSse(sse);
+
+      assert.deepEqual(
+        events.map((event) => event.event),
+        ["notice"],
+        "one notice and nothing else — no user turn, no chunks, no done, no error"
+      );
+      assert.equal(events[0].data.code, "no_speech");
+      assert.equal(h.searches.length, 0, "there is no question to search for");
+      assert.equal(h.prompts.length, 0, "the LLM must not be asked to answer nothing");
+      assert.equal(h.synthCalls.length, 0, "and there is nothing to speak");
+      assert.ok(
+        !h.logs.some((line) => line.includes("Unexpected error")),
+        `a silent turn is an outcome, not an unhandled error — logged: ${h.logs.join(" | ")}`
+      );
     });
   });
 });
@@ -448,6 +552,30 @@ describe("POST /api/voice-agent/prefetch — holding a result for a turn not yet
       assert.equal(h.searches.length, 1);
       assert.equal(h.searches[0].query, "grip?", "the prefetch searches the typed input");
       assert.deepEqual(h.searches[0].collections, ["truyen-kiem-hiep"]);
+    });
+  });
+
+  it("asks for each hit's section when the prefetch declares a material-reply persona", async () => {
+    const h = harness({ ok: true, chunks: PREFETCHED });
+
+    await withServer(h.deps, async (api) => {
+      await sendPrefetch(api.prefetch, h, {
+        text: "grip?",
+        enabledTopics: TOPICS,
+        answerMode: "material",
+      });
+      await sendPrefetch(api.prefetch, h, { text: "grip?", enabledTopics: TOPICS });
+
+      assert.deepEqual(
+        h.searches[0].options,
+        { expand: "section" },
+        "a hold meant for a material turn must carry the section that turn will speak (D6)"
+      );
+      assert.equal(
+        h.searches[1].options,
+        undefined,
+        "a hold for the generating path asks for nothing extra, so its request is unchanged (D5)"
+      );
     });
   });
 
@@ -928,6 +1056,46 @@ describe("POST /api/voice-agent/stream — the spoken chunk contract", () => {
       );
     });
   });
+
+  it("emits every chunk's text and no audio, and synthesizes nothing, when the turn is muted", async () => {
+    // `speak: "0"` is a client saying it will not play this turn. The turn must be
+    // otherwise indistinguishable from a spoken one — same texts, same indices,
+    // same `done` — because the transcript is the half a muted client still reads.
+    const h = harness(
+      { ok: true, chunks: [] },
+      { stream: TOKENS, synthesize: (chunk) => Buffer.from(`wav:${chunk}`) }
+    );
+
+    await withServer(h.deps, async (api) => {
+      const events = parseSse(await sendTurn(api.stream, h, { speak: "0" }));
+      const chunks = events.filter((event) => event.event === "sentence");
+
+      assert.equal(h.synthCalls.length, 0, "a muted turn must not ask the TTS service for anything");
+      assert.ok(
+        chunks.length > 3,
+        `a muted turn must still reach every chunk — got ${chunks.length}, the spoken turn's is 4+`
+      );
+      assert.deepEqual(
+        chunks.map((event) => event.data.index),
+        chunks.map((_, at) => at),
+        "the indices must be the ones a spoken turn's chunks would have had"
+      );
+      assert.ok(
+        chunks.every((event) => event.data.audioData === null),
+        "every chunk must be emitted with no audio rather than omitted"
+      );
+      assert.ok(
+        chunks.every((event) => typeof event.data.text === "string" && event.data.text.length > 0),
+        "the text is the half a muted turn keeps"
+      );
+      assert.equal(chunks.at(-1)?.data.text, TAIL, "the delimiter-less tail must still arrive");
+      assert.equal(events.at(-1)?.event, "done", "a muted turn must close like any other");
+      assert.ok(
+        !h.logs.some((line) => line.includes("TTS failed")),
+        `muting is not a failure, so nothing may be reported as one — logged: ${h.logs.join(" | ")}`
+      );
+    });
+  });
 });
 
 describe("POST /api/voice-agent/stream — chunking is the extractor's chunking (D6)", () => {
@@ -958,6 +1126,350 @@ describe("POST /api/voice-agent/stream — chunking is the extractor's chunking 
         .map((event) => event.data.text);
 
       assert.deepEqual(spoken, extracted.chunks);
+    });
+  });
+});
+
+describe("POST /api/voice-agent/stream — the material turn", () => {
+  /** The words the fixture hit's section holds, and so the text a material turn
+   * answers with. Named once so an assertion about the reply cannot drift from
+   * the fixture that produced it. */
+  const SECTION_TEXT = "the stored passage the hit located.";
+
+  /** A located hit in the shape doc-etl-api reports one, in a speakable
+   * collection and carrying the section the search was asked to expand it to.
+   *
+   * The section's text is deliberately unlike the chunk's own `text` — the
+   * search's quote of it — so a test can tell a reply taken from the section
+   * from one built out of the hit itself. The range and the stated length agree,
+   * which is what the gate reads as a whole section. */
+  const located = (overrides: Partial<KnowledgeChunk> = {}): KnowledgeChunk => ({
+    text: "the text the search quoted",
+    source: "Trang Quynh",
+    score: 0.71,
+    address: "https://example.org/wiki/A",
+    collections: ["truyen-kiem-hiep"],
+    position: 3,
+    section: {
+      text: SECTION_TEXT,
+      start: 1200,
+      end: 1200 + SECTION_TEXT.length,
+      size: SECTION_TEXT.length,
+    },
+    ...overrides,
+  });
+
+  /** How many times the route asked a model to answer: the streaming call and the
+   * non-streaming fallback together. A material turn must produce zero. */
+  const modelCalls = (h: Harness): number => h.prompts.length + h.nonStreaming.length;
+
+  /** A material turn's request, over the scope the kiếm hiệp persona declares. */
+  const MATERIAL_TURN = {
+    text: "ke chuyen kiem hiep",
+    enabledTopics: ["truyen-kiem-hiep"],
+    answerMode: "material",
+    history: LATER_TURN,
+  };
+
+  it("answers a material turn from the section the search returned, without asking a model", async () => {
+    const h = harness({ ok: true, chunks: [located()] });
+
+    await withServer(h.deps, async (api) => {
+      const events = parseSse(await sendTurn(api.stream, h, MATERIAL_TURN));
+
+      assert.equal(modelCalls(h), 0, "a material turn must not ask a model at all");
+      assert.deepEqual(
+        events.filter((event) => event.event === "sentence").map((event) => event.data.text),
+        [SECTION_TEXT],
+        "the reply is the section that came with the hit, and not the search's quote of it"
+      );
+      assert.equal(events.at(-1)?.event, "done");
+      assert.equal(events.at(-1)?.data.fullText, SECTION_TEXT);
+    });
+  });
+
+  it("emits no event type the client does not already handle", async () => {
+    const h = harness({ ok: true, chunks: [located()] });
+
+    await withServer(h.deps, async (api) => {
+      const events = parseSse(await sendTurn(api.stream, h, MATERIAL_TURN));
+      const names = new Set(events.map((event) => event.event));
+
+      assert.ok(names.has("sentence"), `a material reply is spoken as sentences, got ${[...names]}`);
+      assert.ok(names.has("done"), `a material turn closes like any other, got ${[...names]}`);
+      assert.deepEqual(
+        [...names].filter((name) => !["user", "text", "sentence", "done"].includes(name)),
+        [],
+        "the transcript builds a material reply from the same events a generated one uses"
+      );
+    });
+  });
+
+  it("asks the search for a single result on a material turn, and the full k on a generating one", async () => {
+    const h = harness({ ok: true, chunks: [located()] });
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, MATERIAL_TURN);
+      await sendTurn(api.stream, h, { ...MATERIAL_TURN, answerMode: "generate" });
+
+      assert.equal(h.searches[0].topK, 1, "the locator asks for one result (D1)");
+      assert.equal(
+        h.searches[1].topK,
+        DEFAULT_PREFETCH_TOP_K,
+        "a generating turn's search is unchanged by this capability"
+      );
+    });
+  });
+
+  it("asks for the hit's section on a material turn, and asks for nothing extra on a generating one", async () => {
+    const h = harness({ ok: true, chunks: [located()] });
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, MATERIAL_TURN);
+      await sendTurn(api.stream, h, { ...MATERIAL_TURN, answerMode: "generate" });
+
+      assert.deepEqual(
+        h.searches[0].options,
+        { expand: "section" },
+        "the locator must ask for the passage the reply will be spoken from (D1)"
+      );
+      assert.equal(
+        h.searches[1].options,
+        undefined,
+        "a generating turn's search asks for no section, so its request body is unchanged (D5)"
+      );
+    });
+  });
+
+  it("speaks nothing from the material on a persona that generates, however eligible its hit", async () => {
+    const h = harness({ ok: true, chunks: [located()] }, { stream: ["A generated answer."] });
+
+    await withServer(h.deps, async (api) => {
+      const events = parseSse(await sendTurn(api.stream, h, { ...MATERIAL_TURN, answerMode: "generate" }));
+
+      assert.ok(modelCalls(h) > 0, "a generating persona's turn is answered by the model");
+      assert.equal(
+        events.at(-1)?.data.fullText,
+        "A generated answer.",
+        "the reply is the model's, not the section the hit carried"
+      );
+      assert.ok(
+        !h.logs.some((line) => line.includes("Material")),
+        `the path must not be entered and abandoned, logged: ${h.logs.join(" | ")}`
+      );
+    });
+  });
+
+  it("generates when the hit's source is not speakable, without speaking it", async () => {
+    const h = harness(
+      { ok: true, chunks: [located({ collections: ["truyen-cuoi"] })] },
+      { stream: ["A generated answer."] }
+    );
+
+    await withServer(h.deps, async (api) => {
+      // The joke topic folds to a collection the corpus serves and this
+      // deployment does not speak, so the hit is in scope for the search and
+      // refused by the gate.
+      await sendTurn(api.stream, h, { ...MATERIAL_TURN, enabledTopics: ["Truyện cười"] });
+
+      assert.ok(modelCalls(h) > 0);
+      assert.ok(h.logs.some((line) => line.includes("(not_speakable)")));
+    });
+  });
+
+  it("generates when the hit is below the floor", async () => {
+    const h = harness(
+      { ok: true, chunks: [located({ score: 0.42 })] },
+      { stream: ["A generated answer."] }
+    );
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, MATERIAL_TURN);
+
+      assert.ok(modelCalls(h) > 0);
+      assert.ok(h.logs.some((line) => line.includes("(below_floor)")));
+    });
+  });
+
+  it("generates when no enabled topic resolves to a collection, issuing no search at all", async () => {
+    const h = harness({ ok: true, chunks: [located()] }, { stream: ["A generated answer."] });
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, { ...MATERIAL_TURN, enabledTopics: ["!!!"] });
+
+      assert.deepEqual(h.searches, [], "a material turn with no scope has nothing to locate with");
+      assert.ok(modelCalls(h) > 0);
+      assert.ok(h.logs.some((line) => line.includes("(no_hit)")));
+    });
+  });
+
+  it("generates when the search returned no section with the hit", async () => {
+    // The older service, and any search that was not asked to expand: the hit is
+    // eligible on every other count, and what it lacks is the passage to speak.
+    const h = harness(
+      { ok: true, chunks: [located({ section: undefined })] },
+      { stream: ["A generated answer."] }
+    );
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, MATERIAL_TURN);
+
+      assert.ok(modelCalls(h) > 0);
+      assert.ok(
+        !h.logs.some((line) => line.includes("Material reply: read")),
+        "nothing was spoken from the corpus"
+      );
+      assert.ok(h.logs.some((line) => line.includes("(no_section)")));
+    });
+  });
+
+  it("generates when the section came back shorter than the service stated", async () => {
+    const h = harness(
+      {
+        ok: true,
+        chunks: [
+          located({
+            section: { text: "the passage's opening.", start: 1200, end: 1221, size: 4200 },
+          }),
+        ],
+      },
+      { stream: ["A generated answer."] }
+    );
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, MATERIAL_TURN);
+
+      assert.ok(modelCalls(h) > 0);
+      assert.ok(h.logs.some((line) => line.includes("(section_incomplete)")));
+    });
+  });
+
+  it("reuses a claimed prefetch as the locator instead of searching twice", async () => {
+    const h = harness({ ok: true, chunks: [located()] });
+
+    await withServer(h.deps, async (api) => {
+      // Declared as a material turn's prefetch, which is what makes its hits carry
+      // the section the turn will speak (D6).
+      const prefetchId = await sendPrefetch(api.prefetch, h, {
+        text: MATERIAL_TURN.text,
+        enabledTopics: MATERIAL_TURN.enabledTopics,
+        answerMode: "material",
+      });
+      assert.ok(prefetchId, "the prefetch must hold something to be reused");
+
+      const events = parseSse(await sendTurn(api.stream, h, { ...MATERIAL_TURN, prefetchId }));
+
+      assert.equal(
+        h.searches.length,
+        1,
+        "the prefetch's search is the locator's; a material turn issues no second"
+      );
+      assert.equal(modelCalls(h), 0);
+      assert.equal(events.at(-1)?.data.fullText, SECTION_TEXT);
+      assert.ok(h.logs.some((line) => line.includes("Reused prefetched knowledge")));
+    });
+  });
+
+  it("declines a held prefetch that carries no section, issuing its own locator search", async () => {
+    // The prefetch as it is issued today, for the generating path: its hits carry
+    // no section, so no material turn can be spoken from them, and reusing the
+    // hold regardless would turn this turn into a generated one merely because a
+    // prefetch happened to be held (design.md D6). The turn then does exactly what
+    // it does with no prefetch held.
+    let issued = 0;
+    const h = harness(() =>
+      ++issued === 1
+        ? { ok: true, chunks: [located({ section: undefined })] }
+        : { ok: true, chunks: [located()] }
+    );
+
+    await withServer(h.deps, async (api) => {
+      const prefetchId = await sendPrefetch(api.prefetch, h, {
+        text: MATERIAL_TURN.text,
+        enabledTopics: MATERIAL_TURN.enabledTopics,
+      });
+      assert.ok(prefetchId, "the prefetch holds a hit — it is only unusable to a material turn");
+
+      const events = parseSse(await sendTurn(api.stream, h, { ...MATERIAL_TURN, prefetchId }));
+
+      assert.equal(h.searches.length, 2, "the held section-less hit, then the turn's own locator");
+      assert.equal(h.searches[1].topK, 1, "the search the turn issues for itself is its locator");
+      assert.deepEqual(
+        h.searches[1].options,
+        { expand: "section" },
+        "and it asks for the section the reply will be spoken from"
+      );
+      assert.equal(modelCalls(h), 0, "the turn is still answered from the material");
+      assert.equal(events.at(-1)?.data.fullText, SECTION_TEXT);
+      assert.ok(
+        h.logs.some((line) => line.includes("issuing the locator search instead")),
+        `the decline must be logged, got: ${h.logs.join(" | ")}`
+      );
+    });
+  });
+
+  it("records the reply as the turn's message, so the next turn's history carries it", async () => {
+    const h = harness({ ok: true, chunks: [located()] }, { stream: ["A generated answer."] });
+
+    await withServer(h.deps, async (api) => {
+      const read = parseSse(await sendTurn(api.stream, h, MATERIAL_TURN));
+      const reply = read.at(-1)?.data.fullText;
+      assert.equal(reply, SECTION_TEXT);
+
+      // A material turn persists nothing a generated one does not: the reply
+      // travels as `done.fullText`, the client holds it, and it comes back as the
+      // next turn's `history` — which is the whole of "the session holds it as
+      // that turn's assistant message".
+      await sendTurn(api.stream, h, {
+        text: "and then what happened?",
+        enabledTopics: ["truyen-kiem-hiep"],
+        answerMode: "generate",
+        history: JSON.stringify([
+          { role: "user", content: MATERIAL_TURN.text },
+          { role: "agent", content: reply },
+        ]),
+      });
+
+      const nextPrompt = h.prompts.at(-1) ?? "";
+      assert.ok(
+        nextPrompt.includes(SECTION_TEXT),
+        `the turn after must receive the reply as history, got: ${nextPrompt}`
+      );
+    });
+  });
+
+  it("logs a material read and a fallback as distinct lines, naming the reason", async () => {
+    // One harness, two turns: the first locates an eligible hit, the second one
+    // under the floor — so both lines come from one run and are compared against
+    // each other rather than against a literal.
+    const h = harness(
+      (call) =>
+        call.query === "readable"
+          ? { ok: true, chunks: [located()] }
+          : { ok: true, chunks: [located({ score: 0.42 })] },
+      { stream: ["A generated answer."] }
+    );
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, { ...MATERIAL_TURN, text: "readable" });
+      await sendTurn(api.stream, h, { ...MATERIAL_TURN, text: "not readable" });
+
+      const readLine = h.logs.find((line) => line.includes("Material reply: read"));
+      const fallbackLine = h.logs.find((line) =>
+        line.includes("Material path did not answer this turn")
+      );
+
+      assert.ok(readLine, `the read must be logged, got: ${h.logs.join(" | ")}`);
+      assert.ok(fallbackLine, `the fallback must be logged, got: ${h.logs.join(" | ")}`);
+      assert.notEqual(readLine, fallbackLine);
+      assert.ok(
+        fallbackLine.includes("below_floor"),
+        `the fallback line must name the reason, got: ${fallbackLine}`
+      );
+      assert.ok(
+        readLine.includes(located().source),
+        `the read line must name the source it spoke, got: ${readLine}`
+      );
     });
   });
 });
