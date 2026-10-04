@@ -65,6 +65,35 @@ export function resolveEngineForLanguage(
 }
 
 /**
+ * The ISO-639-1 code to transcribe in, for an interview language.
+ *
+ * Tell the service the language or it detects one, and its detection is not to be
+ * trusted on this audio. Given a short, quiet, or weakly-onset Vietnamese
+ * utterance it decides the person is speaking Chinese, and the LLM is then handed
+ * a Chinese sentence nobody said. Measured on the gadget bridge: a turn whose
+ * transcript came back "你可就别别说这话了。", reproduced deterministically from the
+ * captured audio, which returned clean Vietnamese for the same bytes only when
+ * `language=vi` was sent. Pinning it back the other way (`language=en` on that
+ * same clip) returns English, so the code is honored rather than merely a hint.
+ *
+ * The tutor personas turn this from a bad transcript into visible nonsense: fed a
+ * Chinese transcript they correct the person's "Chinese", so the device lectures
+ * someone who has only ever spoken Vietnamese about a language they never used.
+ *
+ * The service takes the two-letter lowercase code. The full name ("vietnamese")
+ * is not recognized and quietly falls back to detection — the failure this
+ * exists to remove — so these must stay ISO codes.
+ */
+const STT_LANGUAGE_CODES: Record<InterviewLanguage, string> = {
+  vietnamese: "vi",
+  english: "en",
+};
+
+export function resolveSttLanguage(language: InterviewLanguage): string {
+  return STT_LANGUAGE_CODES[language];
+}
+
+/**
  * Options for synthesizing long text into a single combined audio clip.
  * Extends the standard TTS options with optional session/prefix for saving.
  */

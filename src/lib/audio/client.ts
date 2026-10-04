@@ -55,19 +55,33 @@ export class AudioCppClient {
    * Speech-to-text: send an audio file and receive transcription.
    * @param audioPath Absolute path to the audio file on disk.
    * @param model Optional model override.
+   * @param language Optional ISO-639-1 code to decode in. Without one the service
+   * detects the language itself, and on a short, quiet, or weakly-onset
+   * Vietnamese utterance it detects wrong — the caller hands the LLM a sentence
+   * in a language nobody spoke. A caller that knows the language must therefore
+   * pass it (`resolveSttLanguage`); one that does not is left exactly as it was,
+   * which is why an absent language sends no field at all rather than an empty
+   * one.
    *
    * An empty `text` is an answer rather than an error: no words were heard. The
    * caller knows what that means for its own turn — a session opener has nothing
    * to transcribe in the first place, a voice turn heard silence, and an interview
    * answer was not given — so this returns it and leaves the decision there.
    */
-  async transcribe(audioPath: string, model?: string): Promise<TranscriptionResult> {
+  async transcribe(
+    audioPath: string,
+    model?: string,
+    language?: string
+  ): Promise<TranscriptionResult> {
     const formData = new FormData();
     const { readFile } = await import("fs/promises");
     const buffer = await readFile(audioPath);
     const blob = new Blob([buffer], { type: "audio/wav" });
     formData.append("file", blob, "audio.wav");
     formData.append("model", model || config.audio.sttModel);
+    if (language) {
+      formData.append("language", language);
+    }
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);

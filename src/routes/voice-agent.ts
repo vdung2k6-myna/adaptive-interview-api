@@ -18,6 +18,7 @@ import {
   synthesizeSpeechWithFallback,
   resolveVoice,
   resolveEngineForLanguage,
+  resolveSttLanguage,
   hasUnclosedCodeFence,
   SentenceExtractor,
   SentenceStream,
@@ -305,7 +306,15 @@ async function handleStream(
     if (audioFile) {
       const audioExt = audioFile.mimetype === "audio/wav" ? "wav" : "webm";
       await withTempAudioFile(audioFile.buffer, audioExt, async (tmpPath) => {
-        const sttResult = await deps.transcribeAudio(tmpPath);
+        // The turn already carries its language, which is the one thing the
+        // transcriber cannot work out for itself on this audio: left to detect,
+        // it answers short Vietnamese in Chinese, and the persona then corrects
+        // the person for words they never said. See resolveSttLanguage.
+        const sttResult = await deps.transcribeAudio(
+          tmpPath,
+          undefined,
+          resolveSttLanguage(language)
+        );
         userText = sttResult.text;
       });
     } else if (textInput) {

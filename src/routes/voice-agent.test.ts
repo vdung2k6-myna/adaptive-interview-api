@@ -36,6 +36,10 @@ interface Harness {
   /** The text of every chunk the route asked to synthesize, in order — what the
    * turn actually spoke, which is not the same claim as what it emitted. */
   synthCalls: string[];
+  /** Every transcription the route asked for, with the arguments it passed. The
+   * language has to reach the transcriber, and "the route knows the language" is
+   * not the same claim as "the transcriber was told it". */
+  transcribeCalls: Array<{ language: string | undefined }>;
 }
 
 /** One turn's worth of history, which is what makes a turn *not* a session's
@@ -91,6 +95,7 @@ function harness(
   const logs: string[] = [];
   const events: string[] = [];
   const synthCalls: string[] = [];
+  const transcribeCalls: Array<{ language: string | undefined }> = [];
   const tokens = settings.stream ?? [];
   const fullText = settings.fullText ?? tokens.join("");
 
@@ -101,6 +106,7 @@ function harness(
     logs,
     events,
     synthCalls,
+    transcribeCalls,
     deps: {
       searchKnowledge: async (query, topK, collections, options) => {
         const call = { query, topK, collections, options };
@@ -111,8 +117,9 @@ function harness(
         }
         return await (typeof reply === "function" ? reply(call) : reply);
       },
-      transcribeAudio: async () => {
+      transcribeAudio: async (_audioPath, _model, language) => {
         events.push("transcribe");
+        transcribeCalls.push({ language });
         return { text: settings.transcription ?? "transcribed words", confidence: 0.9 };
       },
       generateChatResponseStream: (options) => {
@@ -223,9 +230,10 @@ async function sendAudioTurn(
 ): Promise<string> {
   const form = new FormData();
   form.append("systemPrompt", "You are a tutor.");
-  form.append("language", "english");
+  form.append("language", typeof body.language === "string" ? body.language : "english");
   form.append("audio", new Blob([new Uint8Array([0, 1, 2, 3])], { type: "audio/wav" }), "turn.wav");
   for (const [key, value] of Object.entries(body)) {
+    if (key === "language") continue; // already appended, and a repeated field is not the same request
     form.append(key, typeof value === "string" ? value : JSON.stringify(value));
   }
 
@@ -516,6 +524,29 @@ describe("POST /api/voice-agent/stream — request validation", () => {
       assert.ok(
         !h.logs.some((line) => line.includes("Unexpected error")),
         `a silent turn is an outcome, not an unhandled error — logged: ${h.logs.join(" | ")}`
+      );
+    });
+  });
+
+  it("pins the transcriber to the turn's language instead of leaving it to detect one", async () => {
+    // Left to detect, the transcriber answers short or quiet Vietnamese in
+    // Chinese — measured on the gadget, where a turn whose transcript was
+    // "你可就别别说这话了。" was reproduced deterministically from the captured
+    // audio and came back Vietnamese only when the same bytes were sent with
+    // `language=vi`. The tutor personas then correct the person's "Chinese", so
+    // the device lectures someone who has only ever spoken Vietnamese. The turn
+    // carries the language; the transcriber is the one thing that has to be told.
+    const h = harness();
+
+    await withServer(h.deps, async (api) => {
+      await sendAudioTurn(api.stream, h, { language: "vietnamese", history: LATER_TURN });
+      await sendAudioTurn(api.stream, h, { language: "english", history: LATER_TURN });
+
+      assert.deepEqual(
+        h.transcribeCalls.map((call) => call.language),
+        ["vi", "en"],
+        "the ISO code the service recognizes — the full language name silently " +
+          "falls back to detection, which is the bug being guarded here"
       );
     });
   });

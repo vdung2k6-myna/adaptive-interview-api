@@ -37,6 +37,7 @@ export {
   synthesizeLongText,
   resolveVoice,
   resolveEngineForLanguage,
+  resolveSttLanguage,
   hasUnclosedCodeFence,
   type SynthesizeResult,
   type SynthesizeLongTextOptions,

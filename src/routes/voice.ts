@@ -20,6 +20,7 @@ import {
   concatWavBuffers,
   resolveVoice,
   resolveEngineForLanguage,
+  resolveSttLanguage,
   SentenceStream,
   sweepStaleSegments,
   SEGMENT_MARKER,
@@ -332,6 +333,10 @@ async function handleTurn(req: Request, res: Response, deps: VoiceRouteDeps): Pr
     }
 
     const session = found.session;
+    // The session's own language, read here because the transcriber is the first
+    // thing in the turn to need it — and the engine resolution further down needs
+    // it too, so it is declared once rather than cast twice.
+    const language = (session.language as "english" | "vietnamese") || "english";
 
     const audioExt = audioFile.mimetype === "audio/wav" ? "wav" : "webm";
     const audioBuffer = audioFile.buffer;
@@ -345,7 +350,13 @@ async function handleTurn(req: Request, res: Response, deps: VoiceRouteDeps): Pr
     let transcription: string;
     let sttConfidence: number | undefined;
     try {
-      const sttResult = await deps.transcribeAudio(candidateAudioPath);
+      // Pin the session's language: the service's own detection answers short
+      // Vietnamese in Chinese (see resolveSttLanguage).
+      const sttResult = await deps.transcribeAudio(
+        candidateAudioPath,
+        undefined,
+        resolveSttLanguage(language)
+      );
       transcription = sttResult.text;
       sttConfidence = sttResult.confidence;
     } catch (err) {
@@ -405,7 +416,6 @@ async function handleTurn(req: Request, res: Response, deps: VoiceRouteDeps): Pr
       .orderBy(messages.createdAt);
 
     const requestedEngine = (session.ttsProvider as "kokoro" | "piper") || "kokoro";
-    const language = (session.language as "english" | "vietnamese") || "english";
     const engine = resolveEngineForLanguage(requestedEngine, language);
 
     const promptMessages: PromptMessage[] = existingMessages.map((m) => ({
@@ -629,6 +639,9 @@ async function handleStreamTurn(req: Request, res: Response, deps: VoiceRouteDep
     }
 
     const session = found.session;
+    // As in the `/api/voice/turn` handler: declared once, above the transcriber
+    // that needs it first and the engine that needs it later.
+    const streamLanguage = (session.language as "english" | "vietnamese") || "english";
 
     const audioExt = audioFile.mimetype === "audio/wav" ? "wav" : "webm";
     const audioBuffer = audioFile.buffer;
@@ -642,7 +655,13 @@ async function handleStreamTurn(req: Request, res: Response, deps: VoiceRouteDep
     let transcription: string;
     let sttConfidence: number | undefined;
     try {
-      const sttResult = await deps.transcribeAudio(candidateAudioPath);
+      // Pin the session's language: the service's own detection answers short
+      // Vietnamese in Chinese (see resolveSttLanguage).
+      const sttResult = await deps.transcribeAudio(
+        candidateAudioPath,
+        undefined,
+        resolveSttLanguage(streamLanguage)
+      );
       transcription = sttResult.text;
       sttConfidence = sttResult.confidence;
     } catch (err) {
@@ -688,7 +707,6 @@ async function handleStreamTurn(req: Request, res: Response, deps: VoiceRouteDep
     });
 
     const newTurn = session.currentTurn + 1;
-    const streamLanguage = (session.language as "english" | "vietnamese") || "english";
     const streamEngine = resolveEngineForLanguage(
       (session.ttsProvider as "kokoro" | "piper") || "kokoro",
       streamLanguage

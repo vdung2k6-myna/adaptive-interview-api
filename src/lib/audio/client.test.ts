@@ -133,4 +133,35 @@ describe("AudioCppClient.transcribe", () => {
       "a non-200 must surface as the error it is"
     );
   });
+
+  it("sends the language it was given, so the service decodes in it rather than detecting one", async () => {
+    answerJson(200, { text: "xin chào" });
+
+    await client.transcribe(audioPath, undefined, "vi");
+
+    const sent = requests[requests.length - 1];
+    assert.ok(sent);
+    assert.match(
+      sent.body.toString("latin1"),
+      /name="language"\r?\n\r?\nvi\r?\n/,
+      "the code must go as a multipart `language` field, or the service detects one"
+    );
+  });
+
+  it("sends no language field at all when the caller has none to give", async () => {
+    // Detection is what a caller with no language is left with, and that request
+    // has to stay exactly what it was: an empty `language` field is not the same
+    // request as none, and only one of the two is the behaviour being preserved.
+    answerJson(200, { text: "xin chào" });
+
+    await client.transcribe(audioPath);
+
+    const sent = requests[requests.length - 1];
+    assert.ok(sent);
+    assert.doesNotMatch(
+      sent.body.toString("latin1"),
+      /name="language"/,
+      "no language was known, so none may be claimed on the wire"
+    );
+  });
 });

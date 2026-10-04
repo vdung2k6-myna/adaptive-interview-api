@@ -4,6 +4,7 @@ import {
   numberToVietnameseWords,
   normalizeNumbersForKokoro,
   normalizeTextForEngine,
+  resolveSttLanguage,
   splitForTTS,
   stripMarkdown,
   synthesizeLongText,
@@ -533,5 +534,16 @@ describe("synthesizeLongText", () => {
 
     // The abort-before-start path does not save a file, so deletion is not
     // exercised here. Manual verification covers the disconnect-after-save case.
+  });
+});
+
+describe("resolveSttLanguage", () => {
+  it("answers the two-letter ISO code, not the language's name", () => {
+    // The service recognizes the code. Sent the full name it treats it as
+    // unknown and quietly falls back to detecting the language itself — which is
+    // the behaviour that answers short Vietnamese in Chinese, so a "helpful"
+    // rename here would reintroduce the bug with no test failing anywhere else.
+    assert.equal(resolveSttLanguage("vietnamese"), "vi");
+    assert.equal(resolveSttLanguage("english"), "en");
   });
 });
