@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseList, parseUnitInterval } from "./env";
+import { parseGain, parseList, parseUnitInterval } from "./env";
 
 describe("parseList", () => {
   it("falls back when the variable is not set at all", () => {
@@ -47,5 +47,31 @@ describe("parseUnitInterval", () => {
     assert.equal(parseUnitInterval(undefined, 0.55), 0.55);
     assert.equal(parseUnitInterval("", 0.55), 0.55);
     assert.equal(parseUnitInterval("high", 0.55), 0.55);
+  });
+});
+
+describe("parseGain", () => {
+  it("reads a gain in either direction from 1", () => {
+    assert.equal(parseGain("0.5", 1.2), 0.5, "a fractional gain must not be read as an integer");
+    assert.equal(parseGain("1.2", 0.5), 1.2, "amplifying is the reason there is no upper bound");
+  });
+
+  it("allows a gain of exactly 1 and of exactly 0", () => {
+    assert.equal(parseGain("1", 0.5), 1, "1 is the neutral value, not a missing one");
+    assert.equal(parseGain("0", 0.5), 0, "muting an engine is a real choice");
+  });
+
+  it("falls back for a negative gain instead of clamping it to zero", () => {
+    // Clamping to 0 would mute the engine; a negative multiplier inverts the
+    // waveform's phase, which is audible and is nobody's intent when they meant
+    // to type a volume.
+    assert.equal(parseGain("-0.5", 0.7), 0.7);
+  });
+
+  it("falls back for a value that is not a number", () => {
+    assert.equal(parseGain(undefined, 1), 1);
+    assert.equal(parseGain("", 1), 1);
+    assert.equal(parseGain("loud", 1), 1);
+    assert.equal(parseGain("Infinity", 1), 1);
   });
 });

@@ -123,7 +123,7 @@ describe("SentenceExtractor", () => {
   it("chunks long sentences via splitForTTS", () => {
     const ex = new SentenceExtractor();
     const longSentence =
-      "Trong dự án vừa rồi, bạn đã sử dụng những công cụ nào để quản lý cơ sở dữ liệu và đảm bảo hiệu năng?";
+      "Trong dự án vừa rồi, bạn đã sử dụng những công cụ nào để quản lý cơ sở dữ liệu, theo dõi hiệu năng truy vấn và đảm bảo rằng hệ thống vẫn chạy ổn định khi lượng người dùng tăng lên gấp nhiều lần?";
     const results = ex.feed(longSentence);
     assert.equal(results.length, 1);
     assert.ok(results[0].chunks.length >= 2, "expected sentence to be chunked");

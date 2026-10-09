@@ -5,7 +5,7 @@
  * - stripMarkdown: Remove markdown formatting for clean TTS input
  * - normalizeNumbersForKokoro: Convert Arabic numerals to Vietnamese words
  * - splitForTTS: Split long text into phoneme-safe chunks
- * - synthesizeSpeechWithFallback: Recursive retry on phoneme overflow
+ * - synthesizeSpeechWithFallback: Recursive retry by dividing the utterance
  * - synthesizeChunkWithFallback: Wrapper that saves audio after synthesis
  */
 
@@ -498,12 +498,38 @@ function nextTwoWords(text: string, index: number): [string, string] {
 }
 
 /**
- * Split a long sentence into smaller chunks safe for TTS engines.
+ * The working length of one utterance, in characters.
  *
- * Piper and Kokoro both have a max phoneme limit (~510). Vietnamese averages
- * ~6 phonemes/char, so a safe chunk size is ~60 characters to leave headroom.
+ * It was 60, and 60 was justified only by Piper's and Kokoro's ~510-phoneme
+ * limit — not by the engine actually in use. The price of respecting it was a
+ * boundary scan that cut sentences mid-clause, which is what the listener hears
+ * as a stutter: at 60, the four-sentence reply measured six utterances with two
+ * of them ending mid-sentence, and a request for 60 characters could come back
+ * with 71.
  *
- * Boundary preference (strongest first):
+ * 120 is where whole sentences of both measured replies fit without a scan at
+ * all. Above it the utterance stops being one — a reply divided at 240 comes
+ * back as calls of 190 and 233 characters — and the mean silence over three
+ * runs was lowest here on both measured replies, above it at 240, and higher
+ * again unbounded. Lower brings the scan back.
+ *
+ * An engine that cannot synthesize 120 characters reports it and is retried on
+ * smaller pieces, so this is a target rather than a hard ceiling on what any
+ * engine may be handed.
+ */
+export const TTS_WORKING_LENGTH = 120;
+
+/**
+ * Split a reply into utterances safe for TTS engines.
+ *
+ * The division follows the sentence structure whenever the text has one: whole
+ * sentences are packed into an utterance while they fit within `maxChars`, and
+ * only a sentence longer than `maxChars` on its own goes to the boundary scan
+ * below. Every streaming caller passes exactly one sentence, so for those this
+ * is the scan and nothing else — no regrouping, and no waiting for a following
+ * sentence before the first audio can start.
+ *
+ * Boundary preference inside an over-long sentence (strongest first):
  * 1. Vietnamese two-word phrase boundaries (e.g., "cụ thể")
  * 2. Colons and semicolons — natural clause boundaries
  * 3. Commas — phrase boundaries
@@ -511,16 +537,63 @@ function nextTwoWords(text: string, index: number): [string, string] {
  * 5. Spaces — word boundaries
  * 6. Hard split at maxChars — last resort
  *
- * The algorithm balances distance from the ideal maxChars with boundary
- * strength. Stronger boundaries (especially two-word phrase pairs) can win
- * even when significantly earlier, which prevents unnatural splits like
- * separating a number from its noun ("cho 5" / "người lớn tuổi").
+ * The scan balances distance from the ideal maxChars against boundary
+ * strength, so a boundary near the working length wins over a stronger one far
+ * behind it. It still refuses to separate a number from its noun
+ * ("cho 5" / "người lớn tuổi").
  *
  * @param text The text to split.
- * @param maxChars Maximum characters per chunk (default: 60).
+ * @param maxChars Maximum characters per utterance (default: TTS_WORKING_LENGTH).
  * @returns Array of chunks.
  */
-export function splitForTTS(text: string, maxChars = 60): string[] {
+export function splitForTTS(text: string, maxChars = TTS_WORKING_LENGTH): string[] {
+  return joinUndersizedFragments(divideAtSentences(text, maxChars), maxChars);
+}
+
+/**
+ * Divides text where its sentences divide, packing whole sentences into one
+ * utterance while they fit within `maxChars`. A sentence longer than `maxChars`
+ * on its own is divided by the boundary scan rather than packed with anything.
+ *
+ * Text that carries at most one sentence — which is everything the streaming
+ * callers pass — is handed straight to the scan, so what those callers submit,
+ * and when they submit it, is unchanged.
+ */
+function divideAtSentences(text: string, maxChars: number): string[] {
+  const sentences = splitSentences(text);
+  if (sentences.length <= 1) {
+    return splitOneSentence(text, maxChars);
+  }
+
+  const chunks: string[] = [];
+  let packed = "";
+
+  for (const sentence of sentences) {
+    if (sentence.length > maxChars) {
+      if (packed) {
+        chunks.push(packed);
+        packed = "";
+      }
+      chunks.push(...splitOneSentence(sentence, maxChars));
+      continue;
+    }
+
+    const candidate = packed ? `${packed} ${sentence}` : sentence;
+    if (candidate.length <= maxChars) {
+      packed = candidate;
+    } else {
+      if (packed) chunks.push(packed);
+      packed = sentence;
+    }
+  }
+
+  if (packed) chunks.push(packed);
+  return chunks;
+}
+
+/** Divides one sentence — or a fragment with no sentence boundary in it — at
+ * the best boundary the backward scan can find. */
+function splitOneSentence(text: string, maxChars: number): string[] {
   if (text.length <= maxChars) return [text];
   const chunks: string[] = [];
   let remaining = text.trim();
@@ -545,11 +618,11 @@ export function splitForTTS(text: string, maxChars = 60): string[] {
       const startsPhrase = VIETNAMESE_PHRASE_STARTERS.has(next);
       const nextIsDigit = /^\d/.test(remaining.slice(i + 1).trimStart());
 
-      // Strong boundaries (punctuation + two-word phrases) may extend below the
-      // soft minimum; single-word starters and spaces stay above it.
-      const isStrongBoundary =
-        ch === ":" || ch === ";" || ch === "," || isPhrasePair;
-      if (i < softMin && !isStrongBoundary) continue;
+      // Only a two-word phrase pair may reach below the soft minimum. A comma
+      // far back is not a licence to stop there: exempting punctuation is what
+      // let an 11-character opener like "Trước tiên," become an utterance of
+      // its own, because a comma scores 80 however distant it is.
+      if (i < softMin && !isPhrasePair) continue;
 
       let score = 0;
       if (isPhrasePair) {
@@ -567,9 +640,12 @@ export function splitForTTS(text: string, maxChars = 60): string[] {
       // Avoid splitting right before a number or quantifier.
       if (nextIsDigit) score -= 60;
 
-      // Prefer boundaries close to the target length, but with a modest
-      // penalty so earlier strong boundaries can still win.
-      score -= Math.abs(i - maxChars) * 0.3;
+      // Prefer boundaries close to the target length. Two points per character
+      // back is enough that a space at the working length outranks a comma more
+      // than 35 characters behind it, while a phrase pair (130) can still win
+      // from 60 characters back. At the old 0.3 per character no distance was
+      // ever far enough to lose.
+      score -= Math.abs(i - maxChars) * 2;
 
       if (score > bestScore) {
         bestScore = score;
@@ -609,45 +685,78 @@ export function splitForTTS(text: string, maxChars = 60): string[] {
 
   if (remaining) chunks.push(remaining);
 
-  // Merge a trailing fragment that is too short to stand alone (e.g. a single
-  // word like "mèo?" left after splitting a long Vietnamese sentence). This
-  // avoids synthesizing one-word chunks that are meaningless out of context.
-  // The merge is capped at 1.5× maxChars so we do not accidentally push the
-  // previous chunk past the engine's comfortable limit.
-  const minWords = 3;
-  const minChars = 15;
-  const mergeLimit = Math.floor(maxChars * 1.5);
-  while (chunks.length >= 2) {
-    const last = chunks[chunks.length - 1];
-    const wordCount = last.trim().split(/\s+/).length;
-    if (wordCount < minWords || last.length < minChars) {
-      const prev = chunks[chunks.length - 2];
-      if (prev.length + 1 + last.length <= mergeLimit) {
-        chunks[chunks.length - 2] = (prev + " " + last).trim();
-        chunks.pop();
-      } else {
-        // Cannot merge without exceeding the safe limit; leave the short chunk.
-        break;
-      }
-    } else {
-      break;
-    }
-  }
-
   return chunks;
 }
 
 /**
- * Attempt to synthesize text. If the TTS engine fails with a phoneme overflow
- * error, recursively split the text in half and retry each half.
+ * Joins a fragment too short to be spoken on its own into a neighbouring
+ * utterance — a stray "mèo?" left after dividing a long sentence, or an
+ * introductory "Trước tiên," that would otherwise be heard alone.
  *
- * When both halves succeed and are WAV format, they are concatenated into a
- * single buffer so no audio is lost.
+ * Every utterance is inspected, not only the last one: once a long sentence is
+ * divided, a short fragment can land anywhere in the reply. A join never pushes
+ * an utterance past `maxChars`; when neither neighbour leaves room, the
+ * fragment stays separate. That bound is what the old 1.5x ceiling was working
+ * around — a join that only ever looked backwards, and only ever once.
+ */
+function joinUndersizedFragments(chunks: string[], maxChars: number): string[] {
+  const minWords = 3;
+  const minChars = 15;
+  const undersized = (chunk: string): boolean =>
+    chunk.trim().split(/\s+/).length < minWords || chunk.length < minChars;
+
+  const joined: string[] = [];
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    if (!undersized(chunk)) {
+      joined.push(chunk);
+      continue;
+    }
+
+    // Backwards first: the fragment reads as the tail of what precedes it.
+    const prev = joined[joined.length - 1];
+    if (prev !== undefined && prev.length + 1 + chunk.length <= maxChars) {
+      joined[joined.length - 1] = `${prev} ${chunk}`;
+      continue;
+    }
+
+    // Otherwise forward, which is how an opening phrase rejoins the clause it
+    // introduces. `chunks[i + 1]` is unvisited, so it cannot be double-counted.
+    const next = chunks[i + 1];
+    if (next !== undefined && chunk.length + 1 + next.length <= maxChars) {
+      joined.push(`${chunk} ${next}`);
+      i++;
+      continue;
+    }
+
+    joined.push(chunk);
+  }
+
+  return joined;
+}
+
+/**
+ * Attempt to synthesize text, and recover from a failure by dividing it.
+ *
+ * Any failure is retried as smaller pieces. Whether dividing an utterance can
+ * rescue it is not knowable before trying, and it is not a property of the
+ * engine's error text — matching two Piper strings made recovery available to
+ * one engine and withheld it from the others (D6). Only an abort is exempt,
+ * because the caller asked for that and not for audio, and an utterance too
+ * short to divide is reported as it failed.
+ *
+ * When both halves come back as WAV they are concatenated into one buffer, so no
+ * audio is lost. If they cannot be concatenated the utterance fails whole: half
+ * an utterance returned as though it were the whole of it is the silent
+ * truncation this change removes, and a caller can report an absence at an
+ * index but nothing can report a half.
  *
  * @param text The text to synthesize.
  * @param ttsOptions Engine, voice, and optional abort signal.
  * @param depth Recursion depth (max 3).
  * @param signal Optional abort signal; if aborted, recursion stops early.
+ * @param synthesizeFn The synthesizer to call; injectable for tests.
  * @returns Audio buffer.
  * @throws If synthesis fails and cannot be recovered.
  */
@@ -655,7 +764,8 @@ export async function synthesizeSpeechWithFallback(
   text: string,
   ttsOptions: SynthesizeOptions,
   depth = 0,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  synthesizeFn: (text: string, options: SynthesizeOptions) => Promise<Buffer> = synthesizeSpeech
 ): Promise<Buffer> {
   if (signal?.aborted) {
     throw new DOMException("TTS synthesis aborted", "AbortError");
@@ -676,21 +786,17 @@ export async function synthesizeSpeechWithFallback(
   }
 
   try {
-    return await synthesizeSpeech(normalizedText, { ...ttsOptions, signal });
+    return await synthesizeFn(normalizedText, { ...ttsOptions, signal });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-
     if (err instanceof Error && err.name === "AbortError") {
       throw err;
     }
 
-    const isPhonemeError =
-      msg.includes("Piper produced no audio data") ||
-      msg.includes("Phoneme chunk too long");
+    const message = err instanceof Error ? err.message : String(err);
 
-    if (isPhonemeError && normalizedText.length > 15) {
+    if (normalizedText.length > 15) {
       console.warn(
-        `[synthesizeSpeechWithFallback] Retrying split for chunk "${normalizedText.slice(0, 40)}..." (depth=${depth})`
+        `[synthesizeSpeechWithFallback] Retrying split for chunk "${normalizedText.slice(0, 40)}..." (depth=${depth}): ${message}`
       );
 
       const mid = Math.floor(normalizedText.length / 2);
@@ -706,36 +812,60 @@ export async function synthesizeSpeechWithFallback(
       const right = normalizedText.slice(splitAt).trim();
 
       if (left && right) {
-        if (signal?.aborted) {
-          throw new DOMException("TTS synthesis aborted", "AbortError");
+        let leftBuf: Buffer;
+        let rightBuf: Buffer;
+        try {
+          leftBuf = await synthesizeSpeechWithFallback(
+            left,
+            ttsOptions,
+            depth + 1,
+            signal,
+            synthesizeFn
+          );
+          if (signal?.aborted) {
+            throw new DOMException("TTS synthesis aborted", "AbortError");
+          }
+          rightBuf = await synthesizeSpeechWithFallback(
+            right,
+            ttsOptions,
+            depth + 1,
+            signal,
+            synthesizeFn
+          );
+        } catch (retryError) {
+          if (retryError instanceof Error && retryError.name === "AbortError") {
+            throw retryError;
+          }
+          // Dividing the utterance did not rescue it. Report the failure that
+          // started this rather than whichever one the retry happened to end
+          // in — unwrapped, a dead gateway surfaced as "max recursion depth",
+          // which names the retry strategy instead of the cause (D6). The
+          // retry's own error is kept as the cause.
+          throw new Error(
+            `TTS failed and dividing the utterance did not recover it ` +
+              `("${normalizedText.slice(0, 40)}..."): ${message}`,
+            { cause: retryError }
+          );
         }
-        const leftBuf = await synthesizeSpeechWithFallback(
-          left,
-          ttsOptions,
-          depth + 1,
-          signal
-        );
-        if (signal?.aborted) {
-          throw new DOMException("TTS synthesis aborted", "AbortError");
-        }
-        const rightBuf = await synthesizeSpeechWithFallback(
-          right,
-          ttsOptions,
-          depth + 1,
-          signal
-        );
 
         // If both halves are WAV, concatenate so no audio is lost
-        const leftWav = leftBuf.length >= 4 && leftBuf.toString("ascii", 0, 4) === "RIFF";
-        const rightWav = rightBuf.length >= 4 && rightBuf.toString("ascii", 0, 4) === "RIFF";
+        const isWav = (b: Buffer) =>
+          b.length >= 4 && b.toString("ascii", 0, 4) === "RIFF";
+        const leftWav = isWav(leftBuf);
+        const rightWav = isWav(rightBuf);
 
         if (leftWav && rightWav) {
           return concatWavBuffers([leftBuf, rightBuf]);
         }
 
-        // For non-WAV formats (e.g. MP3), return the left half only.
-        // The right half is lost in this case — this is a known limitation.
-        return leftBuf;
+        // For non-WAV formats (e.g. MP3) the halves cannot be joined, and
+        // returning the left one would speak half an utterance as though it were
+        // all of it. Report the loss instead, so the caller can report it too.
+        throw new Error(
+          `Recovered halves cannot be joined (left=${leftWav ? "wav" : "not wav"}, ` +
+            `right=${rightWav ? "wav" : "not wav"}); refusing to return half of ` +
+            `"${normalizedText.slice(0, 40)}..."`
+        );
       }
     }
 
@@ -822,13 +952,14 @@ export async function synthesizeChunkWithFallback(
     }
 
     const msg = err instanceof Error ? err.message : String(err);
-    const isPhonemeError =
-      msg.includes("Piper produced no audio data") ||
-      msg.includes("Phoneme chunk too long");
 
-    if (isPhonemeError && normalizedChunk.length > 15) {
+    // Same rule as `synthesizeSpeechWithFallback` (D6): any failure is worth one
+    // attempt at dividing, whichever engine it came from. This twin kept the
+    // Piper-only classifier, which would have withheld that attempt from the
+    // other engines the moment anything called it.
+    if (normalizedChunk.length > 15) {
       console.warn(
-        `[synthesizeChunkWithFallback] Retrying split for chunk "${normalizedChunk.slice(0, 40)}..." (depth=${depth})`
+        `[synthesizeChunkWithFallback] Retrying split for chunk "${normalizedChunk.slice(0, 40)}..." (depth=${depth}): ${msg}`
       );
 
       const mid = Math.floor(normalizedChunk.length / 2);
@@ -920,19 +1051,20 @@ export async function synthesizeLongText(
     throw new Error(`No synthesizable content: "${normalizedText.slice(0, 30)}"`);
   }
 
-  const sentences = splitSentences(normalizedText);
-  const chunks: string[] = [];
-  for (const sentence of sentences) {
-    if (hasSynthesizableContent(sentence)) {
-      chunks.push(...splitForTTS(sentence));
-    }
-  }
-
-  if (chunks.length === 0) {
-    throw new Error(
-      `No synthesizable content after splitting: "${normalizedText.slice(0, 30)}"`
-    );
-  }
+  // The whole reply is in hand before anything is synthesized — this function
+  // returns one concatenated buffer and no caller sees a chunk before the last
+  // — so the division is handed the whole of it and packs whole sentences into
+  // one call each (design.md D1). Packing costs nothing here, which is not true
+  // of the streaming routes: those hand over one sentence per call and are left
+  // alone, because making them wait for a following sentence would delay the
+  // first audio of every turn.
+  //
+  // Text carrying no letter at all was already rejected above, and the division
+  // never comes back empty for text that carries one, so there is nothing left
+  // to guard against here. A sentence that carried no letter used to be dropped
+  // before being chunked; now it is spoken as part of the utterance around it,
+  // which is what it is.
+  const chunks = splitForTTS(normalizedText);
 
   const buffers: Buffer[] = [];
   const concurrency = 3;

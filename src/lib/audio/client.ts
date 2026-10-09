@@ -9,6 +9,7 @@
  */
 
 import config from "@/lib/config";
+import { applyGainToWav } from "./wav-utils";
 
 export interface TranscriptionResult {
   text: string;
@@ -204,9 +205,13 @@ export class AudioGatewayClient {
    * @returns Audio buffer (WAV format).
    */
   async synthesize(text: string, options?: SynthesizeOptions): Promise<Buffer> {
+    // Resolved once, because the same value decides both what to ask for and how
+    // loud the answer is levelled — an engine read twice is an engine that can
+    // disagree with itself.
+    const engine = options?.engine ?? config.audio.defaultEngine;
     const payload: Record<string, string | undefined> = {
       text,
-      engine: options?.engine ?? config.audio.defaultEngine,
+      engine,
       voice: options?.voice ?? config.audio.defaultVoice,
     };
     if (options?.model) {
@@ -258,7 +263,25 @@ export class AudioGatewayClient {
           `content-type=${contentType} magic=${magic}${wavInfo}`
       );
 
-      return buffer;
+      // Level the engines against each other here, at the one place the whole
+      // system's audio comes through — the client, the gadget bridge and the
+      // browser all speak by way of this call (design: per-engine volume).
+      const gain = config.audio.volume[engine];
+      const scaled = applyGainToWav(buffer, gain);
+
+      // Report clipping rather than let a volume set too high pass for a volume
+      // that worked: a clamped sample is distortion, and distortion nobody is
+      // told about is the failure this is meant to remove, not to add.
+      if (scaled.clippedSamples > 0) {
+        const share = ((100 * scaled.clippedSamples) / scaled.totalSamples).toFixed(2);
+        console.warn(
+          `[AudioGateway] volume ${gain} for ${engine} clipped ` +
+            `${scaled.clippedSamples}/${scaled.totalSamples} samples (${share}%); ` +
+            `lower ${engine.toUpperCase()}_VOLUME to stop distorting`
+        );
+      }
+
+      return scaled.buffer;
     } catch (err) {
       clearTimeout(timeout);
       throw err;

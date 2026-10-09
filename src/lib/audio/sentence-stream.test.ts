@@ -6,7 +6,7 @@ import { splitForTTS } from "./text-processing";
 /** A sentence long enough that `splitForTTS` must break it into more than one
  * chunk, so a test can tell per-sentence splitting from per-chunk behavior. */
 const LONG_SENTENCE =
-  "A single sentence long enough that the splitter has to break it into more than one chunk.";
+  "A single sentence that is long enough that the splitter has to break it into more than one chunk, which is the whole reason it is here at all.";
 
 /** Everything the core did, recorded — so a test asserts on what reached the
  * sink and what the sink asked for, which are different claims. */

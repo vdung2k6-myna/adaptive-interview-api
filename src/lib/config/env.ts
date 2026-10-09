@@ -41,3 +41,22 @@ export function parseUnitInterval(raw: string | undefined, fallback: number): nu
   const parsed = Number.parseFloat(raw ?? "");
   return Number.isNaN(parsed) || parsed < 0 || parsed > 1 ? fallback : parsed;
 }
+
+/**
+ * Parse a non-negative multiplier from the environment, falling back when the
+ * value is absent, unparseable, or negative.
+ *
+ * Unlike `parseUnitInterval` there is no upper bound: the point of a volume is to
+ * be able to ask for more than the engine gave, and the value that cannot be
+ * honoured (one that would clip) is handled where the samples are, by clamping
+ * and saying so. Negative is refused rather than clamped to zero because a
+ * negative gain inverts the waveform rather than attenuating it — audible as a
+ * phase-flipped signal, and not what anyone means by typing a volume. Zero is
+ * allowed: muting an engine is a real choice.
+ *
+ * Not `parsePositiveInt`, which would read "0.5" as 0.
+ */
+export function parseGain(raw: string | undefined, fallback: number): number {
+  const parsed = Number.parseFloat(raw ?? "");
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}

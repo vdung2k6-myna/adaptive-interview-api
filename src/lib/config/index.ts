@@ -57,6 +57,21 @@ export interface AppConfig {
         vietnamese: string;
       };
     };
+    /**
+     * A linear volume multiplier per engine, applied to the PCM the gateway
+     * returns; 1 leaves it as the engine produced it.
+     *
+     * Per engine rather than one number because the engines do not agree on
+     * loudness: measured on the same Vietnamese sentence, kokoro and piper come
+     * back at full scale (0 dBFS peak) while supertonic sits ~8 dB below it
+     * (`scripts/measure-engine-levels.mjs`). One shared level would be a
+     * compromise between them; this is the knob that makes them match.
+     */
+    volume: {
+      kokoro: number;
+      piper: number;
+      supertonic: number;
+    };
   };
   docEtl: {
     apiUrl: string;          // Document ETL service URL for knowledge retrieval

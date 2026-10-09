@@ -7,7 +7,9 @@ import {
   resolveSttLanguage,
   splitForTTS,
   stripMarkdown,
+  TTS_WORKING_LENGTH,
   synthesizeLongText,
+  synthesizeSpeechWithFallback,
   type SynthesizeLongTextOptions,
 } from "./text-processing";
 
@@ -180,40 +182,89 @@ describe("normalizeTextForEngine", () => {
   });
 });
 
+/** The two replies the division was measured against (design.md D2). A is four
+ * sentences and 245 characters, B is seven and 530. */
+const MEASURED_REPLY_A =
+  "Chào bạn, rất vui được gặp bạn hôm nay. Tôi sẽ hỏi bạn một vài câu về kinh nghiệm của bạn. " +
+  "Trước tiên, bạn có thể giới thiệu ngắn gọn về bản thân và 3 năm kinh nghiệm gần nhất của bạn không? " +
+  "Sau đó chúng ta sẽ nói về 2 dự án mà bạn tâm đắc nhất.";
+
+const MEASURED_REPLY_B =
+  "Chào bạn, cảm ơn bạn đã dành thời gian tham gia buổi phỏng vấn hôm nay. " +
+  "Tôi là trợ lý phỏng vấn và sẽ đồng hành cùng bạn trong khoảng bốn mươi phút tới. " +
+  "Trước khi bắt đầu, tôi muốn hỏi bạn một vài câu về kinh nghiệm làm việc của bạn. " +
+  "Bạn có thể kể cho tôi nghe về vị trí gần nhất mà bạn đảm nhiệm không? " +
+  "Ở đó tôi đã có 3.5 năm kinh nghiệm với vai trò kỹ sư phần mềm. " +
+  "Điều gì khiến bạn quyết định chuyển sang một môi trường mới? " +
+  "Sau đó chúng ta sẽ cùng nói về hai dự án mà bạn tâm đắc nhất, cũng như những khó khăn bạn đã gặp phải.";
+
 describe("splitForTTS", () => {
-  it("avoids splitting a number from its noun", () => {
-    const chunks = splitForTTS(
-      "Bạn đã thực hiện những công việc chăm sóc cụ thể nào cho 5 người lớn tuổi đó?"
-    );
-    assert.ok(!chunks.some((c) => /\b5$/.test(c)), `unexpected chunk ending in 5: ${JSON.stringify(chunks)}`);
-  });
-
-  it("splits at Vietnamese phrase starters when they produce natural chunks", () => {
-    const chunks = splitForTTS(
-      "Bạn đã thực hiện những công việc chăm sóc cụ thể nào cho 5 người lớn tuổi đó?"
-    );
-    assert.equal(chunks[0], "Bạn đã thực hiện những công việc chăm sóc");
-    assert.equal(
-      chunks[1],
-      "cụ thể nào cho 5 người lớn tuổi đó?"
+  it("keeps a sentence within the working length whole", () => {
+    assert.deepEqual(
+      splitForTTS("Bạn đã thực hiện những công việc chăm sóc cụ thể nào cho 5 người lớn tuổi đó?"),
+      ["Bạn đã thực hiện những công việc chăm sóc cụ thể nào cho 5 người lớn tuổi đó?"]
     );
   });
 
-  it("prefers commas over nearby spaces", () => {
+  it("packs whole sentences rather than splitting each one", () => {
+    // Two sentences fit together; the third does not fit with either.
+    assert.deepEqual(splitForTTS(MEASURED_REPLY_A), [
+      "Chào bạn, rất vui được gặp bạn hôm nay. Tôi sẽ hỏi bạn một vài câu về kinh nghiệm của bạn.",
+      "Trước tiên, bạn có thể giới thiệu ngắn gọn về bản thân và 3 năm kinh nghiệm gần nhất của bạn không?",
+      "Sau đó chúng ta sẽ nói về 2 dự án mà bạn tâm đắc nhất.",
+    ]);
+  });
+
+  it("ends every utterance of a long reply at a sentence boundary", () => {
+    // No two neighbouring sentences of this reply fit in one utterance, so it
+    // comes back as its sentences — and, importantly, as nothing else.
+    assert.deepEqual(splitForTTS(MEASURED_REPLY_B), [
+      "Chào bạn, cảm ơn bạn đã dành thời gian tham gia buổi phỏng vấn hôm nay.",
+      "Tôi là trợ lý phỏng vấn và sẽ đồng hành cùng bạn trong khoảng bốn mươi phút tới.",
+      "Trước khi bắt đầu, tôi muốn hỏi bạn một vài câu về kinh nghiệm làm việc của bạn.",
+      "Bạn có thể kể cho tôi nghe về vị trí gần nhất mà bạn đảm nhiệm không?",
+      "Ở đó tôi đã có 3.5 năm kinh nghiệm với vai trò kỹ sư phần mềm.",
+      "Điều gì khiến bạn quyết định chuyển sang một môi trường mới?",
+      "Sau đó chúng ta sẽ cùng nói về hai dự án mà bạn tâm đắc nhất, cũng như những khó khăn bạn đã gặp phải.",
+    ]);
+  });
+
+  it("does not speak an opening phrase as its own utterance", () => {
+    assert.deepEqual(
+      splitForTTS(
+        "Trước tiên, bạn có thể giới thiệu ngắn gọn về bản thân và 3 năm kinh nghiệm gần nhất của bạn không?"
+      ),
+      ["Trước tiên, bạn có thể giới thiệu ngắn gọn về bản thân và 3 năm kinh nghiệm gần nhất của bạn không?"]
+    );
+  });
+
+  it("does not divide at an opening phrase when the sentence must be scanned", () => {
+    // The comma after "Trước tiên," sits inside the scan window. Exempting
+    // punctuation from the soft floor used to make it win from 100 characters
+    // back, and the opener became an 11-character utterance of its own.
     const chunks = splitForTTS(
-      "Trong dự án trước, bạn đã xử lý như thế nào với các tình huống khó khăn?"
+      `Trước tiên, ${"bạn có thể giới thiệu ngắn gọn về bản thân và kinh nghiệm ".repeat(3)}gần nhất của bạn không?`
     );
-    assert.equal(
-      chunks[0],
-      "Trong dự án trước,"
+    assert.notDeepEqual(chunks[0], "Trước tiên,");
+    assert.ok(chunks[0].startsWith("Trước tiên,"), `opener left behind: ${JSON.stringify(chunks)}`);
+    assert.ok(chunks[0].length >= 60, `opener spoken alone: ${JSON.stringify(chunks)}`);
+  });
+
+  it("prefers a boundary near the working length over a distant punctuation mark", () => {
+    // The comma after "window" is a candidate inside the window, 58 characters
+    // behind the target. It must not win.
+    const chunks = splitForTTS(
+      "This clause opener is long enough to sit inside the window, and then the sentence continues well past the working length so the scan has to choose."
     );
+    assert.ok(!chunks[0].endsWith(","), `stopped at the distant comma: ${JSON.stringify(chunks)}`);
+    assert.equal(chunks[0].length, 120);
   });
 
   it("does not produce tiny chunks for early punctuation", () => {
     const chunks = splitForTTS(
       "A, very long sentence that goes on and on and should not be split right after the first letter because that would be silly."
     );
-    assert.ok(chunks[0].length >= 20);
+    assert.ok(chunks[0].length >= 100, `first chunk too short: ${JSON.stringify(chunks)}`);
   });
 
   it("keeps short text as a single chunk", () => {
@@ -222,12 +273,61 @@ describe("splitForTTS", () => {
     ]);
   });
 
-  it("handles a long question with multiple natural breaks", () => {
+  it("never produces an utterance longer than the working length", () => {
+    // The old join was allowed to reach 1.5x the working length, so a request
+    // for 60 characters could come back with 71.
+    const inputs = [
+      MEASURED_REPLY_A,
+      MEASURED_REPLY_B,
+      "A, very long sentence that goes on and on and should not be split right after the first letter because that would be silly.",
+      "Với vai trò chuyên gia, anh/chị hãy giải thích ngắn gọn: vì sao mèo không tự tổng hợp đủ taurine trong cơ thể, và thiếu taurine kéo dài sẽ gây ra hai bệnh lý chính gì ở mèo?",
+    ];
+    for (const input of inputs) {
+      const chunks = splitForTTS(input);
+      const longest = Math.max(...chunks.map((c) => c.length));
+      assert.ok(
+        longest <= TTS_WORKING_LENGTH,
+        `utterance of ${longest} chars exceeds ${TTS_WORKING_LENGTH}: ${JSON.stringify(chunks)}`
+      );
+    }
+  });
+
+  it("joins a fragment that sits between two utterances and leaves room", () => {
+    // The 9-character "shortend." lands between two long utterances. The old
+    // join only ever looked at the last chunk, so it survived.
     const chunks = splitForTTS(
-      "Trong dự án vừa rồi, bạn đã sử dụng những công cụ nào để quản lý cơ sở dữ liệu và đảm bảo hiệu năng?"
+      `${"alpha ".repeat(19)}end. ${"beta ".repeat(23)}shortend. ${"gamma ".repeat(10)}tail.`
     );
-    assert.ok(chunks.length >= 2);
-    assert.ok(chunks.every((c) => c.length <= 60 || /^\d/.test(c.slice(-1))));
+    assert.equal(chunks.length, 3, `expected the fragment to be absorbed: ${JSON.stringify(chunks)}`);
+    assert.ok(
+      chunks.every((c) => c.trim().split(/\s+/).length >= 3),
+      `an utterance is too short to speak: ${JSON.stringify(chunks)}`
+    );
+    assert.ok(chunks[2].startsWith("shortend."), `fragment not joined forward: ${JSON.stringify(chunks)}`);
+  });
+
+  it("leaves a fragment separate when joining it would exceed the working length", () => {
+    // Same shape, but now neither neighbour has room for the 9-character
+    // fragment. Speaking it alone is the lesser harm; overrunning is not.
+    const chunks = splitForTTS(
+      `${"alpha ".repeat(19)}end. ${"beta ".repeat(23)}shortend. ${"gamma ".repeat(19)}tail.`
+    );
+    assert.ok(
+      chunks.some((c) => c === "shortend."),
+      `the fragment should have been left alone: ${JSON.stringify(chunks)}`
+    );
+    assert.ok(
+      Math.max(...chunks.map((c) => c.length)) <= TTS_WORKING_LENGTH,
+      `joining overran the working length: ${JSON.stringify(chunks)}`
+    );
+  });
+
+  it("avoids splitting a number from its noun", () => {
+    const chunks = splitForTTS(
+      "Bạn đã thực hiện những công việc chăm sóc cụ thể nào cho 5 người lớn tuổi trong gia đình mình trong suốt khoảng thời gian vừa qua?"
+    );
+    assert.ok(chunks.length >= 2, `expected a scan: ${JSON.stringify(chunks)}`);
+    assert.ok(!chunks.some((c) => /\b5$/.test(c)), `unexpected chunk ending in 5: ${JSON.stringify(chunks)}`);
   });
 
   it("keeps a decimal version with its noun phrase", () => {
@@ -240,18 +340,10 @@ describe("splitForTTS", () => {
     );
   });
 
-  it("splits at commas before strong phrase starters", () => {
-    const chunks = splitForTTS(
-      "Khi gặp lỗi production, bạn thường debug như thế nào và bạn sẽ ưu tiên điều gì trước tiên?"
-    );
-    assert.ok(chunks[0].endsWith(","), `expected first chunk to end with comma: ${JSON.stringify(chunks)}`);
-  });
-
   it("handles the user's long example with examples list", () => {
     const sentence =
       "Bạn đã thực hiện những công việc chăm sóc cụ thể nào cho 5 người lớn tuổi đó (ví dụ: tắm rửa, nấu ăn, nhắc uống thuốc, đưa đi khám bệnh)?";
     const chunks = splitForTTS(sentence);
-    console.log("chunks:", JSON.stringify(chunks));
     assert.ok(chunks.length >= 2);
     assert.ok(!chunks.some((c) => /\b5$/.test(c)), `chunk ends in 5: ${JSON.stringify(chunks)}`);
   });
@@ -384,6 +476,12 @@ function makeWavBuffer(payload: string): Buffer {
   return Buffer.concat([header, pcm]);
 }
 
+/** One sentence, longer than `TTS_WORKING_LENGTH`, so `splitForTTS` must divide
+ * it and `synthesizeLongText` has more than one chunk to combine. */
+const SENTENCE_NEEDING_A_SCAN =
+  "Trong dự án vừa rồi, bạn đã sử dụng những công cụ nào để quản lý cơ sở dữ liệu, " +
+  "theo dõi hiệu năng truy vấn và đảm bảo rằng hệ thống vẫn chạy ổn định khi lượng người dùng tăng lên gấp nhiều lần?";
+
 describe("synthesizeLongText", () => {
   const makeMockSynthesizer = (buffers: Map<string, Buffer>) => {
     return async (
@@ -415,8 +513,7 @@ describe("synthesizeLongText", () => {
 
   it("concatenates multiple WAV chunks into one buffer", async () => {
     // This sentence is long enough that splitForTTS will produce >1 chunk.
-    const text =
-      "Trong dự án vừa rồi, bạn đã sử dụng những công cụ nào để quản lý cơ sở dữ liệu và đảm bảo hiệu năng?";
+    const text = SENTENCE_NEEDING_A_SCAN;
     const buffers = new Map<string, Buffer>();
     const synthesizeFn = async (
       chunk: string,
@@ -482,9 +579,32 @@ describe("synthesizeLongText", () => {
     assert.ok(result.urlPath?.includes("interviewer"));
   });
 
+  it("packs whole sentences into one call, since the whole reply is in hand", async () => {
+    const seen: string[] = [];
+    const synthesizeFn = async (chunk: string): Promise<Buffer> => {
+      seen.push(chunk);
+      return makeWavBuffer(chunk);
+    };
+
+    await synthesizeLongText(
+      MEASURED_REPLY_A,
+      { engine: "kokoro", voice: "af_heart" },
+      undefined,
+      synthesizeFn
+    );
+
+    // The engine is kokoro, so the text is normalized (digits to words) before
+    // it is divided; that is the text the division sees.
+    const divided = splitForTTS(normalizeTextForEngine(MEASURED_REPLY_A, "kokoro"));
+    assert.deepEqual(seen, divided);
+    assert.ok(
+      seen.length < 4,
+      `expected the reply's sentences to be packed rather than synthesized one by one: ${JSON.stringify(seen)}`
+    );
+  });
+
   it("synthesizes chunks concurrently while preserving order", async () => {
-    const text =
-      "Trong dự án vừa rồi, bạn đã sử dụng những công cụ nào để quản lý cơ sở dữ liệu và đảm bảo hiệu năng?";
+    const text = SENTENCE_NEEDING_A_SCAN;
     const seenChunks: string[] = [];
     const synthesizeFn = async (chunk: string): Promise<Buffer> => {
       seenChunks.push(chunk);
@@ -534,6 +654,134 @@ describe("synthesizeLongText", () => {
 
     // The abort-before-start path does not save a file, so deletion is not
     // exercised here. Manual verification covers the disconnect-after-save case.
+  });
+});
+
+describe("synthesizeSpeechWithFallback", () => {
+  const TEXT =
+    "Chào bạn, rất vui được gặp bạn hôm nay và chúc bạn một buổi phỏng vấn tốt lành.";
+
+  const options = { engine: "kokoro" as const, voice: "af_heart" };
+
+  /** Runs one synthesis where only the first call fails, and reports what the
+   * fallback did about it — the texts it asked for, in order. */
+  const recoverFrom = async (failureMessage: string) => {
+    const asked: string[] = [];
+    const synthesizeFn = async (text: string): Promise<Buffer> => {
+      asked.push(text);
+      if (asked.length === 1) {
+        throw new Error(failureMessage);
+      }
+      return makeWavBuffer(text);
+    };
+
+    const buffer = await synthesizeSpeechWithFallback(
+      TEXT,
+      options,
+      0,
+      undefined,
+      synthesizeFn
+    );
+
+    return { asked, buffer };
+  };
+
+  it("retries a failure it recognises and one it does not, on identical terms", async () => {
+    // The two strings are what the classifier used to key on: the first is the
+    // exact Piper wording it matched, the second is an error no version of it
+    // ever matched. Any difference between these two results is the engine
+    // deciding whether an utterance gets a second chance (D6).
+    const recognised = await recoverFrom("Phoneme chunk too long");
+    const unrecognised = await recoverFrom("Audio gateway returned 502 Bad Gateway");
+
+    assert.deepEqual(
+      unrecognised.asked,
+      recognised.asked,
+      "an unrecognised failure took a different path than a recognised one"
+    );
+    assert.ok(
+      recognised.asked.length > 1,
+      "the utterance was never retried, so nothing was divided"
+    );
+    assert.ok(
+      recognised.asked.slice(1).every((text) => text.length < TEXT.length),
+      `expected the retry to ask for smaller pieces, got: ${JSON.stringify(recognised.asked)}`
+    );
+    assert.equal(recognised.buffer.toString("ascii", 0, 4), "RIFF");
+    assert.equal(unrecognised.buffer.toString("ascii", 0, 4), "RIFF");
+  });
+
+  it("reports a failure that survives retrying instead of absorbing it", async () => {
+    const failure = "Audio gateway is unreachable";
+    let calls = 0;
+    const synthesizeFn = async (): Promise<Buffer> => {
+      calls++;
+      throw new Error(failure);
+    };
+
+    await assert.rejects(
+      () => synthesizeSpeechWithFallback(TEXT, options, 0, undefined, synthesizeFn),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(
+          error.message,
+          new RegExp(failure),
+          "the reported failure should name what went wrong, not how the retry ended"
+        );
+        return true;
+      }
+    );
+
+    assert.ok(calls > 1, "the failure was reported without ever being retried");
+  });
+
+  it("does not turn a recovery it cannot join into half an utterance", async () => {
+    // Both halves succeed, but not as WAV, so they cannot be concatenated. The
+    // old fallback returned the left half and dropped the right one without a
+    // word, which is a listener hearing half a sentence and being told it was
+    // the whole of it.
+    let calls = 0;
+    const synthesizeFn = async (): Promise<Buffer> => {
+      calls++;
+      if (calls === 1) {
+        throw new Error("Audio gateway returned 500 Internal Server Error");
+      }
+      return Buffer.from([0xff, 0xf7, 0x00, 0x00, 0x6d, 0x70, 0x33]);
+    };
+
+    await assert.rejects(
+      () => synthesizeSpeechWithFallback(TEXT, options, 0, undefined, synthesizeFn),
+      /cannot be joined/
+    );
+    assert.ok(calls > 1, "nothing was retried, so nothing was lost to report");
+  });
+
+  it("does not retry an abort, because the caller asked for it", async () => {
+    let calls = 0;
+    const synthesizeFn = async (): Promise<Buffer> => {
+      calls++;
+      throw new DOMException("TTS synthesis aborted", "AbortError");
+    };
+
+    await assert.rejects(
+      () => synthesizeSpeechWithFallback(TEXT, options, 0, undefined, synthesizeFn),
+      (error: unknown) => error instanceof DOMException && error.name === "AbortError"
+    );
+    assert.equal(calls, 1, "an abort was retried as though it were a failure");
+  });
+
+  it("does not try to divide an utterance too short to divide", async () => {
+    const short = "Chào bạn nhé."; // 13 characters, under the dividing floor
+    let calls = 0;
+    const synthesizeFn = async (): Promise<Buffer> => {
+      calls++;
+      throw new Error("Audio gateway returned 500 Internal Server Error");
+    };
+
+    await assert.rejects(() =>
+      synthesizeSpeechWithFallback(short, options, 0, undefined, synthesizeFn)
+    );
+    assert.equal(calls, 1, "a fragment too short to divide was divided anyway");
   });
 });
 

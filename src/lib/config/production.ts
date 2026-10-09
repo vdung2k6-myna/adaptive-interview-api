@@ -1,5 +1,5 @@
 import type { AppConfig } from "./index";
-import { parseList, parsePositiveInt, parseUnitInterval } from "./env";
+import { parseGain, parseList, parsePositiveInt, parseUnitInterval } from "./env";
 
 export const productionConfig: AppConfig = {
   env: "production",
@@ -56,6 +56,15 @@ export const productionConfig: AppConfig = {
         english: process.env.SUPERTONIC_VOICE_ENGLISH || "F1",
         vietnamese: process.env.SUPERTONIC_VOICE_VIETNAMESE || "F1",
       },
+    },
+    // Same levels as development, and deliberately not a second opinion: the
+    // imbalance being corrected is a property of the engines, not of a
+    // deployment, so the numbers travel with the code until a deployment has a
+    // reason of its own. See the field in `AppConfig` for what was measured.
+    volume: {
+      kokoro: parseGain(process.env.KOKORO_VOLUME, 0.5),
+      piper: parseGain(process.env.PIPER_VOLUME, 0.7),
+      supertonic: parseGain(process.env.SUPERTONIC_VOLUME, 1.2),
     },
   },
   docEtl: {

@@ -1004,7 +1004,7 @@ describe("POST /api/voice-agent/stream — the spoken chunk contract", () => {
    * turn's stream was empty (design.md, task 1.3). */
   const TOKENS = [
     "First sentence here.",
-    " Second sentence, long enough that the splitter has to break it into more than one chunk.",
+    " Second sentence, long enough that the splitter has to break it into more than one chunk, which is exactly what this test is here to observe.",
     " And a closing fragment with no delimiter",
   ];
   const TAIL = "And a closing fragment with no delimiter";
@@ -1139,7 +1139,7 @@ describe("POST /api/voice-agent/stream — chunking is the extractor's chunking 
     // equal to the input because the core will be handed `clean`, not `raw`, so
     // the identity only transfers if the two are the same string.
     const sentence =
-      "A single sentence long enough that the splitter has to break it into more than one chunk.";
+      "A single sentence long enough that the splitter has to break it into more than one chunk, which is the whole reason it is here at all.";
     const [extracted] = new SentenceExtractor().feed(sentence);
 
     assert.equal(extracted.clean, sentence, "the pin transfers to the core only if `clean` is the input");
