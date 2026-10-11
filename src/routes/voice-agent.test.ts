@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import type { Server } from "node:http";
 import express from "express";
 import { createVoiceAgentRouter, type VoiceAgentDeps } from "./voice-agent";
+import type { OllamaTool, OllamaToolCall } from "../lib/ollama";
 import { DEFAULT_PREFETCH_TOP_K } from "../lib/prefetch";
 import type { KnowledgeChunk, KnowledgeSearchOutcome, SearchOptions } from "../lib/knowledge";
 import { SentenceExtractor } from "../lib/audio/sentence-extractor";
@@ -23,6 +24,9 @@ interface Harness {
   searches: SearchCall[];
   /** Every message array the route gave the LLM, flattened to text. */
   prompts: string[];
+  /** What each model call was told it might call, in order. `undefined` is a turn that
+   *  carried no catalogue — which is every turn a browser client takes. */
+  toolSets: Array<OllamaTool[] | undefined>;
   /** Every message array the route gave the *non-streaming* generate — the
    * fallback a cloud model with empty streaming content triggers. Separate from
    * `prompts` so "no model was asked" can be asserted over both. */
@@ -77,6 +81,11 @@ function harness(
     neverSettles?: (call: SearchCall) => boolean;
     /** The tokens the fake LLM streams, in order. */
     stream?: string[];
+    /** The tokens per model round, for a turn that asks the model more than once. A round that
+     *  asks for a tool call streams nothing, so the default above would put words in its mouth. */
+    streamRounds?: string[][];
+    /** The calls the fake LLM asks for, by round. Absent for a round that answers in words. */
+    toolCallRounds?: OllamaToolCall[][];
     /** What `getFullText()` answers. Defaults to the streamed tokens joined, so
      * `finalize` sees the same text the turn streamed. */
     fullText?: string;
@@ -91,6 +100,7 @@ function harness(
 ): Harness {
   const searches: SearchCall[] = [];
   const prompts: string[] = [];
+  const toolSets: Array<OllamaTool[] | undefined> = [];
   const nonStreaming: string[] = [];
   const logs: string[] = [];
   const events: string[] = [];
@@ -98,10 +108,13 @@ function harness(
   const transcribeCalls: Array<{ language: string | undefined }> = [];
   const tokens = settings.stream ?? [];
   const fullText = settings.fullText ?? tokens.join("");
+  // Which model round the stub is answering, so one turn's rounds can be scripted apart.
+  let modelRounds = 0;
 
   return {
     searches,
     prompts,
+    toolSets,
     nonStreaming,
     logs,
     events,
@@ -124,14 +137,18 @@ function harness(
       },
       generateChatResponseStream: (options) => {
         prompts.push(options.messages.map((m) => m.content).join("\n---\n"));
+        toolSets.push(options.tools);
+        const round = modelRounds++;
+        const roundTokens = settings.streamRounds?.[round] ?? tokens;
         return {
           stream: new ReadableStream<string>({
             start(controller) {
-              for (const token of tokens) controller.enqueue(token);
+              for (const token of roundTokens) controller.enqueue(token);
               controller.close();
             },
           }),
-          getFullText: () => fullText,
+          getFullText: () => settings.fullText ?? roundTokens.join(""),
+          getToolCalls: () => settings.toolCallRounds?.[round] ?? [],
         };
       },
       generateChatResponse: async (options) => {
@@ -153,6 +170,8 @@ interface Endpoints {
   stream: string;
   /** POST here to prefetch a text turn's knowledge. */
   prefetch: string;
+  /** POST here what a gadget did about a call a turn asked it to make. */
+  toolResult: string;
 }
 
 /** Mount the router on a bare app, bound to an ephemeral port. */
@@ -173,7 +192,11 @@ async function withServer(
   const base = `http://127.0.0.1:${address.port}/api/voice-agent`;
 
   try {
-    await fn({ stream: `${base}/stream`, prefetch: `${base}/prefetch` });
+    await fn({
+      stream: `${base}/stream`,
+      prefetch: `${base}/prefetch`,
+      toolResult: `${base}/tool-result`,
+    });
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
@@ -256,6 +279,72 @@ async function sendTurn(
 }
 
 /**
+ * Submit one turn and read its stream as it arrives, handing each event to `onEvent`.
+ *
+ * A turn that asks a gadget to do something holds its stream open until it is told what
+ * happened, so a test that awaited the whole body would be waiting for the very timeout it is
+ * meant to prevent. This is what lets a test answer the turn from inside it.
+ */
+async function readTurn(
+  url: string,
+  harnessed: Harness,
+  body: Record<string, unknown>,
+  onEvent: (event: string, data: Record<string, unknown>) => void | Promise<void>,
+  /** Hang up mid-turn, which is what a client does when it stops reading — and what the bridge
+   *  does when it answers a command itself and abandons the turn it was taking. */
+  signal?: AbortSignal
+): Promise<string> {
+  const response = await captureConsole(harnessed, () =>
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ systemPrompt: "You are a tutor.", language: "english", ...body }),
+      ...(signal ? { signal } : {}),
+    })
+  );
+  assert.equal(response.status, 200);
+  assert.ok(response.body, "an SSE turn answers with a body");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let whole = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const text = decoder.decode(value, { stream: true });
+    whole += text;
+    buffer += text;
+
+    // Events are separated by a blank line, and the last piece may be half of one.
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() ?? "";
+    for (const part of parts) {
+      const name = /^event: (.+)$/m.exec(part)?.[1];
+      const payload = /^data: (.+)$/m.exec(part)?.[1];
+      if (name && payload) await onEvent(name, JSON.parse(payload) as Record<string, unknown>);
+    }
+  }
+  return whole;
+}
+
+/** Report back what a gadget did, the way the bridge does. */
+async function sendToolResult(
+  url: string,
+  harnessed: Harness,
+  body: Record<string, unknown>
+): Promise<Response> {
+  return captureConsole(harnessed, () =>
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+  );
+}
+
+/**
  * Issue a prefetch and return its `prefetchId`. `null` is the route's ordinary
  * "nothing to reuse" answer, so it is returned rather than asserted against.
  */
@@ -269,6 +358,289 @@ async function sendPrefetch(
   const payload = (await response.json()) as { prefetchId?: string | null };
   return payload.prefetchId ?? null;
 }
+
+describe("POST /api/voice-agent/stream — the gadget's own tools", () => {
+  /** What the bridge carries: the gadget's report, unedited. */
+  const REPORT = JSON.stringify([
+    {
+      name: "self.audio_speaker.set_volume",
+      description: "Set the volume of the audio speaker.",
+      inputSchema: {
+        type: "object",
+        properties: { volume: { type: "integer", minimum: 0, maximum: 100 } },
+      },
+    },
+  ]);
+
+  it("gives the model the gadget's own report, renamed into the dialect the model takes", async () => {
+    const h = harness({ ok: true, chunks: [] }, { stream: ["vâng"] });
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, { text: "tăng âm lượng chút nữa", tools: REPORT });
+
+      assert.equal(h.toolSets.length, 1, "one turn, one model call");
+      // The schema is the gadget's, untouched; only its name on the wire changes, which is
+      // the whole of what stands between the gadget's report and the model's dialect.
+      assert.deepEqual(h.toolSets[0], [
+        {
+          type: "function",
+          function: {
+            name: "self.audio_speaker.set_volume",
+            description: "Set the volume of the audio speaker.",
+            parameters: {
+              type: "object",
+              properties: { volume: { type: "integer", minimum: 0, maximum: 100 } },
+            },
+          },
+        },
+      ]);
+    });
+  });
+
+  it("asks with no tools at all when the turn carries none", async () => {
+    const h = harness({ ok: true, chunks: [] }, { stream: ["vâng"] });
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, { text: "hôm nay thế nào" });
+
+      // Absent, not empty: a browser turn, and every turn this route took before any of
+      // this, is asked with no tools — and an empty list is a different claim from silence.
+      assert.deepEqual(h.toolSets, [undefined], "a turn with no catalogue is asked with no tools");
+    });
+  });
+
+  it("tells the model when not to call a tool, and only when it has one to call", async () => {
+    // Measured on the device: asked a remark about their own habits — "tôi thường để chế độ điện
+    // thoại." — the model called the volume tool and spoke about the change, because the
+    // conversation still carried an earlier request for volume 60. A prompt cannot make that
+    // certain, and this is the one lever this side has.
+    const withTools = harness({ ok: true, chunks: [] }, { stream: ["vâng"] });
+    await withServer(withTools.deps, async (api) => {
+      await sendTurn(api.stream, withTools, { text: "tôi thường để chế độ điện thoại", tools: REPORT });
+
+      const system = withTools.prompts[0] ?? "";
+      assert.match(system, /Call one only when the person is asking you to change something/);
+      assert.match(
+        system,
+        /past requests in this conversation are not current ones/,
+        "the case that was actually measured: an earlier request is not a standing one"
+      );
+    });
+
+    const withoutTools = harness({ ok: true, chunks: [] }, { stream: ["vâng"] });
+    await withServer(withoutTools.deps, async (api) => {
+      await sendTurn(api.stream, withoutTools, { text: "hôm nay thế nào" });
+
+      // A browser turn has nothing to call, so it is not told about calling — the same rule the
+      // knowledge directive follows.
+      assert.doesNotMatch(withoutTools.prompts[0] ?? "", /Call one only when the person is asking/);
+    });
+  });
+
+  it("drops a report entry that is not a tool rather than asking the model to call it", async () => {
+    const h = harness({ ok: true, chunks: [] }, { stream: ["vâng"] });
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, {
+        text: "hôm nay thế nào",
+        tools: JSON.stringify([{ description: "no name at all" }, { name: "self.lamp.turn_on" }]),
+      });
+
+      assert.deepEqual(
+        (h.toolSets[0] ?? []).map((tool) => tool.function.name),
+        ["self.lamp.turn_on"],
+        "a tool with no name is not a tool"
+      );
+      // And a tool that declared no schema is given one that takes nothing, rather than a
+      // function Ollama would refuse for want of `parameters`.
+      assert.deepEqual(h.toolSets[0]?.[0]?.function.parameters, { type: "object", properties: {} });
+    });
+  });
+
+  /** A model round that asks for one volume change. */
+  const asksForVolume = (volume: number): OllamaToolCall[] => [
+    { function: { name: "self.audio_speaker.set_volume", arguments: { volume } } },
+  ];
+
+  it("tells the bridge what the model asked for, and speaks the reply the result earns", async () => {
+    const h = harness({ ok: true, chunks: [] }, {
+      // The round that asks for a call says nothing itself; the reply belongs to the round
+      // after it, which is the whole point of carrying the result back to the model.
+      streamRounds: [[], ["Đã hạ xuống 60 rồi nhé."]],
+      toolCallRounds: [asksForVolume(60)],
+    });
+
+    await withServer(h.deps, async (api) => {
+      const seen: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const sse = await readTurn(api.stream, h, { text: "hạ xuống 60 đi", tools: REPORT }, async (event, data) => {
+        seen.push({ event, data });
+        if (event !== "tool_call") return;
+        const answer = await sendToolResult(api.toolResult, h, {
+          turnId: data.turnId,
+          index: data.index,
+          ok: true,
+          text: "volume 60",
+        });
+        assert.equal(answer.status, 200, "a result a turn is waiting on is accepted");
+      });
+
+      const call = seen.find((entry) => entry.event === "tool_call");
+      assert.ok(call, "the turn tells the bridge what the model asked for");
+      assert.equal(call.data.name, "self.audio_speaker.set_volume");
+      assert.deepEqual(call.data.arguments, { volume: 60 });
+      assert.ok(
+        typeof call.data.turnId === "string" && call.data.turnId !== "",
+        "and names the turn it belongs to, so the result can be matched to it"
+      );
+
+      // The round that asked for the call produced nothing to say: one sentence in the whole
+      // turn, and it is the second round's.
+      assert.equal(seen.filter((entry) => entry.event === "sentence").length, 1);
+      assert.match(sse, /Đã hạ xuống 60 rồi nhé/);
+      assert.match(sse, /event: done/);
+
+      // And the second round was asked with the exchange in the conversation, which is what
+      // makes its reply about the change rather than about the question.
+      assert.match(h.prompts[1] ?? "", /volume 60/, "the result reached the model");
+      assert.deepEqual(h.toolSets[1], h.toolSets[0], "and it is still asked with the gadget's tools");
+    });
+  });
+
+  it("stops a model that keeps asking at the bound, and the turn still ends in speech", async () => {
+    const h = harness({ ok: true, chunks: [] }, {
+      // A call for every round, so the bound is what stops it rather than the model.
+      streamRounds: [[], [], ["Đã chỉnh xong rồi ạ."]],
+      toolCallRounds: [asksForVolume(30), asksForVolume(40), asksForVolume(50)],
+    });
+
+    await withServer(h.deps, async (api) => {
+      let answered = 0;
+      const sse = await readTurn(api.stream, h, { text: "chỉnh âm lượng", tools: REPORT }, async (event, data) => {
+        if (event !== "tool_call") return;
+        answered++;
+        await sendToolResult(api.toolResult, h, {
+          turnId: data.turnId,
+          index: data.index,
+          ok: true,
+          text: `volume ${answered * 10}`,
+        });
+      });
+
+      assert.equal(answered, 2, "the model may make the bounded number of calls and no more");
+      assert.equal(h.toolSets.length, 3, "and the round after the last one is still asked");
+      assert.equal(
+        h.toolSets[2],
+        undefined,
+        "asked without tools, so that round can only answer in words — which is what ends the turn in speech rather than in silence"
+      );
+      assert.match(sse, /Đã chỉnh xong rồi ạ/);
+      assert.match(sse, /event: done/);
+    });
+  });
+
+  it("tells the model what could not be done, and the turn still speaks", async () => {
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [[], ["Xin lỗi, tôi chưa chỉnh được âm lượng."]],
+      toolCallRounds: [asksForVolume(60)],
+    });
+
+    await withServer(h.deps, async (api) => {
+      const sse = await readTurn(api.stream, h, { text: "hạ xuống 60 đi", tools: REPORT }, async (event, data) => {
+        if (event !== "tool_call") return;
+        await sendToolResult(api.toolResult, h, {
+          turnId: data.turnId,
+          index: data.index,
+          ok: false,
+          message: "the gadget did not answer",
+        });
+      });
+
+      assert.match(h.prompts[1] ?? "", /the gadget did not answer/, "the model is told what happened");
+      assert.match(sse, /Xin lỗi, tôi chưa chỉnh được âm lượng/);
+      assert.match(sse, /event: done/, "and the turn ends in speech rather than failing");
+      assert.doesNotMatch(sse, /event: error/, "a call that could not be made is not a failed turn");
+    });
+  });
+
+  it("reports a result no turn is waiting on instead of acting on it", async () => {
+    const h = harness();
+
+    await withServer(h.deps, async (api) => {
+      const late = await sendToolResult(api.toolResult, h, {
+        turnId: "a-turn-that-has-gone",
+        index: 0,
+        ok: true,
+        text: "volume 60",
+      });
+      assert.equal(late.status, 409, "a result for a turn that gave up is answered with the truth");
+      assert.deepEqual(await late.json(), { settled: false });
+
+      const unnamed = await sendToolResult(api.toolResult, h, { index: 0, ok: true, text: "volume 60" });
+      assert.equal(unnamed.status, 400, "and one with no turn to belong to is refused at the door");
+    });
+  });
+
+  it("gives up its wait the moment the turn is cancelled, rather than sitting out the bound", async () => {
+    // Found on the device, not planned: the bridge answers a command its own grammar recognised
+    // and abandons the turn it was taking, and this route went on waiting the whole
+    // `toolCalls.timeoutMs` and then asked the model again on a connection nobody was reading.
+    // The wait is a `Promise.all` over the holds, and nothing about it used to know the turn had
+    // been cancelled.
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [[], ["…"]],
+      toolCallRounds: [asksForVolume(60)],
+    });
+
+    await withServer(h.deps, async (api) => {
+      const controller = new AbortController();
+
+      await captureConsole(h, async () => {
+        const reading = readTurn(
+          api.stream,
+          h,
+          { text: "hạ xuống 60 đi", tools: REPORT },
+          async (event) => {
+            if (event === "tool_call") controller.abort();
+          },
+          controller.signal
+        ).catch(() => undefined);
+
+        // The aborted read rejects at once; what is being given time here is the *route*, which
+        // is the thing that used to sit out the whole bound before noticing.
+        await reading;
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+      });
+
+      assert.ok(
+        h.logs.some((line) => line.includes("the turn was cancelled")),
+        `the cancelled turn gave up its wait at once; it logged: ${JSON.stringify(h.logs.slice(-6))}`
+      );
+      assert.ok(
+        !h.logs.some((line) => line.includes("falling back to non-streaming")),
+        "and did not go on to put the same question to the model again"
+      );
+      assert.equal(h.prompts.length, 1, "one model round, not two");
+    });
+  });
+
+  it("ends in speech when no result ever arrives, rather than holding the turn open", async () => {
+    // The wait, exercised for real: nothing answers the call, so it has to time out. That takes
+    // `config.toolCalls.timeoutMs`, which is why this is the slowest test in the file — and it
+    // is the one thing a shorter stand-in could not show, since the bound is the behaviour.
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [[], ["Xin lỗi, tôi chưa làm được."]],
+      toolCallRounds: [asksForVolume(60)],
+    });
+
+    await withServer(h.deps, async (api) => {
+      const sse = await readTurn(api.stream, h, { text: "hạ xuống 60 đi", tools: REPORT }, () => {});
+
+      assert.match(sse, /event: tool_call/);
+      assert.match(h.prompts[1] ?? "", /did not report back in time/, "the model is told the wait ran out");
+      assert.match(sse, /event: done/, "and the turn ends rather than holding the stream open for ever");
+    });
+  });
+});
 
 describe("POST /api/voice-agent/stream — the knowledge turn", () => {
   it("completes a turn with no prefetch id, searching the submitted text itself", async () => {
@@ -1009,7 +1381,7 @@ describe("POST /api/voice-agent/stream — the spoken chunk contract", () => {
   ];
   const TAIL = "And a closing fragment with no delimiter";
 
-  it("streams a text event before its chunks, numbering them across both emit sites", async () => {
+  it("streams a text event per chunk, naming the segment its audio follows", async () => {
     const h = harness(
       { ok: true, chunks: [] },
       { stream: TOKENS, synthesize: (chunk) => Buffer.from(`wav:${chunk}`) }
@@ -1019,11 +1391,30 @@ describe("POST /api/voice-agent/stream — the spoken chunk contract", () => {
       const events = parseSse(await sendTurn(api.stream, h));
       const chunks = events.filter((event) => event.event === "sentence");
 
-      assert.match(
-        events.map((event) => event.event).join(" "),
-        /^(text( sentence)+ )+done$/,
-        "each sentence's text event must precede that sentence's chunks, and done must close"
+      // A `text` event names one spoken segment, not one sentence: it pairs
+      // one-for-one with the `sentence` event whose audio it precedes, carrying
+      // the same index and the same text. This is what lets a client render the
+      // segment being read rather than the whole reply.
+      const spoken = events.filter(
+        (event) => event.event === "text" || event.event === "sentence"
       );
+      assert.equal(
+        spoken.length,
+        chunks.length * 2,
+        "every chunk must be announced exactly once and sent exactly once"
+      );
+      for (let at = 0; at < spoken.length; at += 2) {
+        const announced = spoken[at];
+        const sent = spoken[at + 1];
+        assert.equal(announced.event, "text", "the announcement must come first");
+        assert.equal(sent.event, "sentence", "and its audio must follow immediately");
+        assert.deepEqual(
+          announced.data,
+          { index: sent.data.index, text: sent.data.text },
+          `the text event for chunk ${sent.data.index} must name that same segment`
+        );
+      }
+      assert.equal(events.at(-1)?.event, "done", "done must close the turn");
       assert.deepEqual(
         chunks.map((event) => event.data.index),
         chunks.map((_, at) => at),
@@ -1075,6 +1466,13 @@ describe("POST /api/voice-agent/stream — the spoken chunk contract", () => {
         "a failed chunk keeps its index instead of leaving a gap"
       );
       assert.equal(chunks[1].data.audioData, null, "the failure is reported, not omitted");
+      assert.deepEqual(
+        events
+          .filter((event) => event.event === "text")
+          .map((event) => event.data),
+        chunks.map((event) => ({ index: event.data.index, text: event.data.text })),
+        "a chunk whose synthesis fails was still about to be spoken, so it is still announced"
+      );
       assert.ok(
         chunks.slice(2).every((event) => typeof event.data.audioData === "string"),
         "every chunk after the failure still carries its audio"
@@ -1120,6 +1518,13 @@ describe("POST /api/voice-agent/stream — the spoken chunk contract", () => {
         "the text is the half a muted turn keeps"
       );
       assert.equal(chunks.at(-1)?.data.text, TAIL, "the delimiter-less tail must still arrive");
+      assert.deepEqual(
+        events
+          .filter((event) => event.event === "text")
+          .map((event) => event.data.text),
+        chunks.map((event) => event.data.text),
+        "a muted turn must announce the same segments it sends, so a transcript still follows along"
+      );
       assert.equal(events.at(-1)?.event, "done", "a muted turn must close like any other");
       assert.ok(
         !h.logs.some((line) => line.includes("TTS failed")),

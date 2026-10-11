@@ -99,6 +99,24 @@ export interface AppConfig {
      */
     scoreFloor: number;
   };
+  /**
+   * What a turn may ask a gadget to do, and how long it waits to hear that it was done.
+   *
+   * Both are bounds rather than preferences. The wait keeps a turn that asked for something
+   * from hanging on an answer that is not coming; the round limit keeps a model that keeps
+   * asking from turning one turn into a conversation with itself. See `lib/tool-calls.ts`
+   * for how a turn is held, and `voice-agent.ts` for the loop these bound.
+   */
+  toolCalls: {
+    /** How long a turn holds itself open for the bridge to report what a tool did. A gadget
+     *  that answers at all answers in milliseconds; this is spent by a person listening to
+     *  silence, so it is a bound on patience rather than on the network. */
+    timeoutMs: number;
+    /** The most tool calls one turn may make before it answers with whatever it has. A person
+     *  can reasonably ask for two things in one breath; a model that asks for more than this
+     *  is one no answer will satisfy. */
+    maxRounds: number;
+  };
 }
 
 import { developmentConfig } from "./development";

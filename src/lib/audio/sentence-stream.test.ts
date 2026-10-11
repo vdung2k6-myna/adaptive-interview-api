@@ -15,6 +15,13 @@ interface Recorder {
   chunks: ChunkEvent[];
   /** Every chunk text the core handed to the synthesizer, in order. */
   synthCalls: string[];
+  /** Every chunk the core announced, in order. */
+  announced: { index: number; text: string }[];
+  /** What the core did, in the order it did it — `announce:<index>` and
+   * `synth:<text>`. The interleaving is a claim of its own: an announcement is
+   * the text of what is *about* to be spoken, so it must precede the
+   * synthesis, not merely accompany it. */
+  order: string[];
   /** Every failure the core reported rather than swallowed. */
   reported: { error: unknown; index: number; text: string }[];
 }
@@ -31,15 +38,23 @@ interface Recorder {
 function recorder(
   synthesize: (chunk: string, call: number) => Buffer | Promise<Buffer> = (chunk) =>
     Buffer.from(`wav:${chunk}`),
-  options: { signal?: AbortSignal; failSinkFor?: number } = {}
+  options: { signal?: AbortSignal; failSinkFor?: number; failAnnounceFor?: number } = {}
 ): { stream: SentenceStream; recorded: Recorder } {
-  const recorded: Recorder = { chunks: [], synthCalls: [], reported: [] };
+  const recorded: Recorder = { chunks: [], synthCalls: [], announced: [], order: [], reported: [] };
 
   const stream = new SentenceStream({
     synthesize: async (chunk) => {
       const call = recorded.synthCalls.length;
       recorded.synthCalls.push(chunk);
+      recorded.order.push(`synth:${chunk}`);
       return await synthesize(chunk, call);
+    },
+    onChunkStart: (chunk) => {
+      if (chunk.index === options.failAnnounceFor) {
+        throw new Error("the announce sink refused this chunk");
+      }
+      recorded.announced.push(chunk);
+      recorded.order.push(`announce:${chunk.index}`);
     },
     onChunk: (chunk) => {
       if (chunk.index === options.failSinkFor) {
@@ -164,6 +179,81 @@ describe("SentenceStream — the index contract", () => {
   });
 });
 
+describe("SentenceStream — announcing what is about to be spoken", () => {
+  it("announces every chunk, numbering them like the audio they precede", async () => {
+    // The claim a caller's `text` event rests on: one announcement per chunk,
+    // in index order, each naming the text `splitForTTS` made of the sentence —
+    // not the sentence itself. A caller that emits this event is then able to
+    // tell the client which segment is being read.
+    const { stream, recorded } = recorder();
+
+    const pushed = ["One.", "Two.", LONG_SENTENCE].map((sentence) => stream.push(sentence));
+    await stream.flush();
+    await Promise.all(pushed);
+
+    const expected = ["One.", "Two.", ...splitForTTS(LONG_SENTENCE)];
+    assert.ok(expected.length > 3, "the long sentence must split, or this proves nothing");
+    assert.deepEqual(
+      recorded.announced.map((chunk) => chunk.index),
+      expected.map((_, at) => at),
+      "one announcement per chunk, numbered 0..n-1 with no gap"
+    );
+    assert.deepEqual(
+      recorded.announced.map((chunk) => chunk.text),
+      expected,
+      "each announcement carries its own chunk's text"
+    );
+  });
+
+  it("announces a chunk before synthesizing it, not after", async () => {
+    const { stream, recorded } = recorder();
+
+    await Promise.all(["One.", "Two."].map((sentence) => stream.push(sentence)));
+    await stream.flush();
+
+    assert.deepEqual(
+      recorded.order,
+      ["announce:0", "synth:One.", "announce:1", "synth:Two."],
+      "the announcement must not wait on the audio it announces"
+    );
+  });
+
+  it("announces a chunk whose synthesis then fails", async () => {
+    // The text was about to be spoken either way, so a client told about it has
+    // been told the truth; the matching `sentence` event follows with null audio.
+    const { stream, recorded } = recorder((chunk, call) => {
+      if (call === 1) throw new Error("audio gateway refused this chunk");
+      return Buffer.from(`wav:${chunk}`);
+    });
+
+    await Promise.all(["One.", "Two.", "Three."].map((sentence) => stream.push(sentence)));
+    await stream.flush();
+
+    assert.deepEqual(recorded.announced.map((chunk) => chunk.index), [0, 1, 2]);
+    assert.equal(recorded.chunks[1].buffer, null, "the audio is still the failure");
+  });
+
+  it("reports a throwing announce sink without stopping the stream", async () => {
+    const { stream, recorded } = recorder(undefined, { failAnnounceFor: 1 });
+
+    await Promise.all(["One.", "Two.", "Three."].map((sentence) => stream.push(sentence)));
+    await stream.flush();
+
+    assert.deepEqual(
+      recorded.announced.map((chunk) => chunk.index),
+      [0, 2],
+      "a refused announcement must not stop the rest"
+    );
+    assert.deepEqual(
+      recorded.chunks.map((chunk) => chunk.index),
+      [0, 1, 2],
+      "a refused announcement does not silence the chunk it was about"
+    );
+    assert.equal(recorded.reported.length, 1);
+    assert.equal(recorded.reported[0].index, 1);
+  });
+});
+
 describe("SentenceStream — flush() and abort", () => {
   it("resolves flush() only after the last chunk has been emitted", async () => {
     const { held, open } = gate();
@@ -224,5 +314,38 @@ describe("SentenceStream — flush() and abort", () => {
     await assert.doesNotReject(() => stream.push("Three."));
     assert.equal(recorded.synthCalls.length, after, "a push after abort must not synthesize");
     assert.deepEqual(recorded.chunks, []);
+  });
+
+  it("announces nothing once the stream is aborted", async () => {
+    const { held, open } = gate();
+    const controller = new AbortController();
+    const { stream, recorded } = recorder(
+      async (chunk, call) => {
+        if (call === 0) await held;
+        return Buffer.from(`wav:${chunk}`);
+      },
+      { signal: controller.signal }
+    );
+
+    const pushed = ["One.", "Two.", LONG_SENTENCE].map((sentence) => stream.push(sentence));
+    await settle();
+
+    // The first chunk was announced before the abort — it was about to be
+    // spoken. Everything queued behind it was never announced at all, because
+    // the abort is checked before each announcement rather than after.
+    assert.deepEqual(recorded.announced.map((chunk) => chunk.index), [0]);
+
+    controller.abort();
+    open();
+    await Promise.all(pushed);
+    await stream.flush();
+    assert.deepEqual(
+      recorded.announced.map((chunk) => chunk.index),
+      [0],
+      "no chunk after the abort may be announced, not even one already queued"
+    );
+
+    await stream.push("Three.");
+    assert.deepEqual(recorded.announced.map((chunk) => chunk.index), [0]);
   });
 });

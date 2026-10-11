@@ -779,7 +779,7 @@ The endpoint accepts either an audio recording (voice input) or a `text` field (
 |-------|-----------|-------------|
 | `user` | `{ text, messageId }` | Transcribed user audio or the provided `text`. Omitted on the first turn. |
 | `sentence` | `{ index, text, audioData }` | A synthesized agent sentence as base64 WAV. `audioData` is `null` if synthesis failed, including when `speak=0`. |
-| `text` | `{ text }` | The agent's sentence as plain text, emitted immediately before the matching `sentence` so a client can render it without waiting for synthesis. |
+| `text` | `{ index, text }` | The segment about to be spoken, emitted immediately before the matching `sentence` — which is the same segment, by `index` and by `text`. One `text` per `sentence`, so a sentence the splitter breaks into several chunks is several pairs; a client can render the segment being read, or highlight it in the reply, without waiting for synthesis. |
 | `done` | `{ messageId, fullText }` | Agent response complete. |
 | `notice` | `{ code, message }` | Non-fatal notice; the stream then ends. Currently only `code: "no_speech"`, when the recording held no transcribable speech. |
 | `error` | `{ message }` | Fatal error (stream terminates). |
@@ -800,11 +800,30 @@ The backend keeps only the most recent `VOICE_AGENT_MAX_HISTORY` exchanges in th
 event: user
 data: {"text":"Explain closures.","messageId":"user-1"}
 
+event: text
+data: {"index":0,"text":"A closure is a function that remembers the variables from its surrounding scope."}
+
 event: sentence
 data: {"index":0,"text":"A closure is a function that remembers the variables from its surrounding scope.","audioData":"UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA..."}
 
 event: done
 data: {"messageId":"agent-1","fullText":"A closure is a function that remembers the variables from its surrounding scope."}
+```
+
+A sentence long enough to be split is several `text`/`sentence` pairs, in index order:
+
+```
+event: text
+data: {"index":0,"text":"Bạn hãy giải thích về closure trong JavaScript,"}
+
+event: sentence
+data: {"index":0,"text":"Bạn hãy giải thích về closure trong JavaScript,","audioData":"UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA..."}
+
+event: text
+data: {"index":1,"text":"và cho một ví dụ."}
+
+event: sentence
+data: {"index":1,"text":"và cho một ví dụ.","audioData":"UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA..."}
 ```
 
 **Status Codes:**

@@ -112,4 +112,12 @@ export const developmentConfig: AppConfig = {
     // and is invisible (D4).
     scoreFloor: parseUnitInterval(process.env.MATERIAL_SCORE_FLOOR, 0.55),
   },
+  toolCalls: {
+    // 8s. A gadget answers in milliseconds when it answers at all, so this is spent by a person
+    // listening to silence — and it is well under `ollama.chatTimeoutMs`, which bounds the two
+    // model rounds the wait sits between.
+    timeoutMs: parsePositiveInt(process.env.TOOL_CALL_TIMEOUT_MS, 8_000),
+    // See `AppConfig.toolCalls.maxRounds` for why two.
+    maxRounds: parsePositiveInt(process.env.TOOL_CALL_MAX_ROUNDS, 2),
+  },
 };

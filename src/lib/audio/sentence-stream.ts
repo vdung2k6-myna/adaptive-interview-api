@@ -20,7 +20,9 @@
  * What the caller still owns: the transport. The core never sees `req` or `res`,
  * emission happens in the caller's `onChunk` because the sinks differ (the voice
  * agent also guards on `res.writableEnded`, which the core cannot know), and the
- * caller still emits its own `text` and `done` events around it (D1, D5).
+ * caller still emits its own `text` and `done` events around it (D1, D5). A
+ * caller whose `text` event names one segment rather than one sentence takes its
+ * cue from `onChunkStart`, which is the core saying what it is about to speak.
  */
 
 import { splitForTTS } from "./text-processing";
@@ -65,6 +67,25 @@ export interface SentenceStreamOptions {
    * this is where a caller writes its own event. A throw from here is reported
    * through `onError` and does not stop the stream. */
   onChunk: (chunk: ChunkEvent) => void;
+  /**
+   * Called once per chunk, in index order, as that chunk becomes the one being
+   * synthesized — before `synthesize` is awaited, and so before the `onChunk`
+   * above reports how it went.
+   *
+   * This is the text of the segment about to be spoken, for a caller that
+   * announces a segment's text ahead of its audio. The voice agent is the one
+   * that does: it emits a `text` event here, which is what makes that event
+   * carry the same segment its matching `sentence` event carries the audio for.
+   *
+   * It fires for a chunk whose synthesis then fails, exactly as it fires for one
+   * that succeeds — the text was about to be spoken either way, and a caller
+   * that announced it has told the truth. A chunk abandoned by an abort is not
+   * announced, because the abort is checked before this.
+   *
+   * A throw from here is reported through `onError` like a throwing sink and
+   * does not stop the stream.
+   */
+  onChunkStart?: (chunk: { index: number; text: string }) => void;
   /** Stops the stream. Nothing is emitted once it is aborted, and `flush()`
    * still resolves, so a caller can abandon the response it was filling (D5). */
   signal?: AbortSignal;
@@ -175,6 +196,11 @@ export class SentenceStream {
           return;
         }
 
+        // Before the synthesis, not after it: a caller announcing this chunk's
+        // text is saying what is about to be spoken, and the point of the
+        // announcement is that it needs no audio to have been made yet.
+        this.announce({ index: item.index, text: item.text });
+
         let buffer: Buffer | null = null;
         try {
           buffer = await this.options.synthesize(item.text);
@@ -216,6 +242,17 @@ export class SentenceStream {
   private emit(chunk: ChunkEvent): void {
     try {
       this.options.onChunk(chunk);
+    } catch (error) {
+      this.report(error, chunk);
+    }
+  }
+
+  /** Says a chunk is next to be spoken. Optional, and guarded the same way
+   * `emit` guards the sink: a throw is reported, not fatal. */
+  private announce(chunk: { index: number; text: string }): void {
+    if (!this.options.onChunkStart) return;
+    try {
+      this.options.onChunkStart(chunk);
     } catch (error) {
       this.report(error, chunk);
     }

@@ -87,4 +87,10 @@ export const productionConfig: AppConfig = {
     // require choosing a floor in the same change.
     scoreFloor: parseUnitInterval(process.env.MATERIAL_SCORE_FLOOR, 0.55),
   },
+  toolCalls: {
+    // Same as development, and deliberately not a second opinion: the wait is spent by a person
+    // listening to silence, which a deployment does not make shorter. See development.ts.
+    timeoutMs: parsePositiveInt(process.env.TOOL_CALL_TIMEOUT_MS, 8_000),
+    maxRounds: parsePositiveInt(process.env.TOOL_CALL_MAX_ROUNDS, 2),
+  },
 };
