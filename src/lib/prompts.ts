@@ -176,17 +176,37 @@ const KNOWLEDGE_DIRECTIVE =
   "contradict it. If it does not cover the topic, reply as you normally would.";
 
 /**
+ * What a model given the gadget's tools is told about them.
+ *
+ * Measured on the device, and the reason it exists: asked "tôi thường để chế độ điện thoại." —
+ * a remark about the person's own habits — the model called the volume tool and spoke about the
+ * change it had made, because the conversation still carried an earlier request for volume 60.
+ * A setting named inside an answer is not a request for it (specs, `interview/gadget-device-tools`).
+ *
+ * A prompt cannot make that certain — the decision is the model's, which is why the grammar is
+ * kept as the path that cannot be wrong — but it is the one lever this side has.
+ */
+const TOOL_DIRECTIVE = [
+  "- You have the device's own controls as tools. Call one only when the person is asking you to change something.",
+  "- A setting they merely name — while answering you, asking you something, or telling you about themselves — is not a request, and past requests in this conversation are not current ones.",
+  "- If it is not clear that they are asking, ask them what they want and change nothing until they say.",
+].join("\n");
+
+/**
  * Build a generic voice-agent prompt from a user-supplied system prompt,
  * language rule, and conversation history. No position/candidate context.
  * Optional knowledgeContext prepends a "Relevant knowledge:" section to
  * the system prompt, carrying a directive to base the reply on the
- * indexed documents it names.
+ * indexed documents it names. `hasTools` adds the directive above, and
+ * for the same reason: it is about calling the gadget, so it belongs
+ * where calling is possible.
  */
 export function buildVoiceAgentPrompt(
   systemPrompt: string,
   language: "english" | "vietnamese" = "english",
   history: VoiceAgentMessage[] = [],
-  knowledgeContext?: KnowledgeChunk[]
+  knowledgeContext?: KnowledgeChunk[],
+  hasTools = false
 ): OllamaMessage[] {
   const languageInstruction = `- Conduct the entire conversation in ${language}. Replies must be in ${language} only.`;
 
@@ -204,7 +224,7 @@ export function buildVoiceAgentPrompt(
 ${knowledgeSection}Rules:
 ${languageInstruction}
 - Keep replies concise and conversational.
-- Use Markdown only when it helps clarity.`;
+- Use Markdown only when it helps clarity.${hasTools ? `\n${TOOL_DIRECTIVE}` : ""}`;
 
   const historyMessages = history.map((m) => ({
     role: m.role === "agent" ? ("assistant" as const) : ("user" as const),

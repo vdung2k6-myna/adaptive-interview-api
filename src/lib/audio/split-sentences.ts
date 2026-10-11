@@ -3,12 +3,18 @@
  * Supports English and Vietnamese punctuation.
  *
  * Rules:
- * - Split on . ! ? … 。 ？ ！ followed by whitespace or end of string
+ * - Split on . ! ? … 。 ？ ！
+ * - A period between two digits is part of a numeral, not a sentence end, so
+ *   "3.5 năm" is one sentence while "Tổng cộng là 42." still ends one
  * - Preserve the delimiter in the returned sentence
  * - Filter out empty/whitespace-only fragments
  */
 
-const SENTENCE_END_REGEX = /[.!?…。？！]+/g;
+// The two period branches are the negation of "a digit precedes AND a digit
+// follows", which is what makes a period part of a decimal numeral. They use
+// lookaround rather than consuming the neighbouring character, so the match
+// stays exactly the delimiter the caller slices on.
+const SENTENCE_END_REGEX = /(?:\.(?![0-9])|(?<![0-9])\.|[!?…。？！])+/g;
 const WHITESPACE_ONLY = /^\s*$/;
 
 /**

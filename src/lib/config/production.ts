@@ -1,5 +1,5 @@
 import type { AppConfig } from "./index";
-import { parseList, parsePositiveInt, parseUnitInterval } from "./env";
+import { parseGain, parseList, parsePositiveInt, parseUnitInterval } from "./env";
 
 export const productionConfig: AppConfig = {
   env: "production",
@@ -57,6 +57,15 @@ export const productionConfig: AppConfig = {
         vietnamese: process.env.SUPERTONIC_VOICE_VIETNAMESE || "F1",
       },
     },
+    // Same levels as development, and deliberately not a second opinion: the
+    // imbalance being corrected is a property of the engines, not of a
+    // deployment, so the numbers travel with the code until a deployment has a
+    // reason of its own. See the field in `AppConfig` for what was measured.
+    volume: {
+      kokoro: parseGain(process.env.KOKORO_VOLUME, 0.5),
+      piper: parseGain(process.env.PIPER_VOLUME, 0.7),
+      supertonic: parseGain(process.env.SUPERTONIC_VOLUME, 1.2),
+    },
   },
   docEtl: {
     apiUrl: process.env.DOC_ETL_API_URL || "http://localhost:8000",
@@ -77,5 +86,11 @@ export const productionConfig: AppConfig = {
     // empty, and defaulted here so that turning a collection on does not also
     // require choosing a floor in the same change.
     scoreFloor: parseUnitInterval(process.env.MATERIAL_SCORE_FLOOR, 0.55),
+  },
+  toolCalls: {
+    // Same as development, and deliberately not a second opinion: the wait is spent by a person
+    // listening to silence, which a deployment does not make shorter. See development.ts.
+    timeoutMs: parsePositiveInt(process.env.TOOL_CALL_TIMEOUT_MS, 8_000),
+    maxRounds: parsePositiveInt(process.env.TOOL_CALL_MAX_ROUNDS, 2),
   },
 };

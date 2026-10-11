@@ -1,9 +1,98 @@
 import { OllamaError } from "./errors";
 import config from "./config";
 
+/** One call a model asked for, as it reported it. `arguments` arrives already parsed — Ollama
+ *  does that before the chunk reaches us — and is handed to the gadget as it stands. */
+export interface OllamaToolCall {
+  function: {
+    name: string;
+    arguments: Record<string, unknown>;
+  };
+}
+
+/**
+ * One message of the conversation the model is asked with.
+ *
+ * The first three roles are the turn's own. The last two exist for what a turn has with a
+ * gadget: the call the model asked for, then what the call did. A result names the tool it
+ * belongs to, which is how Ollama pairs the two where OpenAI carries an id.
+ */
 export interface OllamaMessage {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: string;
+  /** The calls a model's own message asked for, echoed back in the next round. */
+  tool_calls?: OllamaToolCall[];
+  /** The tool a `tool` message is the result of, by the name the model called. */
+  tool_name?: string;
+}
+
+/**
+ * One tool, in the shape a model is given one.
+ *
+ * Ollama takes OpenAI's dialect: the function is named and described at the top and its
+ * JSON Schema hangs under `parameters`. A gadget states the same three things under
+ * `inputSchema` (see `parseGadgetTools`), so what happens between the two is a rename.
+ */
+export interface OllamaTool {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: unknown;
+  };
+}
+
+/**
+ * A gadget's own report of what it can be asked to do, as the bridge carries it.
+ *
+ * `inputSchema` is the firmware's own JSON Schema, sent unedited. `args` is the bridge's
+ * reading of that schema and never travels, so it is not read here either.
+ */
+export interface GadgetToolReport {
+  name: string;
+  description: string;
+  inputSchema?: unknown;
+}
+
+/** A schema for a tool that declared none. A function whose `parameters` is absent is one
+ *  Ollama will not take, and "it takes nothing" is what a tool that stated nothing stated. */
+const NO_PARAMETERS = { type: "object", properties: {} } as const;
+
+/**
+ * The gadget's report, as the model is given it — the rename described on `OllamaTool`, and
+ * nothing more.
+ *
+ * Anything that is not a report is dropped rather than repaired: a tool with no name is not a
+ * tool, and a model given one would call something nothing can answer. An empty result is the
+ * ordinary case of a gadget that reported none, which is what leaves a turn asked without
+ * tools at all.
+ */
+export function parseGadgetTools(raw: string | undefined): OllamaTool[] {
+  if (!raw) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    console.warn("[Ollama] the tools field was not JSON; this turn is asked with no tools");
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+
+  const tools: OllamaTool[] = [];
+  for (const entry of parsed) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const { name, description, inputSchema } = entry as GadgetToolReport;
+    if (typeof name !== "string" || name === "") continue;
+    tools.push({
+      type: "function",
+      function: {
+        name,
+        description: typeof description === "string" ? description : "",
+        parameters: inputSchema ?? NO_PARAMETERS,
+      },
+    });
+  }
+  return tools;
 }
 
 export interface OllamaGenerateOptions {
@@ -11,11 +100,61 @@ export interface OllamaGenerateOptions {
   messages: OllamaMessage[];
   temperature?: number;
   repeat_penalty?: number;
+  /** What the model may ask to be done. Omitted — not empty — when there is nothing it may
+   *  call, so a turn with no tools is the request it was before any of this existed. */
+  tools?: OllamaTool[];
 }
 
 export interface GenerateStreamResult {
   stream: ReadableStream<string>;
   getFullText: () => string;
+  /**
+   * What the model asked to be done, in the order it asked. Empty for a turn that answered in
+   * words — which is every turn that was not given tools, and every turn a browser client
+   * takes.
+   *
+   * Read after the stream ends rather than during it: a call arrives as a whole message with
+   * no content beside it, so there is nothing to stream while it is being made, and the turn
+   * has nothing to say until it knows whether the call it is looking at succeeded.
+   */
+  getToolCalls: () => OllamaToolCall[];
+}
+
+/**
+ * The calls a chunk carried, if any.
+ *
+ * `arguments` is an object in Ollama's own dialect and a JSON *string* in the OpenAI-compatible
+ * one, so both are read: a bridge that got this wrong would hand the gadget `"[object Object]"`
+ * or a string where its schema expects an integer. Anything without a usable name is dropped —
+ * a call to no tool is not a call.
+ */
+function readToolCalls(message: { tool_calls?: unknown } | undefined): OllamaToolCall[] {
+  const raw = message?.tool_calls;
+  if (!Array.isArray(raw)) return [];
+
+  const calls: OllamaToolCall[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const fn = (entry as { function?: unknown }).function;
+    if (typeof fn !== "object" || fn === null) continue;
+    const { name, arguments: args } = fn as { name?: unknown; arguments?: unknown };
+    if (typeof name !== "string" || name === "") continue;
+
+    let parsed: Record<string, unknown> = {};
+    if (typeof args === "string") {
+      try {
+        const decoded: unknown = JSON.parse(args);
+        if (typeof decoded === "object" && decoded !== null) parsed = decoded as Record<string, unknown>;
+      } catch {
+        // A call whose arguments could not be read is still a call: it goes with none, and the
+        // gadget's own schema is what refuses it.
+      }
+    } else if (typeof args === "object" && args !== null) {
+      parsed = args as Record<string, unknown>;
+    }
+    calls.push({ function: { name, arguments: parsed } });
+  }
+  return calls;
 }
 
 /** The counts Ollama reports on a finished chat call. Every field is optional:
@@ -204,6 +343,8 @@ export function generateChatResponseStream(
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   let fullText = "";
+  // What the model asked to be done, in the order it asked — see `getToolCalls`.
+  const toolCalls: OllamaToolCall[] = [];
 
   const stream = new ReadableStream<string>({
     async start(streamController) {
@@ -212,6 +353,10 @@ export function generateChatResponseStream(
           model,
           messages: options.messages,
           stream: true,
+          // Omitted rather than sent empty. An empty list is a claim that the model may call
+          // nothing; silence is a turn that was asked without tools, which is every turn a
+          // browser client takes and every turn this service took before any of this.
+          ...(options.tools && options.tools.length > 0 ? { tools: options.tools } : {}),
           options: {
             temperature: options.temperature ?? 0.7,
             repeat_penalty: options.repeat_penalty ?? 1.1,
@@ -265,10 +410,11 @@ export function generateChatResponseStream(
             if (!line.trim()) continue;
             try {
               const data = JSON.parse(line) as {
-                message?: { content?: string };
+                message?: { content?: string; tool_calls?: unknown };
                 done?: boolean;
               } & TokenCounts;
               const content = data.message?.content || "";
+              for (const call of readToolCalls(data.message)) toolCalls.push(call);
               if (content) {
                 fullText += content;
                 streamController.enqueue(content);
@@ -288,10 +434,11 @@ export function generateChatResponseStream(
         if (buffer.trim()) {
           try {
             const data = JSON.parse(buffer) as {
-              message?: { content?: string };
+              message?: { content?: string; tool_calls?: unknown };
               done?: boolean;
             } & TokenCounts;
             const content = data.message?.content || "";
+            for (const call of readToolCalls(data.message)) toolCalls.push(call);
             if (content) {
               fullText += content;
               streamController.enqueue(content);
@@ -332,5 +479,6 @@ export function generateChatResponseStream(
   return {
     stream,
     getFullText: () => fullText,
+    getToolCalls: () => toolCalls,
   };
 }

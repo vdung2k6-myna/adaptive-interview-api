@@ -364,6 +364,9 @@ Runtime configuration is loaded from `.env` via `dotenv`. Key variables:
 | `KOKORO_VOICE_VIETNAMESE` | Override Vietnamese voice ID for Kokoro (empty = service default) |
 | `PIPER_VOICE_VIETNAMESE` | Override Vietnamese voice ID for Piper (empty = service default) |
 | `SUPERTONIC_VOICE_VIETNAMESE` | Override Vietnamese voice ID for Supertonic (empty = service default) |
+| `KOKORO_VOLUME` | Per-engine linear volume for Kokoro, applied to the PCM the gateway returns (default `0.5`) |
+| `PIPER_VOLUME` | Per-engine linear volume for Piper (default `0.7`) |
+| `SUPERTONIC_VOLUME` | Per-engine linear volume for Supertonic (default `1.2`) |
 | `MATERIAL_COLLECTIONS` | Knowledge collections the material-reply search is scoped to |
 | `FRONTEND_URL` | CORS origin |
 | `PORT` | Server port (default 4000) |

@@ -170,7 +170,7 @@ function sentences(events: SseEvent[]): SseEvent[] {
  * chunk, so a test can tell that splitting happens per sentence and not only at
  * sentence boundaries. */
 const LONG_SENTENCE =
-  "This second sentence is deliberately long enough that the splitter has to break it across more than one chunk.";
+  "This second sentence is deliberately long enough that the splitter has to break it across more than one chunk, which is exactly what this test is here to observe.";
 
 /** The session a turn is recorded against, as `sessionForTurn` resolves one. It
  * is cast rather than spelled out because the row carries a dozen columns these

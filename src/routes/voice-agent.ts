@@ -1,16 +1,18 @@
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, writeFile, rm } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { buildVoiceAgentPrompt, trimVoiceAgentHistory, type VoiceAgentMessage } from "@/lib/prompts";
-import { generateChatResponse, generateChatResponseStream } from "@/lib/ollama";
+import { generateChatResponse, generateChatResponseStream, parseGadgetTools } from "@/lib/ollama";
 import { OllamaError } from "@/lib/errors";
 import { searchKnowledge, type KnowledgeChunk, type KnowledgeSearch, type KnowledgeSearchOutcome } from "@/lib/knowledge";
 import { MATERIAL_LOCATOR_TOP_K, resolveMaterialReply, selectMaterialHit } from "@/lib/material";
 import { resolveAnswerMode, type AnswerMode } from "@/lib/personas";
 import { createPrefetchStore, DEFAULT_PREFETCH_TOP_K, type PrefetchStore } from "@/lib/prefetch";
 import { createSessionKnowledge, type SessionKnowledge } from "@/lib/session-knowledge";
+import { createToolCallStore, type ToolCallOutcome, type ToolCallStore } from "@/lib/tool-calls";
 import { resolveCollections } from "@/lib/topics";
 import config from "@/lib/config";
 import {
@@ -18,6 +20,7 @@ import {
   synthesizeSpeechWithFallback,
   resolveVoice,
   resolveEngineForLanguage,
+  resolveSttLanguage,
   hasUnclosedCodeFence,
   SentenceExtractor,
   SentenceStream,
@@ -60,10 +63,19 @@ export function createVoiceAgentRouter(overrides: Partial<VoiceAgentDeps> = {}):
   // topical turn and never awaited (D4).
   const session = createSessionKnowledge({ search: deps.searchKnowledge });
 
+  // The turns that have asked a model, been answered with a call, and are now waiting to be
+  // told what the gadget did about it. One registry per router instance, like the holds above.
+  const toolCalls = createToolCallStore();
+
   router.post("/stream", upload.single("audio"), (req, res) =>
-    handleStream(req, res, deps, prefetch, session)
+    handleStream(req, res, deps, prefetch, session, toolCalls)
   );
   router.post("/prefetch", (req, res) => handlePrefetch(req, res, prefetch));
+
+  // Where the bridge reports back what a gadget did. It is the only caller that can reach a
+  // gadget at all — the tool channel lives inside the device's own socket — so it is the only
+  // caller that ever has anything to say here.
+  router.post("/tool-result", (req, res) => handleToolResult(req, res, toolCalls));
   return router;
 }
 
@@ -214,7 +226,8 @@ async function handleStream(
   res: Response,
   deps: VoiceAgentDeps,
   prefetch: PrefetchStore,
-  session: SessionKnowledge
+  session: SessionKnowledge,
+  toolCalls: ToolCallStore
 ): Promise<void> {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -251,6 +264,13 @@ async function handleStream(
     const engine = resolveEngineForLanguage(requestedEngine, language);
     const systemPrompt = typeof req.body.systemPrompt === "string" ? req.body.systemPrompt : "";
     const rawHistory = parseHistory(req.body.history);
+    // What the gadget says it can be asked to do, carried by the bridge with the turn and
+    // already the gadget's own words. Empty for every client that is not a gadget — the
+    // browser sends nothing here — and an empty list is what leaves the model asked with no
+    // tools, exactly as every turn was before this existed.
+    const gadgetTools = parseGadgetTools(
+      typeof req.body.tools === "string" ? req.body.tools : undefined
+    );
     const audioFile = req.file;
     const textInput = typeof req.body.text === "string" ? req.body.text.trim() : "";
     // A client that will not play this turn's audio says so up front. The turn is
@@ -305,7 +325,15 @@ async function handleStream(
     if (audioFile) {
       const audioExt = audioFile.mimetype === "audio/wav" ? "wav" : "webm";
       await withTempAudioFile(audioFile.buffer, audioExt, async (tmpPath) => {
-        const sttResult = await deps.transcribeAudio(tmpPath);
+        // The turn already carries its language, which is the one thing the
+        // transcriber cannot work out for itself on this audio: left to detect,
+        // it answers short Vietnamese in Chinese, and the persona then corrects
+        // the person for words they never said. See resolveSttLanguage.
+        const sttResult = await deps.transcribeAudio(
+          tmpPath,
+          undefined,
+          resolveSttLanguage(language)
+        );
         userText = sttResult.text;
       });
     } else if (textInput) {
@@ -484,6 +512,21 @@ async function handleStream(
           audioData: buffer ? buffer.toString("base64") : null,
         });
       },
+      // The `text` event names the segment about to be spoken, which is the same
+      // segment the `sentence` event below carries the audio for — one event per
+      // chunk, not one per sentence. The core announces a chunk just before it
+      // synthesizes it (D6), so the text still arrives without waiting for
+      // synthesis: that is what this event is for, and it is now also what the
+      // client can count on it saying. A sentence the core splits into several
+      // chunks is several `text` events, in the same order as their audio.
+      //
+      // Content is flowing now, so the heartbeat has done its job: every later
+      // gap is between two `text`/`sentence` events, not a silence.
+      onChunkStart: ({ index, text }) => {
+        if (abortController.signal.aborted) return;
+        cleanupHeartbeat();
+        sendSseEvent(res, "text", { index, text });
+      },
       // A failed chunk is emitted as null audio at its own index and the turn
       // goes on (D4); this only reports it. An abort is not a failure and never
       // reaches here.
@@ -540,18 +583,38 @@ async function handleStream(
             `(score ${material.hit.score}) — no model requested`
         );
       } else {
-        const prompt = buildVoiceAgentPrompt(
+        let prompt = buildVoiceAgentPrompt(
           systemPrompt,
           language,
           llmHistory,
-          knowledgeChunks.length ? knowledgeChunks : undefined
+          knowledgeChunks.length ? knowledgeChunks : undefined,
+          // The model is told what it may call, so it is told when to — and a turn with no
+          // catalogue is asked exactly as it was before any of this existed.
+          gadgetTools.length > 0
         );
 
-        const { stream: llmStream, getFullText } = deps.generateChatResponseStream({
-          messages: prompt,
-          temperature: 0.7,
-          repeat_penalty: 1.2,
-        });
+        // A turn asks, and may be answered with a call rather than with words. The call is made
+        // on the gadget by the bridge — the tool channel lives inside the device's own socket
+        // and this service cannot reach it — so the turn stops, tells the bridge what was asked
+        // for, and waits. What comes back joins the conversation and the model is asked again,
+        // which is what makes the reply about the change rather than merely beside it.
+        //
+        // The loop is bounded, and bounded twice over: a call is only permitted while `rounds`
+        // is under the limit, so the round after the last permitted call is asked **without**
+        // tools and can only answer in words. A model that keeps asking therefore still ends
+        // the turn in speech rather than in silence (design.md, "Rounds are bounded").
+        let rounds = 0;
+        while (true) {
+          const mayCall = gadgetTools.length > 0 && rounds < config.toolCalls.maxRounds;
+
+          const { stream: llmStream, getFullText, getToolCalls } = deps.generateChatResponseStream({
+            messages: prompt,
+            temperature: 0.7,
+            repeat_penalty: 1.2,
+            // What this gadget reported it can be asked to do. Absent for a turn that carries
+            // none, so a browser turn — and every turn before this existed — asks as it did.
+            ...(mayCall ? { tools: gadgetTools } : {}),
+          });
 
         const reader = llmStream.getReader();
         let streamEmpty = true;
@@ -572,36 +635,98 @@ async function handleStream(
           const sentences = extractor.feed(token);
           for (const { clean, chunks } of sentences) {
             if (abortController.signal.aborted) break;
-            // Emit text immediately so the frontend can render it even if TTS
-            // is slow or fails. The matching `sentence` event (with audio) will
-            // follow when synthesis completes.
-            // Content is flowing now, so the heartbeat has done its job: every
-            // later gap is between two `text`/`sentence` events, not a silence.
-            cleanupHeartbeat();
-            sendSseEvent(res, "text", { text: clean });
             console.log(`[VoiceAgent] TTS sentence scheduled: "${clean.substring(0, 80)}" → ${chunks.length} chunk(s)`);
             // Awaited, so the read loop still stalls between tokens while the
             // sentence is spoken — which is what this route did before the move,
-            // and what keeps each sentence's chunks ahead of the next `text`
-            // event (D2). The core splits and indexes it (D6, D3).
+            // and what keeps each sentence's chunks ahead of the next sentence.
+            // The core splits and indexes it (D6, D3), and its own
+            // `onChunkStart` is what emits this sentence's `text` events — one
+            // per chunk, each just before the `sentence` event that carries that
+            // chunk's audio.
             await sentenceStream.push(clean);
           }
         }
 
+        finalText = getFullText();
+        const calls = mayCall ? getToolCalls() : [];
+
         // Some cloud models (e.g. kimi-k2.6:cloud) stream with empty content
         // but return full text in non-streaming mode. Fall back when streaming
-        // yielded nothing.
-        finalText = getFullText();
-        if (streamEmpty || !finalText.trim()) {
+        // yielded nothing — and *not* when the emptiness is a tool call, which is a different
+        // thing from a model that failed to speak: the fallback would put the same question to
+        // the same model and be given the same call, and the turn would spend a second request
+        // learning nothing.
+        if (calls.length === 0 && (streamEmpty || !finalText.trim())) {
           console.log("[VoiceAgent] Streaming yielded no text; falling back to non-streaming generateChatResponse");
           finalText = await deps.generateChatResponse({ messages: prompt, temperature: 0.7, repeat_penalty: 1.2 });
+        }
+
+        if (calls.length === 0) break;
+
+        // One turn id for the round and one hold per call: a model may ask for two things at
+        // once, and each is answered on its own. Every hold is opened *before* the event that
+        // carries its id, so a bridge that reports back at once is not writing into a hold that
+        // does not exist yet — which is the whole reason the store is not a bare map
+        // (`lib/tool-calls.ts`).
+        const turnId = randomUUID();
+        const holds = calls.map((call, index) => {
+          const hold = toolCalls.open(`${turnId}:${index}`, config.toolCalls.timeoutMs);
+          console.log(
+            `[VoiceAgent] the model asked for ${call.function.name}(${JSON.stringify(call.function.arguments)}) ` +
+              `— telling the bridge and waiting up to ${config.toolCalls.timeoutMs}ms`
+          );
+          sendSseEvent(res, "tool_call", {
+            turnId,
+            index,
+            name: call.function.name,
+            arguments: call.function.arguments,
+          });
+          return hold;
+        });
+
+        // The wait is against the client as well as the clock. The bridge answers a command the
+        // grammar recognised itself and abandons this turn (4.1), so the turn can be cancelled
+        // while it sits here — and a turn nobody is reading is not one to spend the whole wait on.
+        // The hold that loses the race is left to time out on its own, and what it settles into
+        // is never read.
+        const outcomes = await Promise.all(
+          holds.map((hold) => untilCancelled(hold, abortController.signal))
+        );
+
+        // Logged before the cancellation is acted on, so that an operator reading this log sees
+        // why the turn went quiet: the model asked for something and the turn was abandoned
+        // underneath it.
+        for (const [index, outcome] of outcomes.entries()) {
+          console.log(
+            `[VoiceAgent] ${calls[index]!.function.name}: ` +
+              (outcome.ok ? `done — ${outcome.text}` : `not done — ${outcome.message}`)
+          );
+        }
+
+        // A cancelled turn is one nobody is reading. There is nothing further to ask the model,
+        // because the connection the answer would go down is gone. The only way back to the top
+        // of the loop is past this, which is what keeps a cancelled turn from asking again.
+        if (abortController.signal.aborted) break;
+
+        // What the model asked for, then what it got, in the shape a tool-calling model expects
+        // them back in. A call that could not be made is carried as its own message rather than
+        // dropped: the reply is meant to say what could not be done.
+        prompt = [
+          ...prompt,
+          { role: "assistant", content: "", tool_calls: calls },
+          ...calls.map((call, index) => ({
+            role: "tool" as const,
+            content: outcomes[index]!.ok ? outcomes[index]!.text : outcomes[index]!.message,
+            tool_name: call.function.name,
+          })),
+        ];
+        rounds++;
         }
       }
 
       const tailSentences = extractor.finalize(finalText);
       for (const { clean, chunks } of tailSentences) {
         if (abortController.signal.aborted) break;
-        sendSseEvent(res, "text", { text: clean });
         console.log(`[VoiceAgent] TTS sentence scheduled: "${clean.substring(0, 80)}" → ${chunks.length} chunk(s)`);
         await sentenceStream.push(clean);
       }
@@ -646,6 +771,73 @@ async function handleStream(
     // before the streaming block's own finally.
     cleanupHeartbeat();
   }
+}
+
+/**
+ * A hold, or the turn being cancelled — whichever comes first.
+ *
+ * A turn can be cancelled while it waits: the bridge answers a command its own grammar
+ * recognised and abandons the turn it was taking. Without this the route would sit out the
+ * whole `toolCalls.timeoutMs` and then ask the model again on a connection nobody is reading,
+ * which is what it did the first time a command and a tool call met.
+ */
+function untilCancelled(hold: Promise<ToolCallOutcome>, signal: AbortSignal): Promise<ToolCallOutcome> {
+  if (signal.aborted) return Promise.resolve({ ok: false, message: "the turn was cancelled" });
+  return Promise.race([
+    hold,
+    new Promise<ToolCallOutcome>((resolve) => {
+      signal.addEventListener("abort", () => resolve({ ok: false, message: "the turn was cancelled" }), {
+        once: true,
+      });
+    }),
+  ]);
+}
+
+/* ── POST /api/voice-agent/tool-result ──────────────────────────── */
+
+/**
+ * What a gadget did about a call a turn asked for.
+ *
+ * The body is `{ turnId, index, ok, text }`, or `{ turnId, index, ok: false, message }` when it
+ * could not be done. The turn that asked is holding its stream open and waiting on exactly
+ * this, so the answer here says only whether a wait was found: the turn's own reply is what the
+ * person is reading, and this response is for the bridge's operator.
+ *
+ * A result nobody is waiting on is an ordinary race rather than a fault — a turn that timed out
+ * and a bridge that answered just afterwards are both behaving as they should — so it is logged
+ * and answered with the truth instead of being refused at the door.
+ */
+async function handleToolResult(
+  req: Request,
+  res: Response,
+  toolCalls: ToolCallStore
+): Promise<void> {
+  const turnId = typeof req.body.turnId === "string" ? req.body.turnId : "";
+  const index = Number.isInteger(req.body.index) ? (req.body.index as number) : 0;
+  if (!turnId) {
+    res.status(400).json({ error: "turnId is required" });
+    return;
+  }
+
+  const outcome: ToolCallOutcome =
+    req.body.ok === false
+      ? {
+          ok: false,
+          message:
+            typeof req.body.message === "string" && req.body.message
+              ? req.body.message
+              : "the gadget did not carry it out",
+        }
+      : { ok: true, text: typeof req.body.text === "string" ? req.body.text : "" };
+
+  const settled = toolCalls.settle(`${turnId}:${index}`, outcome);
+  if (!settled) {
+    console.warn(
+      `[VoiceAgent] a tool result arrived for ${turnId}:${index} which no turn is waiting on — ` +
+        "the turn it belonged to has already timed out or ended"
+    );
+  }
+  res.status(settled ? 200 : 409).json({ settled });
 }
 
 /* ── POST /api/voice-agent/prefetch ─────────────────────────────── */

@@ -487,6 +487,25 @@ an override naming a held-less voice fails the same way.
 
 See [supertonic-service/README.md](../supertonic-service/README.md) for how to install a voice.
 
+### How loud a turn speaks
+
+Loudness is a deployment setting too, and it is set per engine (`KOKORO_VOLUME`,
+`PIPER_VOLUME`, `SUPERTONIC_VOLUME`), because the engines do not agree: measured on
+one Vietnamese sentence, Kokoro and Piper return at full scale while Supertonic
+sits about 8 dB below it, so one shared level would only be a compromise between
+them. Each value is a linear multiplier applied to the audio the gateway returns —
+`1` leaves an engine as it is, `0.5` halves it, `1.2` boosts it and clamps whatever
+no longer fits, logging the share of samples that clipped so a value set too high
+is visible rather than merely audible.
+
+There is no per-request field for it: the level of an engine's voice is a property
+of the deployment, and a turn that could ask for its own would be a turn that
+sounds unlike the rest of the interview. Re-measure after changing one:
+
+```bash
+node scripts/measure-engine-levels.mjs
+```
+
 ### `POST /api/voice/start`
 
 Generate the first interview question for a voice session, synthesize it to audio, and return the message with audio URL.
@@ -760,7 +779,7 @@ The endpoint accepts either an audio recording (voice input) or a `text` field (
 |-------|-----------|-------------|
 | `user` | `{ text, messageId }` | Transcribed user audio or the provided `text`. Omitted on the first turn. |
 | `sentence` | `{ index, text, audioData }` | A synthesized agent sentence as base64 WAV. `audioData` is `null` if synthesis failed, including when `speak=0`. |
-| `text` | `{ text }` | The agent's sentence as plain text, emitted immediately before the matching `sentence` so a client can render it without waiting for synthesis. |
+| `text` | `{ index, text }` | The segment about to be spoken, emitted immediately before the matching `sentence` — which is the same segment, by `index` and by `text`. One `text` per `sentence`, so a sentence the splitter breaks into several chunks is several pairs; a client can render the segment being read, or highlight it in the reply, without waiting for synthesis. |
 | `done` | `{ messageId, fullText }` | Agent response complete. |
 | `notice` | `{ code, message }` | Non-fatal notice; the stream then ends. Currently only `code: "no_speech"`, when the recording held no transcribable speech. |
 | `error` | `{ message }` | Fatal error (stream terminates). |
@@ -781,11 +800,30 @@ The backend keeps only the most recent `VOICE_AGENT_MAX_HISTORY` exchanges in th
 event: user
 data: {"text":"Explain closures.","messageId":"user-1"}
 
+event: text
+data: {"index":0,"text":"A closure is a function that remembers the variables from its surrounding scope."}
+
 event: sentence
 data: {"index":0,"text":"A closure is a function that remembers the variables from its surrounding scope.","audioData":"UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA..."}
 
 event: done
 data: {"messageId":"agent-1","fullText":"A closure is a function that remembers the variables from its surrounding scope."}
+```
+
+A sentence long enough to be split is several `text`/`sentence` pairs, in index order:
+
+```
+event: text
+data: {"index":0,"text":"Bạn hãy giải thích về closure trong JavaScript,"}
+
+event: sentence
+data: {"index":0,"text":"Bạn hãy giải thích về closure trong JavaScript,","audioData":"UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA..."}
+
+event: text
+data: {"index":1,"text":"và cho một ví dụ."}
+
+event: sentence
+data: {"index":1,"text":"và cho một ví dụ.","audioData":"UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA..."}
 ```
 
 **Status Codes:**

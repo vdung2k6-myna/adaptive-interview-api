@@ -57,6 +57,21 @@ export interface AppConfig {
         vietnamese: string;
       };
     };
+    /**
+     * A linear volume multiplier per engine, applied to the PCM the gateway
+     * returns; 1 leaves it as the engine produced it.
+     *
+     * Per engine rather than one number because the engines do not agree on
+     * loudness: measured on the same Vietnamese sentence, kokoro and piper come
+     * back at full scale (0 dBFS peak) while supertonic sits ~8 dB below it
+     * (`scripts/measure-engine-levels.mjs`). One shared level would be a
+     * compromise between them; this is the knob that makes them match.
+     */
+    volume: {
+      kokoro: number;
+      piper: number;
+      supertonic: number;
+    };
   };
   docEtl: {
     apiUrl: string;          // Document ETL service URL for knowledge retrieval
@@ -83,6 +98,24 @@ export interface AppConfig {
      * measurement on this value in development.ts.
      */
     scoreFloor: number;
+  };
+  /**
+   * What a turn may ask a gadget to do, and how long it waits to hear that it was done.
+   *
+   * Both are bounds rather than preferences. The wait keeps a turn that asked for something
+   * from hanging on an answer that is not coming; the round limit keeps a model that keeps
+   * asking from turning one turn into a conversation with itself. See `lib/tool-calls.ts`
+   * for how a turn is held, and `voice-agent.ts` for the loop these bound.
+   */
+  toolCalls: {
+    /** How long a turn holds itself open for the bridge to report what a tool did. A gadget
+     *  that answers at all answers in milliseconds; this is spent by a person listening to
+     *  silence, so it is a bound on patience rather than on the network. */
+    timeoutMs: number;
+    /** The most tool calls one turn may make before it answers with whatever it has. A person
+     *  can reasonably ask for two things in one breath; a model that asks for more than this
+     *  is one no answer will satisfy. */
+    maxRounds: number;
   };
 }
 

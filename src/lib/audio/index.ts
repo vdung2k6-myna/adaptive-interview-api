@@ -26,7 +26,7 @@ export {
   SEGMENT_MARKER,
 } from "./storage";
 export { splitSentences, extractNewSentences } from "./split-sentences";
-export { concatWavBuffers, isValidWav } from "./wav-utils";
+export { concatWavBuffers, isValidWav, applyGainToWav, type GainResult } from "./wav-utils";
 export {
   stripMarkdown,
   normalizeNumbersForKokoro,
@@ -37,6 +37,7 @@ export {
   synthesizeLongText,
   resolveVoice,
   resolveEngineForLanguage,
+  resolveSttLanguage,
   hasUnclosedCodeFence,
   type SynthesizeResult,
   type SynthesizeLongTextOptions,

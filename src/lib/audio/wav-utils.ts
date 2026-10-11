@@ -197,3 +197,90 @@ export function isValidWav(buffer: Buffer): boolean {
   const wave = buffer.toString("ascii", 8, 12);
   return riff === "RIFF" && wave === "WAVE";
 }
+
+/** What scaling a buffer did, so a caller can report the runs that ran out of
+ * headroom instead of quietly distorting them. */
+export interface GainResult {
+  /** The scaled audio, or the input unchanged when scaling did not apply. */
+  buffer: Buffer;
+  /** Samples the gain pushed past full scale, which were clamped to it. */
+  clippedSamples: number;
+  /** Samples read. Zero when the buffer was left alone — see `applied`. */
+  totalSamples: number;
+  /** False when the buffer was returned untouched because it is not 16-bit PCM
+   * this can scale, or because the gain was 1 (which is the same buffer). */
+  applied: boolean;
+}
+
+/**
+ * Scale a WAV buffer's samples by a linear gain, clamping at full scale.
+ *
+ * The engines do not agree on loudness — measured on one Vietnamese sentence,
+ * kokoro and piper return at full scale (peak 0.0 dBFS) and supertonic ~8 dB
+ * below it — and the gateway has no volume parameter to ask them to agree, so
+ * the levelling is done here, on the PCM it returned.
+ *
+ * Scaling is linear and per sample, so scaling each utterance gives exactly the
+ * samples scaling their concatenation would: a reply that had to be divided and
+ * rejoined needs no second pass and no undoing.
+ *
+ * Anything that is not 16-bit PCM is returned untouched rather than guessed at.
+ * A wrong sample width would rewrite the audio into noise, which is worse than
+ * an engine being the wrong volume, and nothing here needs the other depths: all
+ * three engines return 16-bit PCM mono (44100 / 24000 / 22050 Hz respectively).
+ *
+ * @param buffer The WAV to scale.
+ * @param gain Linear multiplier; 1 returns the buffer as it is, 0 silences it.
+ */
+export function applyGainToWav(buffer: Buffer, gain: number): GainResult {
+  const unchanged: GainResult = {
+    buffer,
+    clippedSamples: 0,
+    totalSamples: 0,
+    applied: false,
+  };
+
+  // A gain of 1 is the identity, and returning the same buffer keeps the common
+  // case free of a copy. A negative or non-finite gain is refused rather than
+  // clamped: see `parseGain` — the config parser is supposed to have already
+  // rejected it, and a caller reaching here with one is a bug, not a volume.
+  if (!Number.isFinite(gain) || gain < 0) return unchanged;
+  if (gain === 1) return { ...unchanged, applied: true };
+
+  let fmt: WavFmt;
+  let pcmOffset: number;
+  let pcmLength: number;
+  try {
+    ({ fmt, pcmOffset, pcmLength } = parseWav(buffer));
+  } catch {
+    // Not a WAV this understands. Returning it is the only option that does not
+    // corrupt it; the caller's audio is then merely at the engine's own level.
+    return unchanged;
+  }
+
+  if (fmt.audioFormat !== 1 || fmt.bitsPerSample !== 16) return unchanged;
+
+  // Trust the header only as far as the bytes actually present.
+  pcmLength = Math.min(pcmLength, buffer.length - pcmOffset);
+  const totalSamples = Math.floor(pcmLength / 2);
+  if (totalSamples === 0) return unchanged;
+
+  const output = Buffer.from(buffer);
+  let clippedSamples = 0;
+
+  for (let i = 0; i < totalSamples; i++) {
+    const at = pcmOffset + i * 2;
+    const scaled = Math.round(output.readInt16LE(at) * gain);
+    if (scaled > 32767) {
+      output.writeInt16LE(32767, at);
+      clippedSamples++;
+    } else if (scaled < -32768) {
+      output.writeInt16LE(-32768, at);
+      clippedSamples++;
+    } else {
+      output.writeInt16LE(scaled, at);
+    }
+  }
+
+  return { buffer: output, clippedSamples, totalSamples, applied: true };
+}

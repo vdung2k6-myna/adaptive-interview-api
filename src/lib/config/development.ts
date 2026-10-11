@@ -1,5 +1,5 @@
 import type { AppConfig } from "./index";
-import { parseList, parsePositiveInt, parseUnitInterval } from "./env";
+import { parseGain, parseList, parsePositiveInt, parseUnitInterval } from "./env";
 
 export const developmentConfig: AppConfig = {
   env: "development",
@@ -56,6 +56,15 @@ export const developmentConfig: AppConfig = {
         vietnamese: process.env.SUPERTONIC_VOICE_VIETNAMESE || "F1",
       },
     },
+    // 1 is "unchanged". Kokoro and Piper come back at full scale and Supertonic
+    // ~8 dB below it, so the pair that is already loud is brought down and the
+    // one that is quiet is brought up. Measured figures and the script that
+    // produces them are named on the field in `AppConfig`.
+    volume: {
+      kokoro: parseGain(process.env.KOKORO_VOLUME, 0.5),
+      piper: parseGain(process.env.PIPER_VOLUME, 0.7),
+      supertonic: parseGain(process.env.SUPERTONIC_VOLUME, 1.2),
+    },
   },
   docEtl: {
     apiUrl: process.env.DOC_ETL_API_URL || "http://localhost:8000",
@@ -102,5 +111,13 @@ export const developmentConfig: AppConfig = {
     // of audio, while too high generates, which is what every turn does today
     // and is invisible (D4).
     scoreFloor: parseUnitInterval(process.env.MATERIAL_SCORE_FLOOR, 0.55),
+  },
+  toolCalls: {
+    // 8s. A gadget answers in milliseconds when it answers at all, so this is spent by a person
+    // listening to silence — and it is well under `ollama.chatTimeoutMs`, which bounds the two
+    // model rounds the wait sits between.
+    timeoutMs: parsePositiveInt(process.env.TOOL_CALL_TIMEOUT_MS, 8_000),
+    // See `AppConfig.toolCalls.maxRounds` for why two.
+    maxRounds: parsePositiveInt(process.env.TOOL_CALL_MAX_ROUNDS, 2),
   },
 };
