@@ -29,8 +29,13 @@ Express Server (:4000)
 ├── /api/voice-agent     → Ephemeral voice agent chat (prefetch + material replies)
 ├── /api/personas        → Persona catalog (read-only, seeded)
 ├── /api/mcp             → MCP analytics SSE
-└── /audio               → Static audio file serving
+└── /audio               → Session recordings, behind the same Bearer token as /api
 ```
+
+Everything under `/api` needs the token, and so does `/audio`: it sits outside `/api` not because it
+is open but because its path is stored verbatim in every `messages.audio_url` row and cannot be
+moved without a migration, so the mount wears the middleware itself. `/health` is the one path here
+that answers without a credential.
 
 ## Quick Start
 

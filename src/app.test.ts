@@ -9,8 +9,9 @@ import { createApp } from "./app";
 
 /** The token this suite arms auth with. Deliberately not the developer's: the
  * assertions below are about which requests auth answers, and an unset
- * `API_AUTH_TOKEN` disables authentication entirely, which would make the
- * authenticated-resource assertion pass for the wrong reason. */
+ * `API_AUTH_TOKEN` disables authentication entirely, which would make every
+ * authenticated-resource assertion pass for the wrong reason — the audio refusals
+ * among them, since a disabled credential refuses nothing. */
 const TOKEN = "test-token-for-the-composition-root";
 
 /** The session directory and file the present-file case is served from. The
@@ -93,40 +94,61 @@ async function withApp(fn: (urls: Urls) => Promise<void>): Promise<void> {
 }
 
 describe("composition root: which middleware answers a request", () => {
-  it("serves audio that is there, with no credentials", async () => {
+  const bearer = (): Record<string, string> => ({ Authorization: `Bearer ${TOKEN}` });
+
+  it("serves a recording to a caller that presents the credential", async () => {
     await withApp(async (urls) => {
-      const res = await fetch(urls.present);
+      const res = await fetch(urls.present, { headers: bearer() });
 
       assert.equal(res.status, 200);
       assert.equal(await res.text(), "RIFF0000WAVEfmt ");
     });
   });
 
-  it("answers audio that is gone with 404, not an authentication failure", async () => {
+  it("refuses a recording to a caller that does not, rather than serving it by URL", async () => {
+    // The whole of this change. A recording used to be served to anyone holding its
+    // URL: the mount sat before the middleware, and this deployment's ingress forwards
+    // `/audio` as well as `/api`. Two UUIDs of secrecy is not a credential, and a URL
+    // leaks into payloads, browser history and logs.
     await withApp(async (urls) => {
-      const res = await fetch(urls.swept);
+      const res = await fetch(urls.present);
 
+      assert.equal(res.status, 401, "a recording is not readable by its URL alone");
+      assert.notEqual(await res.text(), "RIFF0000WAVEfmt ", "and its bytes are not in the refusal");
+    });
+  });
+
+  it("refuses a path that holds nothing exactly as it refuses one that holds a recording", async () => {
+    // A change of the answer this file used to pin. The mount was placed before the
+    // middleware so that a segment swept at the end of a turn would be answered as
+    // absent (404) rather than as a rejected credential (401). Behind the middleware
+    // both are 401, which is the wanted answer: a 404-versus-401 difference tells an
+    // unauthenticated caller which recordings exist.
+    await withApp(async (urls) => {
+      const swept = await fetch(urls.swept);
+      const present = await fetch(urls.present);
+      const outside = await fetch(urls.outside);
+
+      assert.equal(swept.status, 401);
+      assert.equal(outside.status, 401);
       assert.equal(
-        res.status,
-        404,
-        "a file that is not there must not be reported as a rejected credential"
+        present.status,
+        swept.status,
+        "the two must not be told apart by a caller who may read neither"
       );
     });
   });
 
-  it("answers a missing audio path with 404 whether or not credentials are sent", async () => {
+  it("tells an authenticated caller what is actually there", async () => {
+    // A caller holding the credential may read these files, so it may also learn that
+    // one is missing: a 404 here is information the platform is entitled to give, and
+    // it is the same 404 the mount answered before.
     await withApp(async (urls) => {
-      const bare = await fetch(urls.outside);
-      const credentialed = await fetch(urls.outside, {
-        headers: { Authorization: `Bearer ${TOKEN}` },
-      });
+      const swept = await fetch(urls.swept, { headers: bearer() });
+      const outside = await fetch(urls.outside, { headers: bearer() });
 
-      assert.equal(bare.status, 404);
-      assert.equal(
-        credentialed.status,
-        404,
-        "a valid token must not change what a missing file is reported as"
-      );
+      assert.equal(swept.status, 404, "a segment that was swept is gone, and says so");
+      assert.equal(outside.status, 404);
     });
   });
 

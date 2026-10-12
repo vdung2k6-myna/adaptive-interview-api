@@ -61,18 +61,35 @@ export function createApp(): express.Express {
     res.json({ status: "ok", service: "adaptive-interview-api" });
   });
 
-  // Audio static files — public, served before auth. A request for a file that
-  // has been removed is answered 404 by the absence of any route for it, rather
-  // than by the auth middleware: the mount is the last thing that will ever
-  // claim an `/audio` request, present or not.
-  app.use("/audio", express.static(process.env.AUDIO_STORAGE_DIR || "/tmp/audio"));
+  // Audio static files — **behind the same credential as the API**, at the same path.
+  // That path is stored verbatim in every `messages.audio_url` row and built in one
+  // place (`lib/audio/storage.ts`), so moving the mount rather than the URL means no
+  // row stops resolving and no migration is owed — and, because it is the same
+  // directory, the recordings already on disk are covered as well as the ones to come.
+  //
+  // It used to be mounted *before* auth, so that a segment swept at the end of a turn
+  // would be answered as absent rather than as a rejected credential. That reason is
+  // now the wrong way round, and worth saying plainly: behind the middleware, a
+  // request with no credential for a path that holds nothing is refused exactly as one
+  // holding a recording is, so an unauthenticated caller cannot tell which recordings
+  // exist. The 404-versus-401 difference this mount was placed to preserve is a
+  // difference nobody who may not read these files is entitled to.
+  //
+  // What that replaced: the mount was reachable from the internet by URL alone —
+  // measured 2026-10-12 against this deployment, whose ingress forwards `/audio` as
+  // well as `/api` — leaving every interview recording to the secrecy of two UUIDs.
+  // Unguessable is not authenticated, and a URL leaks.
+  app.use("/audio", apiAuthMiddleware, express.static(process.env.AUDIO_STORAGE_DIR || "/tmp/audio"));
 
   // MCP endpoint — handles its own auth (MCP_AUTH_TOKEN)
   app.use("/api/mcp", mcpRoutes);
 
-  // Auth middleware (protects the API routes below). Scoped to `/api` so that
-  // only the API is authenticated: the audio mount's misses, and any other path
-  // outside `/api`, are answered as what they are instead of as a missing token.
+  // Auth middleware (protects the API routes below). Scoped to `/api` so that only
+  // the API is authenticated: any path outside `/api`, and the MCP mount above which
+  // carries its own token, are answered as what they are instead of as a missing
+  // token. The audio mount above is the one exception, and it wears the middleware
+  // itself rather than moving under `/api` — see there for why its path could not
+  // change.
   app.use("/api", apiAuthMiddleware);
 
   // Routes
