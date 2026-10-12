@@ -112,6 +112,15 @@ export const developmentConfig: AppConfig = {
     // and is invisible (D4).
     scoreFloor: parseUnitInterval(process.env.MATERIAL_SCORE_FLOOR, 0.55),
   },
+  music: {
+    // Empty, and unset is empty: music is something a deployment opts into, and a shipped default
+    // would point every deployment at a directory that is not there. It has to be inside
+    // `AUDIO_STORAGE_DIR` for its tracks to have a URL — see `AppConfig.music`.
+    //
+    // The files are the deployment's own. What may be played is theirs to answer for; this
+    // repository ships no music and grants no rights to any.
+    libraryDir: (process.env.MUSIC_LIBRARY_DIR || "").trim(),
+  },
   toolCalls: {
     // 8s. A gadget answers in milliseconds when it answers at all, so this is spent by a person
     // listening to silence — and it is well under `ollama.chatTimeoutMs`, which bounds the two

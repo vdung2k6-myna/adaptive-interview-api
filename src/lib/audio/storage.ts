@@ -4,10 +4,45 @@
  */
 
 import { mkdir, writeFile, readFile, access, unlink, readdir, stat } from "fs/promises";
-import { join } from "path";
+import { isAbsolute, join, relative, resolve, sep } from "path";
 import { randomUUID } from "crypto";
 
-const BASE_DIR = process.env.AUDIO_STORAGE_DIR || "/tmp/audio";
+/**
+ * The directory the audio mount serves.
+ *
+ * Exported because a caller can hold a path and needs to know whether the mount would serve it —
+ * a music library is the case, and it has to answer that question before it offers a track whose
+ * URL would resolve to nothing. Read once, at import: the mount reads the same value when the app
+ * is built, and the two must agree about which directory they mean.
+ */
+export const AUDIO_ROOT = process.env.AUDIO_STORAGE_DIR || "/tmp/audio";
+
+const BASE_DIR = AUDIO_ROOT;
+
+/**
+ * The URL path a file under the audio root is served at, or `null` for a file outside it.
+ *
+ * The mount serves the root at `/audio`, so a file's URL is its path relative to that root — and a
+ * file outside the root has **no URL at all**, because the mount is the only thing that serves
+ * these and it cannot reach outside what it serves. `null` rather than a guess: a library kept
+ * somewhere else would otherwise be a library whose tracks have URLs that do not resolve, which is
+ * discovered by a person as silence.
+ *
+ * Both paths are resolved before they are compared, so a relative one, a symlinked parent or a
+ * `..` segment cannot be used to name a file the mount would not serve.
+ *
+ * Each segment is percent-encoded, because a track's name is a person's and may hold anything —
+ * a space, an ampersand, a `#`. `encodeURIComponent` per segment and not `encodeURI` over the
+ * whole: the latter leaves `#` and `?` alone, which in a file name are the two characters that
+ * would end the path and start something else.
+ */
+export function urlPathForFile(filePath: string): string | null {
+  const root = resolve(BASE_DIR);
+  const full = resolve(filePath);
+  const within = relative(root, full);
+  if (within === "" || within.startsWith("..") || isAbsolute(within)) return null;
+  return `/audio/${within.split(sep).map(encodeURIComponent).join("/")}`;
+}
 
 /**
  * Names the per-segment files a streamed turn announces. The route builds a

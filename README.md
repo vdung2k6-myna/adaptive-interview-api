@@ -37,6 +37,14 @@ is open but because its path is stored verbatim in every `messages.audio_url` ro
 moved without a migration, so the mount wears the middleware itself. `/health` is the one path here
 that answers without a credential.
 
+A turn may also be answered with music. Where `MUSIC_LIBRARY_DIR` names a directory inside
+`AUDIO_STORAGE_DIR`, the route offers the model two tools of its own — `platform.list_music` and
+`platform.play_music` — and answers them **itself** rather than pushing them out to whoever is on the
+connection: the library is this service's, so there is nobody else to answer for it. A chosen track is
+announced to the client as a `music` event (its URL, its name, and the index one past the reply's last
+sentence) after that reply's sentences and before `done`, and the client plays it from the same mount,
+with the same credential, as any other recording.
+
 ## Quick Start
 
 ```bash

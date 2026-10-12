@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import type { Server } from "node:http";
 import express from "express";
@@ -7,6 +7,10 @@ import type { OllamaTool, OllamaToolCall } from "../lib/ollama";
 import { DEFAULT_PREFETCH_TOP_K } from "../lib/prefetch";
 import type { KnowledgeChunk, KnowledgeSearchOutcome, SearchOptions } from "../lib/knowledge";
 import { SentenceExtractor } from "../lib/audio/sentence-extractor";
+import { AUDIO_ROOT } from "../lib/audio/storage";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 interface SearchCall {
   query: string;
@@ -1906,6 +1910,175 @@ describe("POST /api/voice-agent/stream — the material turn", () => {
         readLine.includes(located().source),
         `the read line must name the source it spoke, got: ${readLine}`
       );
+    });
+  });
+});
+
+/**
+ * The platform's own music, over a library this suite makes.
+ *
+ * The library lives **inside the audio root**, because a track anywhere else has no URL — the mount
+ * is the only thing that serves these, and it serves one directory. It is a uniquely-named
+ * directory and it is removed when the file finishes, so nothing here touches a deployment's music.
+ */
+describe("POST /api/voice-agent/stream — the platform's own music", () => {
+  const made: string[] = [];
+  let library: string;
+
+  before(async () => {
+    library = await mkdtemp(join(AUDIO_ROOT, "music-route-"));
+    made.push(library);
+    for (const name of ["Diem Xua.mp3", "Back in Black.mp3"]) {
+      await writeFile(join(library, name), Buffer.from("RIFF0000WAVEfmt "));
+    }
+  });
+
+  after(async () => {
+    for (const dir of made) await rm(dir, { recursive: true, force: true });
+  });
+
+  /** A model that asks for one track by name, in the round it is given tools. */
+  const asksForTrack = (name: string): OllamaToolCall[][] => [
+    [{ function: { name: "platform.play_music", arguments: { name } } }],
+  ];
+  /** A model that asks what the library holds. */
+  const asksForShelf = (): OllamaToolCall[][] => [
+    [{ function: { name: "platform.list_music", arguments: {} } }],
+  ];
+
+  const withLibrary = (h: Harness, fn: (api: Endpoints) => Promise<void>): Promise<void> =>
+    withServer({ ...h.deps, libraryDir: library }, fn);
+
+  it("offers its own two tools, and offers nothing at all where no library is configured", async () => {
+    const h = harness();
+    await withLibrary(h, async (api) => {
+      await readTurn(api.stream, h, { text: "cho toi nghe nhac" }, () => {});
+      assert.deepEqual(
+        (h.toolSets[0] ?? []).map((tool) => tool.function.name),
+        ["platform.list_music", "platform.play_music"],
+        "the platform's own, named so that a reader can see which party answers them"
+      );
+    });
+
+    // The deployment before this existed: nothing configured, nothing offered, and a turn asked
+    // exactly as it was.
+    const bare = harness();
+    await withServer({ ...bare.deps, libraryDir: "" }, async (api) => {
+      await readTurn(api.stream, bare, { text: "cho toi nghe nhac" }, () => {});
+      assert.equal(bare.toolSets[0], undefined, "no library, no tools, no change");
+    });
+  });
+
+  it("answers its own call in place, rather than pushing it out to whoever is on the connection", async () => {
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [[], ["Đang phát bài đó cho bạn nhé."]],
+      toolCallRounds: asksForTrack("Diem Xua"),
+    });
+
+    await withLibrary(h, async (api) => {
+      const seen: string[] = [];
+      await readTurn(api.stream, h, { text: "mo bai Diem Xua" }, (event) => {
+        seen.push(event);
+      });
+
+      assert.ok(
+        !seen.includes("tool_call"),
+        "a call the platform answers itself is not announced to a client, and nothing is waited on"
+      );
+      assert.match(h.prompts[1] ?? "", /playing Diem Xua/, "and the model is told what it got");
+      assert.equal(h.prompts.length, 2, "in the same two rounds a client's own tool would take");
+    });
+  });
+
+  it("answers the shelf with the names a person would ask the tracks for by", async () => {
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [[], ["Mình có mấy bài này nhé."]],
+      toolCallRounds: asksForShelf(),
+    });
+
+    await withLibrary(h, async (api) => {
+      await readTurn(api.stream, h, { text: "co nhung bai gi" }, () => {});
+
+      assert.match(h.prompts[1] ?? "", /Diem Xua/);
+      assert.match(h.prompts[1] ?? "", /Back in Black/);
+      assert.ok(
+        !/\.mp3/.test(h.prompts[1] ?? ""),
+        "the names and not the file names: what a person would ask for"
+      );
+    });
+  });
+
+  it("plays the track after the reply's last sentence, and before the turn is reported ended", async () => {
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [["Một câu."], ["Đang phát nhé."]],
+      toolCallRounds: asksForTrack("Diem Xua"),
+    });
+
+    await withLibrary(h, async (api) => {
+      const seen: Array<{ event: string; data: Record<string, unknown> }> = [];
+      await readTurn(api.stream, h, { text: "mo bai Diem Xua" }, (event, data) => {
+        seen.push({ event, data });
+      });
+
+      const names = seen.map((entry) => entry.event);
+      const at = names.indexOf("music");
+      assert.ok(at > 0, "the turn told the client to play a track");
+      assert.equal(
+        names[at - 1],
+        "sentence",
+        "after the reply's sentences, because those belong to the speech that is already playing"
+      );
+      assert.equal(names[at + 1], "done", "and before the client is told the turn is over");
+
+      const sentences = seen.filter((entry) => entry.event === "sentence");
+      assert.equal(
+        seen[at]!.data.index,
+        (sentences[sentences.length - 1]!.data.index as number) + 1,
+        "at the index one past the reply's last chunk, so the queue keeps the two in order"
+      );
+      assert.equal(seen[at]!.data.title, "Diem Xua", "named once, for the whole of it");
+      assert.match(
+        String(seen[at]!.data.url),
+        /^\/audio\/music-route-[^/]+\/Diem%20Xua\.mp3$/,
+        "and fetched from the mount that wears the API's credential"
+      );
+    });
+  });
+
+  it("reports a name the library does not hold, rather than playing the nearest track", async () => {
+    // The whole of what the platform does not do: it does not fold, does not score a run of words,
+    // and does not settle between files. `Diem` is not a name the shelf reported.
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [[], ["Mình không có bài đó."]],
+      toolCallRounds: asksForTrack("Diem"),
+    });
+
+    await withLibrary(h, async (api) => {
+      const seen: string[] = [];
+      await readTurn(api.stream, h, { text: "mo bai Diem" }, (event) => {
+        seen.push(event);
+      });
+
+      assert.match(h.prompts[1] ?? "", /holds no track called Diem/, "the model is told why");
+      assert.ok(!seen.includes("music"), "and nothing is played");
+    });
+  });
+
+  it("names a track nothing can serve as a failure, rather than offering a URL that resolves to nothing", async () => {
+    // The library is configured somewhere the mount does not serve, which is the one failure that
+    // would otherwise be silent and total: every name offered, every URL a 404.
+    const outside = await mkdtemp(join(tmpdir(), "music-outside-"));
+    made.push(outside);
+    await writeFile(join(outside, "Somewhere Else.mp3"), Buffer.from("RIFF0000WAVEfmt "));
+
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [[], ["Xin lỗi, mình chưa phát được."]],
+      toolCallRounds: asksForShelf(),
+    });
+
+    await withServer({ ...h.deps, libraryDir: outside }, async (api) => {
+      await readTurn(api.stream, h, { text: "co nhung bai gi" }, () => {});
+      assert.match(h.prompts[1] ?? "", /not inside the audio root/);
     });
   });
 });

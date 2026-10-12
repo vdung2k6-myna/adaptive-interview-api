@@ -100,6 +100,26 @@ export interface AppConfig {
     scoreFloor: number;
   };
   /**
+   * The tracks this deployment can be asked to play, and nothing else about them.
+   *
+   * Empty is the absent case and not a degraded one: with no directory the platform offers the
+   * model no music tool and sends no track, so a turn is asked exactly as it was before this
+   * existed. A shipped non-empty default would point every deployment at a directory that exists
+   * on none of them.
+   *
+   * The tracks are served by the audio mount, which wears the API's credential — so the directory
+   * has to be **inside the audio root**, and one configured anywhere else has no URL at all. That
+   * is reported at boot and the library is not offered, rather than taking the platform down over a
+   * music directory: a service whose subject is interviews still has interviews to serve.
+   *
+   * The files are the deployment's own. What may be played is theirs to answer for, and this
+   * service ships no music and grants no rights to any.
+   */
+  music: {
+    /** The directory the tracks are in, or empty for a deployment with no music. */
+    libraryDir: string;
+  };
+  /**
    * What a turn may ask a gadget to do, and how long it waits to hear that it was done.
    *
    * Both are bounds rather than preferences. The wait keeps a turn that asked for something

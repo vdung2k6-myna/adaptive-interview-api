@@ -5,7 +5,13 @@ import { mkdtemp, writeFile, rm } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { buildVoiceAgentPrompt, trimVoiceAgentHistory, type VoiceAgentMessage } from "@/lib/prompts";
-import { generateChatResponse, generateChatResponseStream, parseGadgetTools } from "@/lib/ollama";
+import {
+  generateChatResponse,
+  generateChatResponseStream,
+  parseGadgetTools,
+  type OllamaTool,
+  type OllamaToolCall,
+} from "@/lib/ollama";
 import { OllamaError } from "@/lib/errors";
 import { searchKnowledge, type KnowledgeChunk, type KnowledgeSearch, type KnowledgeSearchOutcome } from "@/lib/knowledge";
 import { MATERIAL_LOCATOR_TOP_K, resolveMaterialReply, selectMaterialHit } from "@/lib/material";
@@ -14,6 +20,7 @@ import { createPrefetchStore, DEFAULT_PREFETCH_TOP_K, type PrefetchStore } from 
 import { createSessionKnowledge, type SessionKnowledge } from "@/lib/session-knowledge";
 import { createToolCallStore, type ToolCallOutcome, type ToolCallStore } from "@/lib/tool-calls";
 import { resolveCollections } from "@/lib/topics";
+import { readLibrary, trackNamed, type Track } from "@/lib/music";
 import config from "@/lib/config";
 import {
   transcribeAudio,
@@ -30,6 +37,16 @@ import {
 const upload = multer({ storage: multer.memoryStorage() });
 
 /**
+ * The two tools this platform answers itself, named under a prefix of its own.
+ *
+ * The prefix is not decoration: the model is handed one list in which every entry is answered by a
+ * different party, and the name is the only thing that says which — `self.*` is the gadget's,
+ * `bridge.*` the bridge's, and these are the server's own.
+ */
+const LIST_MUSIC_TOOL = "platform.list_music";
+const PLAY_MUSIC_TOOL = "platform.play_music";
+
+/**
  * The collaborators this router calls out to, as parameters that default to the
  * real implementations. The route's own logic — which query it builds, which
  * scope it sends, which chunks reach the prompt — is then driven from a test
@@ -41,6 +58,15 @@ export interface VoiceAgentDeps {
   generateChatResponseStream: typeof generateChatResponseStream;
   generateChatResponse: typeof generateChatResponse;
   synthesizeSpeechWithFallback: typeof synthesizeSpeechWithFallback;
+  /**
+   * Where this deployment's music library is, or empty for one that has none.
+   *
+   * Injected rather than read from config where it is used, for the reason the four above are
+   * (D10): a test can then offer a library of its own, and `config` is read once at import, so a
+   * route that reached for it could only ever be tested against whatever the machine happened to
+   * have configured. The default below is that same config value.
+   */
+  libraryDir: string;
 }
 
 export function createVoiceAgentRouter(overrides: Partial<VoiceAgentDeps> = {}): Router {
@@ -50,6 +76,7 @@ export function createVoiceAgentRouter(overrides: Partial<VoiceAgentDeps> = {}):
     generateChatResponseStream,
     generateChatResponse,
     synthesizeSpeechWithFallback,
+    libraryDir: config.music.libraryDir,
     ...overrides,
   };
 
@@ -271,6 +298,49 @@ async function handleStream(
     const gadgetTools = parseGadgetTools(
       typeof req.body.tools === "string" ? req.body.tools : undefined
     );
+    // The tools this platform answers itself, offered only where the deployment holds music.
+    //
+    // Unlike a gadget's, these are **not** pushed out to whoever is on the connection: the library
+    // is this service's, so there is nobody else to answer for it, and a round trip to a page and
+    // back would be a trip for data the platform already has in hand. The prefix is the model's
+    // own way of seeing which party answers a name — `self.*` the gadget's, `bridge.*` the
+    // bridge's, these the platform's, which is the one list where every answer comes from the
+    // server the model is talking to.
+    const platformTools: OllamaTool[] =
+      deps.libraryDir === ""
+        ? []
+        : [
+            {
+              type: "function",
+              function: {
+                name: LIST_MUSIC_TOOL,
+                description:
+                  "List the tracks this platform can play. Use it when the person asked for a " +
+                  "track and what came back may not be what its file is called — a title spoken " +
+                  "in another language, or a name the transcriber heard wrongly — and then ask " +
+                  `for one of the names it answers with, using ${PLAY_MUSIC_TOOL}.`,
+                parameters: { type: "object", properties: {} },
+              },
+            },
+            {
+              type: "function",
+              function: {
+                name: PLAY_MUSIC_TOOL,
+                description:
+                  "Play one track from this platform's library through the person's own client. " +
+                  "The name must be one the library reported; call " +
+                  `${LIST_MUSIC_TOOL} first when you are not certain of it.`,
+                parameters: {
+                  type: "object",
+                  properties: {
+                    name: { type: "string", description: "The track's name, as the library reported it." },
+                  },
+                  required: ["name"],
+                },
+              },
+            },
+          ];
+    const tools: OllamaTool[] = [...gadgetTools, ...platformTools];
     const audioFile = req.file;
     const textInput = typeof req.body.text === "string" ? req.body.text.trim() : "";
     // A client that will not play this turn's audio says so up front. The turn is
@@ -563,6 +633,16 @@ async function handleStream(
 
     let tokenCount = 0;
     let finalText: string;
+    // The track the model asked for, if it did. Declared out here because the turn it belongs to
+    // ends outside the branch that asks the model: the event is sent after the reply's last
+    // sentence, which is past the end of that branch.
+    //
+    // A box rather than a bare `let`: it is written from inside the closure below and read at the
+    // tail, and a `let` written only from a closure reads to the type checker as never written —
+    // which would leave the tail unable to see a track at all, rather than unable to see one it
+    // might not have. `null` is every turn on a deployment with no library, and every turn whose
+    // model asked for nothing.
+    const wanted: { track: Track | null } = { track: null };
 
     try {
       if (material?.ok) {
@@ -590,7 +670,7 @@ async function handleStream(
           knowledgeChunks.length ? knowledgeChunks : undefined,
           // The model is told what it may call, so it is told when to — and a turn with no
           // catalogue is asked exactly as it was before any of this existed.
-          gadgetTools.length > 0
+          tools.length > 0
         );
 
         // A turn asks, and may be answered with a call rather than with words. The call is made
@@ -603,9 +683,41 @@ async function handleStream(
         // is under the limit, so the round after the last permitted call is asked **without**
         // tools and can only answer in words. A model that keeps asking therefore still ends
         // the turn in speech rather than in silence (design.md, "Rounds are bounded").
+
+        /**
+         * Answer a call that names a tool of this platform's own, or `null` for one that belongs to
+         * the client which declared it.
+         *
+         * Both kinds are answered in the same round and carried back to the model in one message
+         * list, so a turn that asked for both is not serialised into two.
+         */
+        async function answerHere(call: OllamaToolCall): Promise<ToolCallOutcome | null> {
+          const name = call.function.name;
+          if (name !== LIST_MUSIC_TOOL && name !== PLAY_MUSIC_TOOL) return null;
+
+          const library = await readLibrary(deps.libraryDir);
+          if (name === LIST_MUSIC_TOOL) {
+            if (!library.ok) return { ok: false, message: library.detail };
+            return {
+              ok: true,
+              text:
+                "the tracks this platform holds:\n" +
+                library.tracks.map((track) => track.title).join("\n"),
+            };
+          }
+
+          const named = call.function.arguments["name"];
+          const found = trackNamed(library, typeof named === "string" ? named : "");
+          if (!found.ok) return { ok: false, message: found.detail };
+          // Held rather than played: the sentences still to be spoken belong to the reply this call
+          // is inside, and a track is minutes. See where the event is sent.
+          wanted.track = found.track;
+          return { ok: true, text: `playing ${found.track.title}` };
+        }
+
         let rounds = 0;
         while (true) {
-          const mayCall = gadgetTools.length > 0 && rounds < config.toolCalls.maxRounds;
+          const mayCall = tools.length > 0 && rounds < config.toolCalls.maxRounds;
 
           const { stream: llmStream, getFullText, getToolCalls } = deps.generateChatResponseStream({
             messages: prompt,
@@ -613,7 +725,7 @@ async function handleStream(
             repeat_penalty: 1.2,
             // What this gadget reported it can be asked to do. Absent for a turn that carries
             // none, so a browser turn — and every turn before this existed — asks as it did.
-            ...(mayCall ? { tools: gadgetTools } : {}),
+            ...(mayCall ? { tools } : {}),
           });
 
         const reader = llmStream.getReader();
@@ -663,13 +775,21 @@ async function handleStream(
 
         if (calls.length === 0) break;
 
+        // A call this platform answers itself is answered here, and every other call goes out to
+        // the client that declared it, exactly as it always has.
+        const answeredHere = await Promise.all(calls.map((call) => answerHere(call)));
+
         // One turn id for the round and one hold per call: a model may ask for two things at
         // once, and each is answered on its own. Every hold is opened *before* the event that
         // carries its id, so a bridge that reports back at once is not writing into a hold that
         // does not exist yet — which is the whole reason the store is not a bare map
-        // (`lib/tool-calls.ts`).
+        // (`lib/tool-calls.ts`). A call already answered leaves no hold, because nothing is waiting
+        // for it: the difference between the two kinds is exactly that one of them has someone to
+        // answer.
         const turnId = randomUUID();
-        const holds = calls.map((call, index) => {
+        const holds = new Map<number, ReturnType<typeof toolCalls.open>>();
+        calls.forEach((call, index) => {
+          if (answeredHere[index] !== null) return;
           const hold = toolCalls.open(`${turnId}:${index}`, config.toolCalls.timeoutMs);
           console.log(
             `[VoiceAgent] the model asked for ${call.function.name}(${JSON.stringify(call.function.arguments)}) ` +
@@ -681,7 +801,7 @@ async function handleStream(
             name: call.function.name,
             arguments: call.function.arguments,
           });
-          return hold;
+          holds.set(index, hold);
         });
 
         // The wait is against the client as well as the clock. The bridge answers a command the
@@ -689,8 +809,12 @@ async function handleStream(
         // while it sits here — and a turn nobody is reading is not one to spend the whole wait on.
         // The hold that loses the race is left to time out on its own, and what it settles into
         // is never read.
-        const outcomes = await Promise.all(
-          holds.map((hold) => untilCancelled(hold, abortController.signal))
+        const outcomes: ToolCallOutcome[] = await Promise.all(
+          calls.map((_, index) => {
+            const here = answeredHere[index];
+            if (here !== null && here !== undefined) return here;
+            return untilCancelled(holds.get(index)!, abortController.signal);
+          })
         );
 
         // Logged before the cancellation is acted on, so that an operator reading this log sees
@@ -734,6 +858,24 @@ async function handleStream(
       // Before `done`, so the client is never told the turn ended while audio
       // for it is still arriving (D1).
       await sentenceStream.flush();
+
+      // The track, after every sentence of the reply has been sent and before `done` — the same
+      // place this route already refuses to end a turn early, and the same ordering the bridge
+      // reaches by deferring a track to the end of its turn. A track is minutes of audio, and the
+      // sentences still to be spoken belong to the reply it follows.
+      //
+      // Its index is one past the reply's last sentence, which is the only way the client's queue
+      // can keep the reply and the track in the order they are meant to be heard: the queue plays
+      // by index, and an item placed by any other rule would be placed by whichever callback ran
+      // last. The turn is still reported as ended before the track has played — holding it is the
+      // client's queue's own work, which is what that queue is for.
+      if (wanted.track !== null && !abortController.signal.aborted) {
+        sendSseEvent(res, "music", {
+          index: sentenceStream.nextChunkIndex,
+          url: wanted.track.url,
+          title: wanted.track.title,
+        });
+      }
 
       console.log(
         material?.ok

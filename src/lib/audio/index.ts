@@ -21,6 +21,8 @@ export {
   audioExists,
   deleteAudio,
   urlPathToFilePath,
+  urlPathForFile,
+  AUDIO_ROOT,
   detectAudioFormat,
   sweepStaleSegments,
   SEGMENT_MARKER,

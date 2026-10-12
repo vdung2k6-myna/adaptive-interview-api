@@ -114,6 +114,18 @@ export class SentenceStream {
 
   constructor(private readonly options: SentenceStreamOptions) {}
 
+  /**
+   * The index the next chunk will be given.
+   *
+   * Read by a caller that has something of its own to place in the same sequence — a track, which
+   * is played after the reply it belongs to — so that a client's queue keeps the two in the order
+   * they are meant to be heard rather than in the order two callbacks happened to fire. This is
+   * the only thing that assigns these indices, so asking is the only way to know the next one.
+   */
+  get nextChunkIndex(): number {
+    return this.nextIndex;
+  }
+
   /** True once the caller's signal says the client is gone (D5). */
   private get aborted(): boolean {
     return this.options.signal?.aborted === true;

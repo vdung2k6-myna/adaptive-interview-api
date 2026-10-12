@@ -2,13 +2,35 @@ import "dotenv/config";
 
 import { createApp } from "./app";
 import { unavailableConfiguredVoices } from "./lib/audio/voice-catalog";
+import { libraryComplaint } from "./lib/music";
+import config from "./lib/config";
 
 const PORT = process.env.PORT || 4000;
 
 createApp().listen(PORT, () => {
   console.log(`Adaptive Interview API listening on port ${PORT}`);
   void reportUnavailableVoices();
+  void reportMusicLibrary();
 });
+
+/**
+ * Report a music library this deployment cannot serve, once, at boot.
+ *
+ * The two ways it can fail are both silent otherwise. A directory that is not there is "no music"
+ * to a turn, which is indistinguishable from a deployment that configured none; and a directory
+ * outside the audio root has no URL a client could fetch, because the mount is the only thing that
+ * serves these and it serves one directory — so a track in it would be a name that plays silence.
+ *
+ * Reported and not thrown, for the reason the voice check is: this service's subject is interviews,
+ * and a music directory is not a reason to refuse to serve them. A deployment with no library
+ * configured has nothing to report.
+ */
+async function reportMusicLibrary(): Promise<void> {
+  const complaint = await libraryComplaint(config.music.libraryDir);
+  if (complaint !== null) {
+    console.warn(`[Music] ${complaint} — no music will be offered to the model.`);
+  }
+}
 
 /**
  * Report any configured Supertonic voice the synthesis service does not hold.

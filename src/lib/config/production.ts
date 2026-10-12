@@ -87,6 +87,12 @@ export const productionConfig: AppConfig = {
     // require choosing a floor in the same change.
     scoreFloor: parseUnitInterval(process.env.MATERIAL_SCORE_FLOOR, 0.55),
   },
+  music: {
+    // Same as development, and deliberately not a second opinion: whether this deployment has a
+    // music library is a fact about the deployment, not about which environment it runs in. See
+    // development.ts, and `AppConfig.music` for the two things it must be.
+    libraryDir: (process.env.MUSIC_LIBRARY_DIR || "").trim(),
+  },
   toolCalls: {
     // Same as development, and deliberately not a second opinion: the wait is spent by a person
     // listening to silence, which a deployment does not make shorter. See development.ts.
