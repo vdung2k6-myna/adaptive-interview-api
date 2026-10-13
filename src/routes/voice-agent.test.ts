@@ -8,7 +8,7 @@ import { DEFAULT_PREFETCH_TOP_K } from "../lib/prefetch";
 import type { KnowledgeChunk, KnowledgeSearchOutcome, SearchOptions } from "../lib/knowledge";
 import { SentenceExtractor } from "../lib/audio/sentence-extractor";
 import { AUDIO_ROOT } from "../lib/audio/storage";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -111,7 +111,6 @@ function harness(
   const synthCalls: string[] = [];
   const transcribeCalls: Array<{ language: string | undefined }> = [];
   const tokens = settings.stream ?? [];
-  const fullText = settings.fullText ?? tokens.join("");
   // Which model round the stub is answering, so one turn's rounds can be scripted apart.
   let modelRounds = 0;
 
@@ -513,7 +512,7 @@ describe("POST /api/voice-agent/stream — the gadget's own tools", () => {
   it("stops a model that keeps asking at the bound, and the turn still ends in speech", async () => {
     const h = harness({ ok: true, chunks: [] }, {
       // A call for every round, so the bound is what stops it rather than the model.
-      streamRounds: [[], [], ["Đã chỉnh xong rồi ạ."]],
+      streamRounds: [[], [], [], ["Đã chỉnh xong rồi ạ."]],
       toolCallRounds: [asksForVolume(30), asksForVolume(40), asksForVolume(50)],
     });
 
@@ -530,10 +529,10 @@ describe("POST /api/voice-agent/stream — the gadget's own tools", () => {
         });
       });
 
-      assert.equal(answered, 2, "the model may make the bounded number of calls and no more");
-      assert.equal(h.toolSets.length, 3, "and the round after the last one is still asked");
+      assert.equal(answered, 3, "the model may make the bounded number of calls and no more");
+      assert.equal(h.toolSets.length, 4, "and the round after the last one is still asked");
       assert.equal(
-        h.toolSets[2],
+        h.toolSets[3],
         undefined,
         "asked without tools, so that round can only answer in words — which is what ends the turn in speech rather than in silence"
       );
@@ -1937,13 +1936,21 @@ describe("POST /api/voice-agent/stream — the platform's own music", () => {
     for (const dir of made) await rm(dir, { recursive: true, force: true });
   });
 
-  /** A model that asks for one track by name, in the round it is given tools. */
-  const asksForTrack = (name: string): OllamaToolCall[][] => [
-    [{ function: { name: "platform.play_music", arguments: { name } } }],
+  /** A model that asks for one track by its number on the shelf, in the round it is given tools. */
+  const asksForTrack = (index: number | string): OllamaToolCall[][] => [
+    [{ function: { name: "platform.play_music", arguments: { index } } }],
   ];
   /** A model that asks what the library holds. */
   const asksForShelf = (): OllamaToolCall[][] => [
     [{ function: { name: "platform.list_music", arguments: {} } }],
+  ];
+  /**
+   * The one request a track takes, as the two calls it is answered in: the shelf, and then a number
+   * on it. A model that makes only the second call has a number nothing can answer (design D4).
+   */
+  const shelfThenTrack = (index: number | string): OllamaToolCall[][] => [
+    ...asksForShelf(),
+    ...asksForTrack(index),
   ];
 
   const withLibrary = (h: Harness, fn: (api: Endpoints) => Promise<void>): Promise<void> =>
@@ -1958,6 +1965,20 @@ describe("POST /api/voice-agent/stream — the platform's own music", () => {
         ["platform.list_music", "platform.play_music"],
         "the platform's own, named so that a reader can see which party answers them"
       );
+
+      // What a track is asked for *by*, which is the whole of what makes this interface workable on
+      // a model that will not reproduce a name: a number, and nothing else (design D4).
+      const play = (h.toolSets[0] ?? []).find((tool) => tool.function.name === "platform.play_music");
+      const schema = play?.function.parameters as {
+        properties?: Record<string, unknown>;
+        required?: string[];
+      };
+      assert.deepEqual(
+        Object.keys(schema.properties ?? {}),
+        ["index"],
+        "a number on the shelf, and not a name — a name is what the model believes it knows"
+      );
+      assert.deepEqual(schema.required, ["index"], "and it is the only thing a track is asked for by");
     });
 
     // The deployment before this existed: nothing configured, nothing offered, and a turn asked
@@ -1971,8 +1992,8 @@ describe("POST /api/voice-agent/stream — the platform's own music", () => {
 
   it("answers its own call in place, rather than pushing it out to whoever is on the connection", async () => {
     const h = harness({ ok: true, chunks: [] }, {
-      streamRounds: [[], ["Đang phát bài đó cho bạn nhé."]],
-      toolCallRounds: asksForTrack("Diem Xua"),
+      streamRounds: [[], [], ["Đang phát bài đó cho bạn nhé."]],
+      toolCallRounds: shelfThenTrack(1),
     });
 
     await withLibrary(h, async (api) => {
@@ -1985,12 +2006,16 @@ describe("POST /api/voice-agent/stream — the platform's own music", () => {
         !seen.includes("tool_call"),
         "a call the platform answers itself is not announced to a client, and nothing is waited on"
       );
-      assert.match(h.prompts[1] ?? "", /playing Diem Xua/, "and the model is told what it got");
-      assert.equal(h.prompts.length, 2, "in the same two rounds a client's own tool would take");
+      assert.match(h.prompts[2] ?? "", /playing /, "and the model is told what it got");
+      assert.equal(
+        h.prompts.length,
+        3,
+        "in the three rounds one request for a track takes: the shelf, the number, and the reply"
+      );
     });
   });
 
-  it("answers the shelf with the names a person would ask the tracks for by", async () => {
+  it("answers the shelf as numbered tracks, named as the library holds them", async () => {
     const h = harness({ ok: true, chunks: [] }, {
       streamRounds: [[], ["Mình có mấy bài này nhé."]],
       toolCallRounds: asksForShelf(),
@@ -1999,19 +2024,30 @@ describe("POST /api/voice-agent/stream — the platform's own music", () => {
     await withLibrary(h, async (api) => {
       await readTurn(api.stream, h, { text: "co nhung bai gi" }, () => {});
 
-      assert.match(h.prompts[1] ?? "", /Diem Xua/);
-      assert.match(h.prompts[1] ?? "", /Back in Black/);
+      const shelf = (h.prompts[1] ?? "")
+        .split("\n")
+        .filter((line) => /^\d+\. /.test(line));
+      assert.equal(shelf.length, 2, "every track in the library carries its own number");
+      assert.ok(
+        shelf.every((line, at) => line.startsWith(`${at + 1}. `)),
+        "numbered from one, in the order the shelf is held — which is what a number answers against"
+      );
+      assert.deepEqual(
+        shelf.map((line) => line.replace(/^\d+\. /, "")).sort(),
+        ["Back in Black", "Diem Xua"],
+        "named as the library holds them"
+      );
       assert.ok(
         !/\.mp3/.test(h.prompts[1] ?? ""),
-        "the names and not the file names: what a person would ask for"
+        "the names and not the file names: this service invents no name of its own"
       );
     });
   });
 
   it("plays the track after the reply's last sentence, and before the turn is reported ended", async () => {
     const h = harness({ ok: true, chunks: [] }, {
-      streamRounds: [["Một câu."], ["Đang phát nhé."]],
-      toolCallRounds: asksForTrack("Diem Xua"),
+      streamRounds: [["Một câu."], [], ["Đang phát nhé."]],
+      toolCallRounds: shelfThenTrack(1),
     });
 
     await withLibrary(h, async (api) => {
@@ -2036,31 +2072,141 @@ describe("POST /api/voice-agent/stream — the platform's own music", () => {
         (sentences[sentences.length - 1]!.data.index as number) + 1,
         "at the index one past the reply's last chunk, so the queue keeps the two in order"
       );
-      assert.equal(seen[at]!.data.title, "Diem Xua", "named once, for the whole of it");
+
+      // The track the shelf's first line named, whichever of the two the reading put there: the
+      // number is what was answered, so the two have to agree rather than the test assuming an order.
+      const first = /^\d+\. (.+)$/m.exec(h.prompts[1] ?? "")?.[1];
+      assert.ok(first, "the model was given a shelf to choose from");
+      assert.equal(seen[at]!.data.title, first, "the track at that number, and not another");
+      const url = String(seen[at]!.data.url);
       assert.match(
-        String(seen[at]!.data.url),
-        /^\/audio\/music-route-[^/]+\/Diem%20Xua\.mp3$/,
+        url,
+        /^\/audio\/music-route-[^/]+\/[^/]+\.mp3$/,
         "and fetched from the mount that wears the API's credential"
       );
+      assert.equal(decodeURIComponent(url.split("/").pop()!), `${first}.mp3`, "which is that track's file");
     });
   });
 
-  it("reports a name the library does not hold, rather than playing the nearest track", async () => {
+  it("reports a number the shelf does not hold, rather than playing the nearest track", async () => {
     // The whole of what the platform does not do: it does not fold, does not score a run of words,
-    // and does not settle between files. `Diem` is not a name the shelf reported.
+    // and does not settle between files. There is no second track to reach for (design D4).
     const h = harness({ ok: true, chunks: [] }, {
-      streamRounds: [[], ["Mình không có bài đó."]],
-      toolCallRounds: asksForTrack("Diem"),
+      streamRounds: [[], [], ["Mình không có bài đó."]],
+      toolCallRounds: shelfThenTrack(99),
     });
 
     await withLibrary(h, async (api) => {
       const seen: string[] = [];
-      await readTurn(api.stream, h, { text: "mo bai Diem" }, (event) => {
+      await readTurn(api.stream, h, { text: "mo bai so 99" }, (event) => {
         seen.push(event);
       });
 
-      assert.match(h.prompts[1] ?? "", /holds no track called Diem/, "the model is told why");
+      assert.match(h.prompts[2] ?? "", /the shelf holds 2 track\(s\)/, "the model is told why");
       assert.ok(!seen.includes("music"), "and nothing is played");
+    });
+  });
+
+  it("tells a model that asks for a track first to take the shelf, and names the tool that offers one", async () => {
+    // The structural guard: a number means something only against a shelf, so one asked for without
+    // a shelf is a failure the model can correct rather than a track chosen by accident (design D4).
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [[], ["Mình xem qua đã nhé."]],
+      toolCallRounds: asksForTrack(1),
+    });
+
+    await withLibrary(h, async (api) => {
+      const seen: string[] = [];
+      await readTurn(api.stream, h, { text: "mo bai so 1" }, (event) => {
+        seen.push(event);
+      });
+
+      assert.match(h.prompts[1] ?? "", /no shelf of this library has been taken/, "the model is told what it is missing");
+      assert.match(h.prompts[1] ?? "", /platform\.list_music/, "and told by name how to get it");
+      assert.ok(!seen.includes("music"), "and nothing is played in the meantime");
+    });
+  });
+
+  it("answers a number handed back as text as the number it is", async () => {
+    // A model may write a number into a string field. It is the same number, and refusing it would
+    // cost the person a turn for nothing (design D4).
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [[], [], ["Đang phát nhé."]],
+      toolCallRounds: shelfThenTrack("1"),
+    });
+
+    await withLibrary(h, async (api) => {
+      const seen: string[] = [];
+      await readTurn(api.stream, h, { text: "mo bai so 1" }, (event) => {
+        seen.push(event);
+      });
+
+      assert.ok(seen.includes("music"), "the track plays: it was a number, written as text");
+    });
+  });
+
+  it("reads a number against the shelf this turn offered, and not against a fresh reading", async () => {
+    // The directory is allowed to change while the platform runs, so a second reading can order the
+    // same tracks differently, or hold more of them. The number is answered against the shelf the
+    // model was given: a track that arrived after it was taken is not one the model saw (design D4).
+    const dir = await mkdtemp(join(AUDIO_ROOT, "music-held-"));
+    made.push(dir);
+    await writeFile(join(dir, "First.mp3"), Buffer.from("RIFF0000WAVEfmt "));
+    await writeFile(join(dir, "Second.mp3"), Buffer.from("RIFF0000WAVEfmt "));
+
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [["Một câu."], ["Một câu nữa."], ["Xin lỗi nhé."]],
+      toolCallRounds: shelfThenTrack(3),
+      synthesize: async () => {
+        // Written during the round *after* the shelf was taken, which is the only moment that tells
+        // a held shelf from a fresh reading. Rounds are what `toolSets` counts.
+        if (h.toolSets.length >= 2) {
+          await writeFile(join(dir, "Third.mp3"), Buffer.from("RIFF0000WAVEfmt "));
+        }
+        return Buffer.alloc(0);
+      },
+    });
+
+    await withServer({ ...h.deps, libraryDir: dir }, async (api) => {
+      const seen: string[] = [];
+      await readTurn(api.stream, h, { text: "mo bai so 3" }, (event) => {
+        seen.push(event);
+      });
+
+      assert.match(
+        h.prompts[2] ?? "",
+        /the shelf holds 2 track\(s\)/,
+        "the shelf the model was offered, and not the three the directory holds by now"
+      );
+      assert.ok(!seen.includes("music"), "so a number past that shelf plays nothing");
+      // Without this the case above would pass on a directory that never grew, which would prove
+      // nothing: the third track has to be there for a fresh reading to have answered with it.
+      assert.equal(
+        (await readdir(dir)).length,
+        3,
+        "the directory did grow after the shelf was taken — so a fresh reading would have held it"
+      );
+    });
+  });
+
+  it("does not settle a shelf and a track asked for in the same round", async () => {
+    // A model may ask for both in one message. Answering those in the order it wrote them would
+    // settle a number against a shelf it has not been shown yet — a guess, taken as an answer. Both
+    // are answered, the track one fails, and the shelf that round took is there for the next (D4).
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [[], [], ["Được, mình mở nhé."]],
+      toolCallRounds: [[...asksForShelf()[0]!, ...asksForTrack(1)[0]!], ...asksForTrack(1)],
+    });
+
+    await withLibrary(h, async (api) => {
+      const seen: string[] = [];
+      await readTurn(api.stream, h, { text: "mo bai so 1" }, (event) => {
+        seen.push(event);
+      });
+
+      assert.match(h.prompts[1] ?? "", /no shelf of this library has been taken/, "the guess is refused");
+      assert.match(h.prompts[1] ?? "", /1\. /, "and the shelf it took is in the same answer");
+      assert.ok(seen.includes("music"), "while the round after it, which has the shelf, plays the track");
     });
   });
 
