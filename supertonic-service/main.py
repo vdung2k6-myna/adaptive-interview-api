@@ -104,6 +104,108 @@ def ensure_styles() -> None:
         refresh_styles()
 
 
+# The characters this product's content actually meets that the model refuses,
+# and the words to say instead. Dropping one of these would change what was
+# said — "≥140mmHg" read as "140mmHg" is a different claim about a blood
+# pressure — so each gets a reading. Measured against the deployed model, these
+# are the characters `validate_text` rejects among those the corpus uses.
+#
+# The two typographic marks have no reading: a dagger and a currency placeholder
+# are not spoken, and an unread symbol costs a symbol where a refused character
+# costs the whole utterance.
+_CHARACTER_READINGS: dict[str, str] = {
+    "≥": "lớn hơn hoặc bằng",  # ≥
+    "≤": "nhỏ hơn hoặc bằng",  # ≤
+    "‰": "phần nghìn",  # ‰
+    "↔": "đến",  # ↔
+    "₫": "đồng",  # ₫
+    "‡": "",  # ‡
+    "¤": "",  # ¤
+}
+
+_text_processor = None
+_processor_read = False
+
+
+def text_processor():
+    """The model's own character-set predicate, or None when it cannot be read.
+
+    The predicate is the package's ``UnicodeProcessor``, the same one the model
+    validates with, so what it reports is what the model will refuse — including
+    a character nobody anticipated. Its indexer is a JSON file rather than a
+    weight, so building it costs a file read and not a model load, which is why
+    startup can do it beside the style scan (see ``lifespan``).
+    """
+    global _text_processor, _processor_read
+
+    if _processor_read:
+        return _text_processor
+
+    try:
+        from supertonic import DEFAULT_MODEL
+        from supertonic.config import UNICODE_INDEXER_REL_PATH
+        from supertonic.core import UnicodeProcessor
+        from supertonic.loader import get_cache_dir
+
+        indexer = get_cache_dir(DEFAULT_MODEL) / UNICODE_INDEXER_REL_PATH
+        _text_processor = UnicodeProcessor(str(indexer)) if indexer.is_file() else None
+    except Exception as exc:  # noqa: BLE001 - a missing set must not stop the service
+        print(
+            f"[Supertonic] Character set unavailable ({type(exc).__name__}: {exc}); "
+            f"characters are passed through unrendered",
+            flush=True,
+        )
+        _text_processor = None
+
+    _processor_read = True
+    return _text_processor
+
+
+def speakable(text: str, processor=None) -> str:
+    """Render every character the loaded model cannot speak.
+
+    Handed a character outside its set, the model refuses the **whole**
+    utterance; the caller's retry divides the utterance, and the character sits
+    in both halves, so the sentence is lost and nothing reports it. Rendering it
+    first is what keeps a character from costing a sentence.
+
+    The set is asked of the model rather than listed here, so a character this
+    code has never seen is rendered like any other. A character with no reading
+    is dropped and logged, so the table can be extended deliberately.
+    """
+    if processor is None:
+        processor = text_processor()
+    if processor is None:
+        return text
+
+    is_valid, unsupported = processor.validate_text(text)
+    if is_valid:
+        return text
+
+    rendered = text
+    dropped: list[str] = []
+    for character in unsupported:
+        # An entry mapped to the empty string is a character considered and
+        # found unspeakable, so it takes the same path as one never seen.
+        reading = _CHARACTER_READINGS.get(character, "")
+        if reading:
+            # Spaced so the reading does not run into its neighbours: "≥140"
+            # is spoken "lớn hơn hoặc bằng 140", not "bằng140".
+            rendered = rendered.replace(character, f" {reading} ")
+        else:
+            dropped.append(character)
+            rendered = rendered.replace(character, "")
+
+    if dropped:
+        print(
+            f"[Supertonic] Dropped {len(dropped)} character(s) with no reading: "
+            f"{', '.join(f'{c!r} (U+{ord(c):04X})' for c in dropped)}",
+            flush=True,
+        )
+
+    return " ".join(rendered.split())
+
+
 def _load_model():
     global _tts
     if _tts is not None:
@@ -128,6 +230,9 @@ class SpeechRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     refresh_styles()
+    # Beside the style scan, and for the same reason: both are facts about what
+    # this deployment holds, and both are a file read rather than a model load.
+    text_processor()
     yield
 
 
@@ -159,6 +264,11 @@ async def synthesize(req: SpeechRequest):
         )
 
     tts = get_tts()
+
+    # Before the model sees the text: a character it refuses would cost the
+    # whole utterance, and the caller's retry cannot remove it. See
+    # `speakable` and the spec for interview/speech-synthesis.
+    text = speakable(text)
 
     style = _VOICE_STYLES.get(voice)
     if style is None:
