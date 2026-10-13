@@ -139,3 +139,37 @@ describe("sweepStaleSegments", () => {
     assert.deepEqual(await remaining(), [stranger]);
   });
 });
+
+describe("the media type the mount serves a file with", () => {
+  it("knows the audio containers the mount's own table does", () => {
+    // The table is `mime@1.6.0`, pinned by `send` — the same one the mount resolves through, so the
+    // library's answer and a client's served bytes cannot disagree.
+    for (const name of ["a.mp3", "a.wav", "a.flac", "a.m4a", "a.ogg", "a.aac", "a.weba", "a.aiff", "a.wma"]) {
+      assert.equal(storage.isServableAudio(name), true, `${name} is served as audio`);
+    }
+  });
+
+  it("supplies the containers its table is too old to know, and only playable ones", () => {
+    // `.opus` is a mainstream music container and the table, filled in 2017, answers
+    // `application/octet-stream` for it. The criterion for the supplement is "the table lacks it
+    // **and** a browser can play it", so a container that is neither is left out rather than offered
+    // as a track that can only ever fail to play.
+    assert.equal(storage.isServableAudio("a.opus"), true, "admitted from the supplement");
+    assert.equal(storage.isServableAudio("a.m4b"), true, "and m4b");
+    assert.equal(storage.isServableAudio("a.ape"), false, "unplayable, and so not offered");
+    assert.equal(storage.isServableAudio("a.wv"), false, "nor WavPack");
+  });
+
+  it("does not offer what is not audio", () => {
+    for (const name of ["Thumbs.db", "cover.jpg", "Nhac Phap.xspf", "a.webm", "a.mp4", "notes.txt"]) {
+      assert.equal(storage.isServableAudio(name), false, `${name} is not a track`);
+    }
+  });
+
+  it("does not offer a playlist, though its media type is audio-prefixed", () => {
+    // `audio/x-mpegurl` begins `audio/`, so a prefix test alone would put a list of tracks on the
+    // shelf where a track belongs. The exclusion is named rather than inferred from the prefix.
+    assert.equal(storage.audioMediaType("list.m3u"), "audio/x-mpegurl", "typed as audio");
+    assert.equal(storage.isServableAudio("list.m3u"), false, "and still not a track");
+  });
+});

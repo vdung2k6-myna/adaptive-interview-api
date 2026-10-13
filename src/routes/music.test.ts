@@ -97,7 +97,8 @@ describe("GET /api/music", () => {
   it("answers the tracks the deployment holds, named and addressed, in the order they are held", async () => {
     const dir = await dirUnder(AUDIO_ROOT);
     await track(join(dir, "Diem Xua.mp3"));
-    await track(join(dir, "Back in Black.mp3"));
+    await track(join(dir, "Back in Black.flac"));
+    await track(join(dir, "Mot Hai.opus"));
     await writeFile(join(dir, "notes.txt"), "not a track");
 
     await withServer({ libraryDir: dir }, async (library) => {
@@ -106,15 +107,15 @@ describe("GET /api/music", () => {
       assert.equal(answer.report, null, "there is something to play, so there is nothing to report");
       assert.deepEqual(
         answer.tracks.map((entry) => entry.title).sort(),
-        ["Back in Black", "Diem Xua"],
-        "every track the directory holds, and no file that is not one"
+        ["Back in Black", "Diem Xua", "Mot Hai"],
+        "every track the directory holds whatever container it is kept in, and no file that is not one"
       );
       for (const entry of answer.tracks) {
         assert.ok(
           entry.url.startsWith(`/audio/${dir.split(/[\\/]/).pop()}/`),
           `a URL under the mount that serves it, and not one that resolves to nothing: ${entry.url}`
         );
-        assert.ok(entry.url.endsWith(".mp3"), "and one a client can fetch");
+        assert.match(entry.url, /\.(mp3|flac|opus)$/, "and one a client can fetch");
       }
     });
   });

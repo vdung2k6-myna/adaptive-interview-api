@@ -1927,7 +1927,9 @@ describe("POST /api/voice-agent/stream — the platform's own music", () => {
   before(async () => {
     library = await mkdtemp(join(AUDIO_ROOT, "music-route-"));
     made.push(library);
-    for (const name of ["Diem Xua.mp3", "Back in Black.mp3"]) {
+    // Two containers rather than the same one twice: what the shelf offers is decided by what the
+    // mount would serve a file as, so a library of `.flac` is a library and not an empty one.
+    for (const name of ["Diem Xua.mp3", "Back in Black.flac"]) {
       await writeFile(join(library, name), Buffer.from("RIFF0000WAVEfmt "));
     }
   });
@@ -2038,7 +2040,7 @@ describe("POST /api/voice-agent/stream — the platform's own music", () => {
         "named as the library holds them"
       );
       assert.ok(
-        !/\.mp3/.test(h.prompts[1] ?? ""),
+        !/\.(mp3|flac|opus)/.test(h.prompts[1] ?? ""),
         "the names and not the file names: this service invents no name of its own"
       );
     });
@@ -2081,10 +2083,14 @@ describe("POST /api/voice-agent/stream — the platform's own music", () => {
       const url = String(seen[at]!.data.url);
       assert.match(
         url,
-        /^\/audio\/music-route-[^/]+\/[^/]+\.mp3$/,
+        /^\/audio\/music-route-[^/]+\/[^/]+\.(mp3|flac)$/,
         "and fetched from the mount that wears the API's credential"
       );
-      assert.equal(decodeURIComponent(url.split("/").pop()!), `${first}.mp3`, "which is that track's file");
+      assert.equal(
+        decodeURIComponent(url.split("/").pop()!).replace(/\.[^.]+$/, ""),
+        first,
+        "and it is that track's file, in whatever container the library keeps it in"
+      );
     });
   });
 
