@@ -39,16 +39,23 @@ moved without a migration, so the mount wears the middleware itself. `/health` i
 that answers without a credential.
 
 A turn may also be answered with music. Where `MUSIC_LIBRARY_DIR` names a directory inside
-`AUDIO_STORAGE_DIR`, the route offers the model two tools of its own — `platform.list_music` and
-`platform.play_music` — and answers them **itself** rather than pushing them out to whoever is on the
-connection: the library is this service's, so there is nobody else to answer for it. `list_music`
-answers with the tracks as a numbered shelf, and `play_music` takes the number a track carries there,
-read against the shelf that turn offered and never against a fresh reading of the directory. A track
-is asked for by a **number** and not by its name: the names are the library's own file names, and a
-model asked to reproduce one will answer with the title it knows instead. A chosen track is announced
-to the client as a `music` event (its URL, its name, and the index one past the reply's last sentence)
-after that reply's sentences and before `done`, and the client plays it from the same mount, with the
-same credential, as any other recording.
+`AUDIO_STORAGE_DIR`, **and the turn carries no device's own tools**, the route offers the model two
+tools of its own — `platform.list_music` and `platform.play_music` — and answers them **itself** rather
+than pushing them out to whoever is on the connection: the library is this service's, so there is
+nobody else to answer for it. `list_music` answers with the tracks as a numbered shelf, and
+`play_music` takes the number a track carries there, read against the shelf that turn offered and never
+against a fresh reading of the directory. A track is asked for by a **number** and not by its name: the
+names are the library's own file names, and a model asked to reproduce one will answer with the title
+it knows instead. A chosen track is announced to the client as a `music` event (its URL, its name, and
+the index one past the reply's last sentence) after that reply's sentences and before `done`, and the
+client plays it from the same mount, with the same credential, as any other recording.
+
+The device turn is the exception, and the reason is that event's own client. A `music` event is read by
+whoever made the request, and the caller that carries a device's tools is a bridge — which does not
+model `music` and drops it, deliberately, as it drops any event it does not know. A track announced
+there would therefore be heard nowhere, while the model was told it was playing. The bridge offers a
+music tool of its own for the device's own speaker, and that is the one that reaches it, so the
+platform's two are withheld rather than offered and refused.
 
 `GET /api/music` answers that same reading to the client, for a person who wants to see what there is
 rather than ask for a track by name. It answers the tracks with their names and their URLs, in the order

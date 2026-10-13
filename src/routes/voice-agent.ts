@@ -320,8 +320,24 @@ async function handleStream(
     // own way of seeing which party answers a name — `self.*` the gadget's, `bridge.*` the
     // bridge's, these the platform's, which is the one list where every answer comes from the
     // server the model is talking to.
+    //
+    // Withheld from a turn that carries a gadget's own tools.
+    //
+    // A chosen track leaves this service as a `music` event on the turn's stream, and that event is
+    // read by whoever made the request — on a device turn, the bridge. The bridge does not model the
+    // event and drops it, deliberately, in the fall-through every unmodelled event takes. So a
+    // `platform.*` call would be answered here, announced to the model as playing, said aloud by the
+    // reply, and heard nowhere: the only music tool that reaches a device's speaker is the bridge's
+    // own. Offering one that cannot be made to sound is worse than withholding it — the model
+    // cannot tell before it calls, and a refusal would spend one of `toolCalls.maxRounds` on it.
+    //
+    // That `gadgetTools` identifies a device turn is a **proxy** and not the fact: it is non-empty
+    // because the bridge ships the gadget's catalogue with every turn the gadget completed a
+    // handshake for. A bridge whose catalogue read failed, and which holds no music of its own,
+    // carries no `tools` field — and is offered these again. A field by which a caller states where
+    // its audio can be heard is the honest form of this, and is not this change.
     const platformTools: OllamaTool[] =
-      deps.libraryDir === ""
+      deps.libraryDir === "" || gadgetTools.length > 0
         ? []
         : [
             {
