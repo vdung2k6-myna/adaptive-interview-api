@@ -194,3 +194,101 @@ def test_a_removed_style_stops_being_a_voice(client, styles):
     response = speak(client, "me")
 
     assert response.status_code == 400
+
+
+# ── Rendering what the model cannot speak ──────────────────────────────
+
+
+class FakeProcessor:
+    """Stands in for the model's character-set predicate.
+
+    Reports as unsupported exactly the characters the deployed model refuses —
+    the set measured against the corpus — so the tests below exercise the
+    rendering without the weights or the indexer.
+    """
+
+    REFUSED = {"\u2265", "\u2264", "\u2030", "\u2194", "\u20ab", "\u2021", "\u00a4"}
+
+    def validate_text(self, text: str):
+        unsupported = sorted({character for character in text if character in self.REFUSED})
+        return (not unsupported, unsupported)
+
+
+@pytest.fixture
+def processor() -> FakeProcessor:
+    return FakeProcessor()
+
+
+def test_a_character_the_model_refuses_gets_a_reading(processor):
+    rendered = main.speakable("Huyết áp \u2265140mmHg", processor)
+
+    assert rendered == "Huyết áp lớn hơn hoặc bằng 140mmHg"
+
+
+def test_every_measured_character_has_a_reading(processor):
+    rendered = main.speakable("\u2265\u2264\u2030\u2194\u20ab", processor)
+
+    assert rendered == "lớn hơn hoặc bằng nhỏ hơn hoặc bằng phần nghìn đến đồng"
+
+
+def test_a_character_with_no_reading_is_dropped_rather_than_refused(processor, capsys):
+    rendered = main.speakable("trị giá 5\u2021", processor)
+
+    assert rendered == "trị giá 5"
+    assert "\u2021" in capsys.readouterr().out
+
+
+def test_text_the_model_speaks_is_left_alone(processor):
+    text = "Huyết áp tâm thu và tâm trương."
+
+    assert main.speakable(text, processor) == text
+
+
+def test_the_set_is_asked_of_the_model_not_listed_here(processor):
+    # A character this code has never recorded still goes through the same path.
+    unknown = "\u2603"  # snowman
+    processor.REFUSED = {unknown}
+
+    assert main.speakable(f"a{unknown}b", processor) == "ab"
+
+
+def test_the_character_set_is_absent_without_an_indexer(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUPERTONIC_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "_processor_read", False)
+    monkeypatch.setattr(main, "_text_processor", None)
+
+    assert main.text_processor() is None
+
+
+def test_the_real_set_refuses_the_measured_characters(monkeypatch):
+    """The claim the readings table rests on, checked against the real model.
+
+    Skipped where no indexer is installed: the point is to keep the measured set
+    honest, not to require the weights in a test run.
+    """
+    monkeypatch.setattr(main, "_processor_read", False)
+    monkeypatch.setattr(main, "_text_processor", None)
+    real = main.text_processor()
+    if real is None:
+        pytest.skip("no model indexer on this machine")
+
+    ok, unsupported = real.validate_text("Huyết áp \u2265140mmHg")
+    assert not ok
+    assert "\u2265" in unsupported
+
+    ok, unsupported = real.validate_text("Huyết áp tâm thu và tâm trương.")
+    assert ok
+    assert unsupported == []
+
+
+def test_a_refused_character_no_longer_costs_the_utterance(client, styles, stub, monkeypatch):
+    write_style(styles / "me.json")
+    main.refresh_styles()
+    monkeypatch.setattr(main, "text_processor", lambda: FakeProcessor())
+
+    response = client.post(
+        "/v1/audio/speech", json={"input": "Huyết áp \u2265140mmHg", "voice": "me"}
+    )
+
+    assert response.status_code == 200
+    assert stub.synthesized_with == ["Huyết áp lớn hơn hoặc bằng 140mmHg"]

@@ -62,3 +62,20 @@ describe("the material settings each environment defaults to", () => {
     }
   });
 });
+
+describe("the bounds a turn's tool calls are held to", () => {
+  it("gives a turn three rounds, which is one request for a track answered in two calls", () => {
+    // Two was set for a person asking for two things in one breath. A request for a track is one
+    // thing answered in two rounds — the shelf, and the number on it — so three is what leaves a
+    // model that wastes a round with something left to answer with.
+    for (const [name, config] of ENVIRONMENTS) {
+      assert.equal(config.toolCalls.maxRounds, 3, `${name}: ${envNote("TOOL_CALL_MAX_ROUNDS")}`);
+    }
+  });
+
+  it("holds a turn open for a gadget for the same eight seconds in both environments", () => {
+    for (const [name, config] of ENVIRONMENTS) {
+      assert.equal(config.toolCalls.timeoutMs, 8_000, `${name}: ${envNote("TOOL_CALL_TIMEOUT_MS")}`);
+    }
+  });
+});

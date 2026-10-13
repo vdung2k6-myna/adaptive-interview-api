@@ -13,6 +13,7 @@ import evaluationsRoutes from "./routes/evaluations";
 import voiceRoutes from "./routes/voice";
 import voiceAgentRoutes from "./routes/voice-agent";
 import personasRoutes from "./routes/personas";
+import musicRoutes from "./routes/music";
 import mcpRoutes from "./routes/mcp";
 
 /**
@@ -102,6 +103,7 @@ export function createApp(): express.Express {
   app.use("/api/voice", voiceRoutes);
   app.use("/api/voice-agent", voiceAgentRoutes);
   app.use("/api/personas", personasRoutes);
+  app.use("/api/music", musicRoutes);
 
   // Error handler
   app.use(errorHandler);

@@ -20,7 +20,7 @@ import { createPrefetchStore, DEFAULT_PREFETCH_TOP_K, type PrefetchStore } from 
 import { createSessionKnowledge, type SessionKnowledge } from "@/lib/session-knowledge";
 import { createToolCallStore, type ToolCallOutcome, type ToolCallStore } from "@/lib/tool-calls";
 import { resolveCollections } from "@/lib/topics";
-import { readLibrary, trackNamed, type Track } from "@/lib/music";
+import { readLibrary, type Track } from "@/lib/music";
 import config from "@/lib/config";
 import {
   transcribeAudio,
@@ -45,6 +45,20 @@ const upload = multer({ storage: multer.memoryStorage() });
  */
 const LIST_MUSIC_TOOL = "platform.list_music";
 const PLAY_MUSIC_TOOL = "platform.play_music";
+
+/**
+ * The library as the model is offered it: one line per track, numbered from one.
+ *
+ * The number is what a track is asked for by (design D4). The names beside them are what lets the
+ * model recognise the track a person meant, and they are the library's own — the file's name without
+ * its extension — because this service invents no name for a deployment's music.
+ */
+function shelfAnswer(tracks: readonly Track[]): string {
+  return (
+    "the tracks this platform holds, by number:\n" +
+    tracks.map((track, at) => `${at + 1}. ${track.title}`).join("\n")
+  );
+}
 
 /**
  * The collaborators this router calls out to, as parameters that default to the
@@ -315,10 +329,10 @@ async function handleStream(
               function: {
                 name: LIST_MUSIC_TOOL,
                 description:
-                  "List the tracks this platform can play. Use it when the person asked for a " +
-                  "track and what came back may not be what its file is called — a title spoken " +
-                  "in another language, or a name the transcriber heard wrongly — and then ask " +
-                  `for one of the names it answers with, using ${PLAY_MUSIC_TOOL}.`,
+                  "List the tracks this platform can play, each with the number it is asked for " +
+                  "by. Take it whenever the person asked for a track — a title spoken inside " +
+                  "another language, or a name the transcriber heard wrongly, is settled by " +
+                  `choosing from what this answers — and then play one with ${PLAY_MUSIC_TOOL}.`,
                 parameters: { type: "object", properties: {} },
               },
             },
@@ -328,14 +342,18 @@ async function handleStream(
                 name: PLAY_MUSIC_TOOL,
                 description:
                   "Play one track from this platform's library through the person's own client. " +
-                  "The name must be one the library reported; call " +
-                  `${LIST_MUSIC_TOOL} first when you are not certain of it.`,
+                  "A track is named by its number on the shelf, and the number must be one " +
+                  `${LIST_MUSIC_TOOL} answered with: take that shelf first if you have not, and ` +
+                  "never invent a number or pass a track's name.",
                 parameters: {
                   type: "object",
                   properties: {
-                    name: { type: "string", description: "The track's name, as the library reported it." },
+                    index: {
+                      type: "integer",
+                      description: `The track's number on the shelf ${LIST_MUSIC_TOOL} answered with.`,
+                    },
                   },
-                  required: ["name"],
+                  required: ["index"],
                 },
               },
             },
@@ -644,6 +662,16 @@ async function handleStream(
     // model asked for nothing.
     const wanted: { track: Track | null } = { track: null };
 
+    // The shelf this turn has offered the model, as it was offered. Held for the turn rather than
+    // read again for each call: `readLibrary` is called per call and the directory is allowed to
+    // change while the platform runs, so two readings can order the same tracks differently, and a
+    // number is only an answer against the shelf the model is looking at (design D4).
+    //
+    // A box rather than a bare `let`, for the same reason `wanted` is one: it is written from inside
+    // the closure below, and a `let` written only from a closure reads to the type checker as never
+    // written.
+    const offered: { tracks: readonly Track[] | null } = { tracks: null };
+
     try {
       if (material?.ok) {
         // No model is asked for this turn at all, and no prompt is built for it:
@@ -690,29 +718,65 @@ async function handleStream(
          *
          * Both kinds are answered in the same round and carried back to the model in one message
          * list, so a turn that asked for both is not serialised into two.
+         *
+         * `shelf` is the shelf this turn had offered **before this round** — taken by the caller
+         * before any of this round's calls are answered. The model may ask for the shelf and for a
+         * track in one message, and settling those in the model's own order would answer a number
+         * against a shelf it has not been shown yet, which is a guess taken as an answer. Both are
+         * answered and the track one fails, which is what makes the model take the shelf first (D4).
          */
-        async function answerHere(call: OllamaToolCall): Promise<ToolCallOutcome | null> {
+        async function answerHere(
+          call: OllamaToolCall,
+          shelf: readonly Track[] | null
+        ): Promise<ToolCallOutcome | null> {
           const name = call.function.name;
           if (name !== LIST_MUSIC_TOOL && name !== PLAY_MUSIC_TOOL) return null;
 
-          const library = await readLibrary(deps.libraryDir);
           if (name === LIST_MUSIC_TOOL) {
+            const library = await readLibrary(deps.libraryDir);
             if (!library.ok) return { ok: false, message: library.detail };
+            // Nothing to number is not a shelf: an empty list reads as an answer, and the turn that
+            // asked what can be played is owed the truth that nothing can.
+            if (library.tracks.length === 0) {
+              return { ok: false, message: `${deps.libraryDir} holds no track this service can serve` };
+            }
+            offered.tracks = library.tracks;
+            return { ok: true, text: shelfAnswer(library.tracks) };
+          }
+
+          if (shelf === null) {
             return {
-              ok: true,
-              text:
-                "the tracks this platform holds:\n" +
-                library.tracks.map((track) => track.title).join("\n"),
+              ok: false,
+              message:
+                `no shelf of this library has been taken in this turn — ask ${LIST_MUSIC_TOOL} for ` +
+                `one, then ask for a track by a number it gives`,
             };
           }
 
-          const named = call.function.arguments["name"];
-          const found = trackNamed(library, typeof named === "string" ? named : "");
-          if (!found.ok) return { ok: false, message: found.detail };
+          // A number, and only a number. One handed back as text is the same number and is taken;
+          // nothing else is, because a name is what the model believes it knows and this interface
+          // exists because that belief is not what the library holds (D4).
+          const asked = call.function.arguments["index"];
+          const number =
+            typeof asked === "number"
+              ? asked
+              : typeof asked === "string" && /^\d+$/.test(asked.trim())
+                ? Number(asked.trim())
+                : Number.NaN;
+          if (!Number.isInteger(number) || number < 1 || number > shelf.length) {
+            return {
+              ok: false,
+              message:
+                `the shelf holds ${shelf.length} track(s), so ${JSON.stringify(asked)} is not one of ` +
+                `them — answer with a number ${LIST_MUSIC_TOOL} gave`,
+            };
+          }
+
+          const track = shelf[number - 1]!;
           // Held rather than played: the sentences still to be spoken belong to the reply this call
           // is inside, and a track is minutes. See where the event is sent.
-          wanted.track = found.track;
-          return { ok: true, text: `playing ${found.track.title}` };
+          wanted.track = track;
+          return { ok: true, text: `playing ${track.title}` };
         }
 
         let rounds = 0;
@@ -777,7 +841,12 @@ async function handleStream(
 
         // A call this platform answers itself is answered here, and every other call goes out to
         // the client that declared it, exactly as it always has.
-        const answeredHere = await Promise.all(calls.map((call) => answerHere(call)));
+        //
+        // The shelf is read once, before the round is answered: a round that takes the shelf offers it
+        // to the round after, and never to itself, so a shelf and a track asked for in one message
+        // cannot settle against each other (D4).
+        const shelfBefore = offered.tracks;
+        const answeredHere = await Promise.all(calls.map((call) => answerHere(call, shelfBefore)));
 
         // One turn id for the round and one hold per call: a model may ask for two things at
         // once, and each is answered on its own. Every hold is opened *before* the event that

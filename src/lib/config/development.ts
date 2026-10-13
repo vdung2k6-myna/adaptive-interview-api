@@ -117,8 +117,10 @@ export const developmentConfig: AppConfig = {
     // would point every deployment at a directory that is not there. It has to be inside
     // `AUDIO_STORAGE_DIR` for its tracks to have a URL — see `AppConfig.music`.
     //
-    // The files are the deployment's own. What may be played is theirs to answer for; this
-    // repository ships no music and grants no rights to any.
+    // The files are the deployment's own. What may be played is theirs to answer for, and this
+    // repository ships no music and grants no rights to any — and holding a track is not playing it:
+    // a track played to a person during an interview reaches someone other than the operator, which
+    // is a right distinct from keeping the file. See `NOTICE`.
     libraryDir: (process.env.MUSIC_LIBRARY_DIR || "").trim(),
   },
   toolCalls: {
@@ -126,7 +128,9 @@ export const developmentConfig: AppConfig = {
     // listening to silence — and it is well under `ollama.chatTimeoutMs`, which bounds the two
     // model rounds the wait sits between.
     timeoutMs: parsePositiveInt(process.env.TOOL_CALL_TIMEOUT_MS, 8_000),
-    // See `AppConfig.toolCalls.maxRounds` for why two.
-    maxRounds: parsePositiveInt(process.env.TOOL_CALL_MAX_ROUNDS, 2),
+    // See `AppConfig.toolCalls.maxRounds` for why three: one request for a track is answered in two
+    // rounds — the shelf, and the number on it — where two was set for a person asking for two things
+    // in one breath.
+    maxRounds: parsePositiveInt(process.env.TOOL_CALL_MAX_ROUNDS, 3),
   },
 };

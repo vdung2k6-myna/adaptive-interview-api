@@ -113,7 +113,9 @@ export interface AppConfig {
    * music directory: a service whose subject is interviews still has interviews to serve.
    *
    * The files are the deployment's own. What may be played is theirs to answer for, and this
-   * service ships no music and grants no rights to any.
+   * service ships no music and grants no rights to any — and holding a track is not playing it: a
+   * track played to a person during an interview reaches someone other than the operator, which is a
+   * right distinct from keeping the file. See `NOTICE`.
    */
   music: {
     /** The directory the tracks are in, or empty for a deployment with no music. */
@@ -132,9 +134,14 @@ export interface AppConfig {
      *  that answers at all answers in milliseconds; this is spent by a person listening to
      *  silence, so it is a bound on patience rather than on the network. */
     timeoutMs: number;
-    /** The most tool calls one turn may make before it answers with whatever it has. A person
-     *  can reasonably ask for two things in one breath; a model that asks for more than this
-     *  is one no answer will satisfy. */
+    /** How many rounds a turn may ask the model *with tools* before it is asked to answer in words.
+     *
+     *  A round and not a call: a model may name several things in one message, and a round is asked
+     *  once whatever it asks for. Three, because a request for a track is answered in two rounds —
+     *  the shelf, and then the number on it — and a model that spends one of them asking for a track
+     *  it has no shelf for would otherwise have nothing left to answer with. A person can reasonably
+     *  ask for two things in one breath; a model that asks for more than this is one no answer will
+     *  satisfy. */
     maxRounds: number;
   };
 }

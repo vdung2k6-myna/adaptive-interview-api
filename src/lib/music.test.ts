@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AUDIO_ROOT } from "./audio/storage";
-import { libraryComplaint, readLibrary, trackNamed } from "./music";
+import { libraryComplaint, readLibrary } from "./music";
 
 /**
  * The library, over directories this suite makes rather than over a deployment's.
@@ -116,7 +116,7 @@ describe("a library the mount would not serve", () => {
   });
 });
 
-describe("the track a name asks for", () => {
+describe("the library as a shelf a caller numbers", () => {
   const withTracks = async () => {
     const dir = await dirUnder(AUDIO_ROOT);
     await track(join(dir, "Diem Xua.mp3"));
@@ -124,63 +124,27 @@ describe("the track a name asks for", () => {
     return readLibrary(dir);
   };
 
-  it("finds the name the library itself reported", async () => {
-    const found = trackNamed(await withTracks(), "Diem Xua");
+  it("reports every track it read, and nothing that is not one", async () => {
+    const library = await withTracks();
 
-    assert.ok(found.ok);
-    assert.equal(found.track.title, "Diem Xua");
+    assert.ok(library.ok);
+    assert.deepEqual(
+      [...library.tracks.map((entry) => entry.title)].sort(),
+      ["Diem Xua", "Mot Hai"],
+      "what a caller numbers is what the directory holds — the order itself is the reading's own, " +
+        "which is why a turn holds the shelf it offered rather than reading again for each call"
+    );
   });
 
-  it("finds it when the model echoes it back in another case", async () => {
-    // The same name and not a different one: a model that lowercases what it was given is not
-    // making a request this library should refuse.
-    const found = trackNamed(await withTracks(), "  diem xua  ");
+  it("answers with a name no name was invented for", async () => {
+    // The library's own file name without its extension, and not something this service made up.
+    // What a person would ask for a track by is a question for whoever named the files.
+    const library = await withTracks();
 
-    assert.ok(found.ok);
-    assert.equal(found.track.title, "Diem Xua");
+    assert.ok(library.ok);
+    assert.ok(
+      library.tracks.every((entry) => !/\.mp3$/.test(entry.title)),
+      "the extension is the file system's, not a track's"
+    );
   });
-
-  it("reports a name no track carries rather than playing the nearest one", async () => {
-    // The whole of what this module does not do: it does not fold, does not score a run of words,
-    // and does not settle between files. A name the shelf did not report is a name the library does
-    // not hold.
-    const found = trackNamed(await withTracks(), "diem");
-
-    assert.equal(found.ok, false);
-    assert.match(found.ok === false ? found.detail : "", /holds no track called diem/);
-  });
-
-  it("serves the name exactly as the library reported it, even where a sibling differs by case", async () => {
-    // Asking for `Same` is asking for the track the library called `Same` — the name as it was
-    // reported, and not a choice between two files.
-    const dir = await dirUnder(AUDIO_ROOT);
-    await track(join(dir, "Same.mp3"));
-    await track(join(dir, "same.mp3"));
-
-    const found = trackNamed(await readLibrary(dir), "Same");
-
-    assert.ok(found.ok);
-    assert.equal(found.track.title, "Same");
-  });
-
-  it(
-    "reports a name that two tracks answer to rather than choosing between them",
-    {
-      // Unreachable here, and not because the branch is dead: two files whose names differ only by
-      // case cannot both exist on the filesystem this root is on, so the case that reaches it can
-      // only be built where they can. Left named and skipped so that a deployment on such a
-      // filesystem — and a later reader — can see the branch is meant to be exercised.
-      skip: "needs a case-sensitive filesystem, where two names differing only by case can coexist",
-    },
-    async () => {
-      const dir = await dirUnder(AUDIO_ROOT);
-      await track(join(dir, "Same.mp3"));
-      await track(join(dir, "same.mp3"));
-
-      const found = trackNamed(await readLibrary(dir), "SAME");
-
-      assert.equal(found.ok, false);
-      assert.match(found.ok === false ? found.detail : "", /2 tracks are called SAME/);
-    }
-  );
 });

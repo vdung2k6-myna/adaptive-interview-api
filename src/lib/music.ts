@@ -6,12 +6,12 @@
  * a platform that will not start. Both are the reading a service takes of any directory it is told
  * to look at — the same one the bridge takes of its own.
  *
- * **What this module does not do is match.** It answers with the names a person would ask for the
- * tracks by, and it finds a track by one of those names; it does not fold, does not score a run of
- * words, and does not ask which of several files a request covers. The model is given the shelf and
- * chooses from it, which is the part that repairs a title the transcriber heard wrongly and the
- * part no comparison of strings can. A second matcher here would be a worse copy of the bridge's,
- * for a turn that already has a model in it.
+ * **What this module does not do is match.** It answers with the tracks in the order it reads them,
+ * which is the shelf a caller numbers and a model chooses a position on; nothing here folds, scores a
+ * run of words, or asks which of several files a request covers. The model is given the shelf and
+ * chooses from it, which is the part that repairs a title the transcriber heard wrongly and the part
+ * no comparison of strings can. A second matcher here would be a worse copy of the bridge's, for a
+ * turn that already has a model in it.
  */
 
 import { readdir, stat } from "fs/promises";
@@ -21,7 +21,8 @@ import { urlPathForFile } from "@/lib/audio/storage";
 
 /** One track, as the model is offered it and as a client fetches it. */
 export interface Track {
-  /** The name a person would ask for it by — the file's own name, without its extension. */
+  /** The name the library holds the track under — the file's own name, without its extension. No
+   *  name is invented here: what a deployment's files are called is the deployment's to decide. */
   title: string;
   /** The path under the audio mount a client fetches it from. */
   url: string;
@@ -69,41 +70,6 @@ export async function readLibrary(directory: string): Promise<Library> {
     tracks.push({ title: basename(file).replace(/\.[^.]+$/, ""), url });
   }
   return { ok: true, tracks };
-}
-
-/**
- * The track a name asks for, or the reason there is none.
- *
- * The name is one the library itself reported, so this is not a search: it compares the name as
- * given, and then — because a model may echo a name back with different capitalisation, which is
- * the same name and not a different one — without regard to case or surrounding space. Nothing
- * else is compared, and a name that two tracks answer to is reported rather than settled.
- */
-export function trackNamed(
-  library: Library,
-  name: string
-): { ok: true; track: Track } | { ok: false; detail: string } {
-  if (!library.ok) return { ok: false, detail: library.detail };
-
-  const wanted = name.trim();
-  if (wanted === "") {
-    return { ok: false, detail: "no track was named, and this library asks which one" };
-  }
-
-  const exact = library.tracks.filter((track) => track.title === wanted);
-  const folded =
-    exact.length > 0
-      ? exact
-      : library.tracks.filter((track) => track.title.toLowerCase() === wanted.toLowerCase());
-
-  if (folded.length === 1) return { ok: true, track: folded[0]! };
-  if (folded.length > 1) {
-    return {
-      ok: false,
-      detail: `${folded.length} tracks are called ${wanted}: ${folded.map((t) => t.title).join(", ")}`,
-    };
-  }
-  return { ok: false, detail: `the library holds no track called ${wanted}` };
 }
 
 /** Every file under `directory`, as a path relative to it, this directory's own and every

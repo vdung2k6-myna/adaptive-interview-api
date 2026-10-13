@@ -77,6 +77,28 @@ A style file that cannot be read is reported at startup, listed under
 `unreadable_voices`, and makes `/health` report `degraded`. The styles that did
 read are still served.
 
+### A character the model cannot speak
+
+The model refuses a character outside its supported set — `≥ ≤ ‰ ↔ ₫ ‡ ¤` are
+the ones this product's Vietnamese content meets — and a refusal costs the
+**whole utterance**, not the character: handed one of these, the model raises,
+and the sentence it was in is never spoken. The service therefore renders every
+character the model reports as unsupported before the text reaches it. One with
+a reading is replaced by its words; one without is dropped and logged, because
+an unread symbol costs a symbol where a refused character costs a sentence.
+
+```bash
+curl -X POST localhost:8084/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "Huyết áp ≥ 140mmHg", "voice": "F1"}' -o speech.wav
+# 200, audio/wav — spoken as "huyết áp lớn hơn hoặc bằng 140mmHg"
+```
+
+Which characters need rendering is asked of the model rather than listed in this
+service, so a character nobody anticipated takes the same path. The set is a
+property of the loaded model and not of the voice: the voice this deployment
+speaks in and the service's own default refuse the same characters.
+
 ## Environment
 
 | Variable | Default      | Description |

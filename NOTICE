@@ -105,6 +105,39 @@ starting point.
 Users are responsible for obtaining voice models legally and for their use
 case being permitted.
 
+## Music a deployment supplies
+
+The platform's music library is a directory the operator points
+`MUSIC_LIBRARY_DIR` at. This repository ships no tracks, and the MIT grant
+above covers none of them: every file in that directory is the deployment's
+own.
+
+Two different rights are in play, and holding a file is not the same as
+playing it:
+
+- **Reproduction** — the copy of a track on the deployment's disk. This
+  software neither makes that copy nor needs one; the operator made it, and
+  whether it was permitted is the operator's to answer for.
+- **Communication to the public** — playing a track to someone who is
+  listening. This is what the platform does, and a right the operator may not
+  hold even where holding the file is fine. A track a deployment may lawfully
+  keep is not therefore a track it may lawfully play to a third party.
+
+The listener is what makes the second right bite. This platform is used for
+interviews, and an interview is heard by the person being interviewed —
+someone other than the operator. A track played during one is played to an
+audience, not into a room the operator is alone in. Vietnam's VCPMC, for
+example, licenses communication to the public for apps and websites and
+distinguishes personal listening from business use; a deployment elsewhere
+will have its own answer. Which works may be played, to whom, and on what
+terms is a question for the deployment, not for this file.
+
+Serve material whose terms you can state. Public-domain and CC0 catalogues
+carry no obligation to pass on; a CC-BY catalogue carries an attribution its
+own terms require.
+
+This is a summary for engineering purposes, not legal advice.
+
 ## Runtime dependencies with copyleft or missing terms
 
 These are not tracked or vendored by this repository, but they are pulled in

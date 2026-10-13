@@ -97,6 +97,6 @@ export const productionConfig: AppConfig = {
     // Same as development, and deliberately not a second opinion: the wait is spent by a person
     // listening to silence, which a deployment does not make shorter. See development.ts.
     timeoutMs: parsePositiveInt(process.env.TOOL_CALL_TIMEOUT_MS, 8_000),
-    maxRounds: parsePositiveInt(process.env.TOOL_CALL_MAX_ROUNDS, 2),
+    maxRounds: parsePositiveInt(process.env.TOOL_CALL_MAX_ROUNDS, 3),
   },
 };
