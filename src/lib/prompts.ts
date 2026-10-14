@@ -70,7 +70,34 @@ Rules:
 ${languageInstruction}`;
 }
 
-function buildContextUserPrompt(session: PromptSession, coveredTopics: string[], remainingTopics: string[]): string {
+/**
+ * What the question that opens an interview is asked to do, and what every later one is.
+ *
+ * The length of an answer is asked for once, at the start — which is how an interview works, and
+ * why it is said here and not in the standing rules. The rules run on every turn, so an expectation
+ * written into them would be restated with every question, and a length repeated that often is one
+ * a person stops hearing. The other half matters as much as the first: a norm raised a second time
+ * reads as a complaint about the answer just given.
+ *
+ * `currentTurn` counts the turns completed, so the opening question is the one asked at zero, and
+ * it is the only turn on which the interviewer has not heard an answer yet.
+ */
+const OPENING_TURN_INSTRUCTION =
+  "This is the opening question. Ask the candidate to answer in about a minute or two.";
+
+/** Said instead on every later turn, so the expectation is stated exactly once. */
+const LATER_TURN_INSTRUCTION =
+  "Do not mention how long an answer should be. That was asked once, in the opening question.";
+
+/**
+ * The per-turn user message: who is being interviewed, for what, what has been covered, and how
+ * far in the interview this question is.
+ *
+ * Exported so the one part of it that is a rule rather than a description — which turn is told the
+ * expected length of an answer — can be asserted. What a model then does with that is beyond any
+ * test here; that it is told on the opening turn and on no other is not.
+ */
+export function buildContextUserPrompt(session: PromptSession, coveredTopics: string[], remainingTopics: string[]): string {
   const cvSection = session.candidate.cv
     ? `\nCandidate CV summary:\n${session.candidate.cv.substring(0, 800)}`
     : "";
@@ -89,7 +116,9 @@ Experience: ${session.candidate.experienceYears ?? "N/A"} years${cvSection}
 Topics already covered: ${coveredTopics.join(", ") || "None yet"}
 Remaining topics to explore: ${remainingTopics.join(", ") || "None — feel free to dig deeper on covered topics or ask behavioral questions"}
 
-The candidate has completed ${session.currentTurn} of ${session.maxTurns} turns.`;
+The candidate has completed ${session.currentTurn} of ${session.maxTurns} turns.
+
+${session.currentTurn === 0 ? OPENING_TURN_INSTRUCTION : LATER_TURN_INSTRUCTION}`;
 }
 
 function buildTurnMessages(messages: PromptMessage[]): OllamaMessage[] {

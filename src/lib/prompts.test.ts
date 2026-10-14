@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { trimTurnMessages } from "./prompts";
+import { trimTurnMessages, buildContextUserPrompt, type PromptSession } from "./prompts";
 import type { OllamaMessage } from "./ollama";
 
 /**
@@ -119,5 +119,63 @@ describe("trimTurnMessages: the two ends and the floor", () => {
     const turns = history([20_000, 20_000]);
 
     assert.deepEqual(trimTurnMessages(turns, 1_000), turns, "there is no middle to drop");
+  });
+});
+
+/**
+ * How long an answer is asked to be, and the one turn that asks.
+ *
+ * What is asserted here is the prompt's half of it — that the expectation reaches the opening
+ * question and no other. Whether the model then says it out loud is not something a test in this
+ * repository can reach, and asserting the words would be evidence about this file rather than about
+ * an interview. The scoping is the part that rots: it is a conditional, and a later edit that drops
+ * it would leave every turn of every interview asking the candidate to be brief.
+ */
+
+/** A session as the prompt sees one, with only the turn count to vary. */
+function sessionAtTurn(currentTurn: number): PromptSession {
+  return {
+    id: "session-1",
+    positionId: "position-1",
+    status: "in_progress",
+    language: "english",
+    maxTurns: 8,
+    currentTurn,
+    position: { title: "Backend Engineer", level: "mid", requirements: ["Node", "SQL"] },
+    candidate: { name: "Candidate", skills: ["Node"], experienceYears: 4 },
+  };
+}
+
+describe("the expected length of an answer, and the turn that asks for it", () => {
+  it("asks the question that opens an interview to state it", () => {
+    const prompt = buildContextUserPrompt(sessionAtTurn(0), [], []);
+
+    assert.match(
+      prompt,
+      /minute/,
+      "the opening question has to name a length, or the person has a norm to guess at rather than match"
+    );
+  });
+
+  it("does not ask a later question to state it again", () => {
+    const opening = buildContextUserPrompt(sessionAtTurn(0), [], []);
+    const later = buildContextUserPrompt(sessionAtTurn(3), [], []);
+
+    assert.notEqual(later, opening, "a later turn is told something different from the opening one");
+    assert.doesNotMatch(
+      later,
+      /about a minute or two/,
+      "the expectation is not restated, which a person would hear as a complaint about their last answer"
+    );
+  });
+
+  it("tells every turn exactly one of the two, and never neither", () => {
+    const turns = [0, 1, 4, 7].map((n) => buildContextUserPrompt(sessionAtTurn(n), [], []));
+
+    assert.match(turns[0], /This is the opening question/, "the first turn is the opening one");
+    for (const later of turns.slice(1)) {
+      assert.doesNotMatch(later, /This is the opening question/);
+      assert.match(later, /Do not mention how long an answer should be/);
+    }
   });
 });
