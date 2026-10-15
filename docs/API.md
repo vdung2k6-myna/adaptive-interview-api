@@ -772,6 +772,7 @@ The endpoint accepts either an audio recording (voice input) or a `text` field (
 | `answerMode` | `"generate"` \| `"material"` | No | How this turn's reply is produced. Anything other than `"material"` generates, so omitting it is exactly the previous behaviour. See [Material replies](#material-replies). |
 | `prefetchId` | `string` | No | A prefetch (`POST /api/voice-agent/prefetch`) whose located chunks this turn should reuse instead of searching again. |
 | `speak` | `"0"` | No | Set to `"0"` to skip TTS synthesis: `sentence` events still arrive with `audioData: null`. |
+| `tools` | `JSON string` | No | What the caller's own device can be asked to do, as `[{ name, description, inputSchema }]`. A bridge relaying a gadget's catalogue sends it; the platform adds its music tools beside them where a library is configured. Absent, or anything that does not parse as an array of named entries, asks the turn with no tools — which is every browser turn. |
 
 **Response:** `text/event-stream`
 
@@ -780,9 +781,15 @@ The endpoint accepts either an audio recording (voice input) or a `text` field (
 | `user` | `{ text, messageId }` | Transcribed user audio or the provided `text`. Omitted on the first turn. |
 | `sentence` | `{ index, text, audioData }` | A synthesized agent sentence as base64 WAV. `audioData` is `null` if synthesis failed, including when `speak=0`. |
 | `text` | `{ index, text }` | The segment about to be spoken, emitted immediately before the matching `sentence` — which is the same segment, by `index` and by `text`. One `text` per `sentence`, so a sentence the splitter breaks into several chunks is several pairs; a client can render the segment being read, or highlight it in the reply, without waiting for synthesis. |
+| `tool_call` | `{ turnId, index, name, arguments }` | The model asked for something only the caller can do — one of the tools the caller declared in `tools`. The turn stops and holds its stream open (up to `TOOL_CALL_TIMEOUT_MS`, default 8s) for the answer, which the caller sends to `POST /api/voice-agent/tool-result` echoing this `turnId` and `index`. Emitted only for calls the caller declared: the platform's own music tools are answered without it. |
+| `music` | `{ index, url, title }` | A track the platform will play through this client. Sent after the reply's last `sentence` and before `done`. `url` is a path under the audio mount, fetched with the same credential as any other recording. See **What `music`'s `index` means** below. |
 | `done` | `{ messageId, fullText }` | Agent response complete. |
 | `notice` | `{ code, message }` | Non-fatal notice; the stream then ends. Currently only `code: "no_speech"`, when the recording held no transcribable speech. |
 | `error` | `{ message }` | Fatal error (stream terminates). |
+
+**What `music`'s `index` means:**
+
+It is one past the reply's last `sentence` — the *next* position in that turn's index sequence, not an index of the event's own. A client that orders playback by index must place it exactly where it is given, and must treat it as one more item in the reply's sequence that happens to carry a URL instead of base64 audio. A cursor that advances only through consecutive indices is what orders a turn's audio, and an item placed at any other index does not play late — it does not play at all: an index already passed is never reached again, and one past a gap stalls everything behind it. The reply's sentences are all emitted before this event, so the index as sent is the one that follows them.
 
 **Text preprocessing:**
 
@@ -830,6 +837,35 @@ data: {"index":1,"text":"và cho một ví dụ.","audioData":"UklGRiQAAABXQVZFZ
 
 - `200` — SSE stream opened (errors delivered as `event: error`)
 - `400` — Missing `systemPrompt` or invalid configuration
+
+### `POST /api/voice-agent/tool-result`
+
+**What the caller did about a `tool_call`.** The turn that asked is holding its stream open for exactly this, so every `tool_call` that arrives must be answered — one that is not waits out its timeout, and the model is then told the tool did not report back. A result for a turn that is no longer waiting is an ordinary race, not a fault.
+
+**Request:** `application/json`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `turnId` | `string` | Yes | The `turnId` from the `tool_call` event. |
+| `index` | `integer` | No | The `index` from the same event. The model may ask for more than one thing at once, and each is answered on its own. Default: `0`. |
+| `ok` | `boolean` | No | Whether it was carried out. Anything other than `false` is a success. |
+| `text` | `string` | No | On success, what to tell the model — the tool's own report of what it did, which may be a refusal rather than a failure and is the model's to read. Default: `""`. |
+| `message` | `string` | No | On failure (`ok: false`), what went wrong, in words the model can act on. |
+
+What comes back joins the conversation and the model is asked again, so the reply is about the change rather than merely beside it. A turn may ask at most `TOOL_CALL_MAX_ROUNDS` times (default `3`) before it is asked to answer in words.
+
+**Response:**
+
+```json
+{ "settled": true }
+```
+
+**Status Codes:**
+
+- `200` — a turn was waiting and received it
+- `400` — `turnId` missing
+- `401` — Missing or invalid auth token, when `API_AUTH_TOKEN` is set
+- `409` — no turn is waiting on that `turnId`/`index`; the turn it belonged to has already timed out or ended
 
 ### Material replies
 
@@ -885,6 +921,43 @@ It sends 24 queries — 8 naming a story in the speakable set, 8 asking vaguely,
 **Status Codes:**
 
 - `200` — Always, including when nothing was held
+- `401` — Missing or invalid auth token, when `API_AUTH_TOKEN` is set
+
+---
+
+## Music
+
+A deployment may hold a music library — a directory of audio files, named by `MUSIC_LIBRARY_DIR` and sitting inside the audio storage root. Where it does, `POST /api/voice-agent/stream` offers the model two tools of its own, `platform.list_music` and `platform.play_music`, and answers them itself rather than pushing them out to whoever is on the connection: the library is this service's, so there is nobody else to answer for it. `list_music` answers with the library as a numbered shelf; `play_music` takes a number from that shelf, read against the shelf the turn offered and never against a fresh reading of the directory. A track is asked for by **number** and not by its name, because the names are the library's own file names and a model asked to reproduce one answers with the title it knows instead. A chosen track reaches the client as the `music` event on `POST /api/voice-agent/stream`.
+
+None of this is required for a turn to work. A deployment with no library offers the model no music tools, emits no `music` event, and answers every turn exactly as it did before the capability existed.
+
+### `GET /api/music`
+
+**The library this deployment holds.** The same reading the model is offered as a shelf, so the list a person sees is the shelf the model chooses from — the same tracks, in the same order, read the same way.
+
+**Response:** `application/json`
+
+```json
+{
+  "tracks": [
+    { "title": "Ba Bon", "url": "/audio/music/Ba%20Bon.flac" }
+  ],
+  "report": null
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tracks` | `Track[]` | Every track the library holds, in the order the shelf is built. Empty when there is nothing to play. |
+| `tracks[].title` | `string` | The file's own name, without its extension. No name is invented here: what a deployment's files are called is the deployment's to decide. |
+| `tracks[].url` | `string` | A path under the audio mount, fetched with the same credential as any other recording. |
+| `report` | `string \| null` | Why there is nothing to play — no library configured, a directory that cannot be served, or one holding no track this service can serve. `null` where `tracks` is the answer. |
+
+**No numbers are answered here**, unlike the shelf the model is given. A position is a handle for a reasoner that will not reproduce a string faithfully, which is why the model is given one; a client reproduces a string exactly and plays by the URL it was shown — the same handle the `music` event already carries.
+
+**Status Codes:**
+
+- `200` — Always, including when there is nothing to play; the reason is in `report`
 - `401` — Missing or invalid auth token, when `API_AUTH_TOKEN` is set
 
 ---

@@ -16,6 +16,8 @@ import personasRoutes from "./routes/personas";
 import musicRoutes from "./routes/music";
 import mcpRoutes from "./routes/mcp";
 
+import { audioMediaType } from "./lib/audio/storage";
+
 /**
  * The composition root: every mount and the order they are registered in.
  *
@@ -80,7 +82,25 @@ export function createApp(): express.Express {
   // measured 2026-10-12 against this deployment, whose ingress forwards `/audio` as
   // well as `/api` — leaving every interview recording to the secrecy of two UUIDs.
   // Unguessable is not authenticated, and a URL leaks.
-  app.use("/audio", apiAuthMiddleware, express.static(process.env.AUDIO_STORAGE_DIR || "/tmp/audio"));
+  app.use(
+    "/audio",
+    apiAuthMiddleware,
+    express.static(process.env.AUDIO_STORAGE_DIR || "/tmp/audio", {
+      // The mount names each file's type from the same table the music library reads
+      // (`audioMediaType`), so a container the library offers is handed over as audio rather
+      // than as an opaque stream. `.opus` is the case that forced it: `send` resolves
+      // through `mime@1.6.0`, a table from 2017, which answers `application/octet-stream`
+      // for it — and a library listing a track the mount then served opaquely is the drift
+      // the licence audit recorded as M3.
+      //
+      // It works because `send` emits its `headers` event — this callback — *before* it sets
+      // the type, and its own `type()` returns early when a Content-Type is already set. So
+      // this replaces the mount's default rather than fighting it.
+      setHeaders: (res, filePath) => {
+        res.setHeader("Content-Type", audioMediaType(filePath));
+      },
+    })
+  );
 
   // MCP endpoint — handles its own auth (MCP_AUTH_TOKEN)
   app.use("/api/mcp", mcpRoutes);

@@ -184,3 +184,89 @@ describe("composition root: which middleware answers a request", () => {
     });
   });
 });
+
+describe("composition root: the media type the audio mount serves", () => {
+  /**
+   * Serve the audio root over a directory holding one file per container, so the
+   * assertion is about the mount's own answer rather than about a table read
+   * anywhere else. A sibling of `withApp` rather than a change to it: its cases
+   * assert what the directory holds, and adding files would answer those for it.
+   */
+  async function withContainers(names: string[], fn: (base: string) => Promise<void>): Promise<void> {
+    const dir = await mkdtemp(join(tmpdir(), "composition-root-types-"));
+    for (const name of names) await writeFile(join(dir, name), Buffer.from("RIFF0000WAVEfmt "));
+
+    const previousDir = process.env.AUDIO_STORAGE_DIR;
+    const previousToken = process.env.API_AUTH_TOKEN;
+    process.env.AUDIO_STORAGE_DIR = dir;
+    process.env.API_AUTH_TOKEN = TOKEN;
+
+    let server: Server | undefined;
+    try {
+      const app = createApp();
+      server = await new Promise<Server>((resolve) => {
+        const bound = app.listen(0, "127.0.0.1", () => resolve(bound));
+      });
+
+      const address = server.address();
+      assert.ok(address && typeof address === "object", "expected the app to bind a port");
+
+      await fn(`http://127.0.0.1:${address.port}`);
+    } finally {
+      if (server) {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server?.close(() => resolve()));
+      }
+      await rm(dir, { recursive: true, force: true });
+
+      if (previousDir === undefined) delete process.env.AUDIO_STORAGE_DIR;
+      else process.env.AUDIO_STORAGE_DIR = previousDir;
+
+      if (previousToken === undefined) delete process.env.API_AUTH_TOKEN;
+      else process.env.API_AUTH_TOKEN = previousToken;
+    }
+  }
+
+  const auth = (): Record<string, string> => ({ Authorization: `Bearer ${TOKEN}` });
+
+  it("serves every container the library would offer with an audio type", async () => {
+    // The mount's half of the one table (`audioMediaType`): a track the library lists must not
+    // arrive as an opaque stream, which is exactly what `send`'s own table answers for `.opus`.
+    const names = ["a.mp3", "a.wav", "a.flac", "a.opus", "a.m4b", "a.weba"];
+    await withContainers(names, async (base) => {
+      for (const name of names) {
+        const res = await fetch(`${base}/audio/${name}`, { headers: auth() });
+
+        assert.equal(res.status, 200, `${name} is served`);
+        assert.match(
+          String(res.headers.get("content-type")),
+          /^audio\//,
+          `${name} arrives as audio, and not as an opaque stream`
+        );
+        await res.text();
+      }
+    });
+  });
+
+  it("answers .opus with the type the supplement supplies, not the table's opaque default", async () => {
+    await withContainers(["a.opus"], async (base) => {
+      const res = await fetch(`${base}/audio/a.opus`, { headers: auth() });
+
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("content-type"), "audio/ogg");
+      await res.text();
+    });
+  });
+
+  it("still serves a file that is not audio, with a type that is not audio", async () => {
+    // The mount is not the gate — the library is. Serving the bytes is unchanged; what this pins is
+    // that the mount does not *call* a thumbnail cache audio, which is what the library reads.
+    await withContainers(["Thumbs.db"], async (base) => {
+      const res = await fetch(`${base}/audio/Thumbs.db`, { headers: auth() });
+
+      assert.equal(res.status, 200);
+      assert.doesNotMatch(String(res.headers.get("content-type")), /^audio\//);
+      await res.text();
+    });
+  });
+});

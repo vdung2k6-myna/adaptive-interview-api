@@ -44,13 +44,44 @@ describe("the tracks a directory holds", () => {
     assert.deepEqual(
       library.tracks.map((t) => t.title).sort(),
       ["Back in Black", "Diem Xua"],
-      "the file's own name without its extension, and only the mp3s"
+      "the file's own name without its extension, and nothing that is not audio"
     );
     assert.equal(
       library.tracks[0]!.url.startsWith("/audio/"),
       true,
       "and a URL the mount serves, which is what a client fetches"
     );
+  });
+
+  it("is a library whatever container the tracks are kept in", async () => {
+    // What the library asks of a file is what the mount would serve it as, not what it is named — so
+    // a collection in `.flac`, `.wav` or `.opus` is a collection, and a collection of cover art and
+    // caches is not.
+    const dir = await dirUnder(AUDIO_ROOT);
+    await track(join(dir, "Mot Hai.flac"));
+    await track(join(dir, "Ba Bon.wav"));
+    await track(join(dir, "Nam Sau.opus"));
+    await writeFile(join(dir, "cover.jpg"), "not audio");
+    await writeFile(join(dir, "Thumbs.db"), "not audio either");
+
+    const library = await readLibrary(dir);
+
+    assert.ok(library.ok);
+    assert.deepEqual(
+      library.tracks.map((t) => t.title).sort(),
+      ["Ba Bon", "Mot Hai", "Nam Sau"],
+      "every audio container, and nothing that is not audio"
+    );
+  });
+
+  it("holds a directory of flac as a library rather than as an empty one", async () => {
+    const dir = await dirUnder(AUDIO_ROOT);
+    await track(join(dir, "Only Track.flac"));
+
+    const library = await readLibrary(dir);
+
+    assert.ok(library.ok, "a library the old test would have called empty");
+    assert.deepEqual(library.tracks.map((t) => t.title), ["Only Track"]);
   });
 
   it("holds a track filed in a folder, rather than passing over it in silence", async () => {
@@ -146,5 +177,28 @@ describe("the library as a shelf a caller numbers", () => {
       library.tracks.every((entry) => !/\.mp3$/.test(entry.title)),
       "the extension is the file system's, not a track's"
     );
+  });
+});
+
+describe("a library pointed at the audio root", () => {
+  it("is refused, because the root holds every session's recordings", async () => {
+    // A session's recordings live directly beneath the root, and a candidate's answer is written as
+    // `.wav` — which is audio, so the container rule cannot be the thing that keeps it out. A library
+    // pointed at the root would walk those directories and offer a person's own voice as a track.
+    const library = await readLibrary(AUDIO_ROOT);
+
+    assert.equal(library.ok, false);
+    assert.match(library.ok === false ? library.detail : "", /is the audio root/);
+    assert.match(String(await libraryComplaint(AUDIO_ROOT)), /is the audio root/, "and says so at boot");
+  });
+
+  it("leaves a library inside the root alone, which is where one belongs", async () => {
+    const dir = await dirUnder(AUDIO_ROOT);
+    await track(join(dir, "A Track.mp3"));
+
+    const library = await readLibrary(dir);
+
+    assert.ok(library.ok, "refusing the root must not refuse every directory beneath it");
+    assert.deepEqual(library.tracks.map((t) => t.title), ["A Track"]);
   });
 });

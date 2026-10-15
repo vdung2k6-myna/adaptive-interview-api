@@ -4,8 +4,12 @@
  */
 
 import { mkdir, writeFile, readFile, access, unlink, readdir, stat } from "fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "path";
+import { extname, isAbsolute, join, relative, resolve, sep } from "path";
 import { randomUUID } from "crypto";
+// The default import is the `Mime` **instance** `mime@1.6.0` exports, and `lookup` is a method on
+// it (`this.types`) rather than a free function — so it is called as `mime.lookup(...)` and not
+// destructured off, which would lose `this` and throw on every call.
+import mime from "mime";
 
 /**
  * The directory the audio mount serves.
@@ -42,6 +46,59 @@ export function urlPathForFile(filePath: string): string | null {
   const within = relative(root, full);
   if (within === "" || within.startsWith("..") || isAbsolute(within)) return null;
   return `/audio/${within.split(sep).map(encodeURIComponent).join("/")}`;
+}
+
+/**
+ * Containers the mount's own table does not know, and the type to serve them as.
+ *
+ * `send` resolves media types through `mime@1.6.0`, whose table was last filled in 2017 — so a
+ * container that postdates it comes back as `application/octet-stream`, `.opus` among them. A
+ * library reading only the mount's own answer would call a mainstream music file "not audio" while
+ * the mount handed it over as an opaque blob.
+ *
+ * An entry's criterion is two things together, and not "a container we can think of": the table
+ * lacks it, **and** a browser can play it. A container that is neither — `.ape`, `.wv`, `.dsf`,
+ * `.amr` — stays out, because offering a track that can only ever fail to play is nobody's favour.
+ */
+const CONTAINERS_THE_TABLE_LACKS: Record<string, string> = {
+  opus: "audio/ogg",
+  m4b: "audio/mp4",
+  m4r: "audio/mp4",
+};
+
+/**
+ * Playlist media types — audio-prefixed, and not tracks.
+ *
+ * A playlist refers to tracks rather than being one, so offering it would put something nobody can
+ * listen to on the shelf a model chooses from. Named rather than left to the `audio/` prefix, which
+ * admits `.m3u` (`audio/x-mpegurl`).
+ */
+const PLAYLIST_MEDIA_TYPES = new Set(["audio/x-mpegurl", "audio/x-scpls", "audio/x-m3u"]);
+
+/**
+ * The media type the audio mount serves a file with.
+ *
+ * **Used by both the mount and the music library, and that is the point.** The library asks "is this
+ * a track?" and the mount answers a client; if the two ever read different tables, what the library
+ * offers and what a client is handed stop agreeing. A `.opus` track the library lists and the mount
+ * serves as `application/octet-stream` is exactly that drift, which is the bug this function exists
+ * to make impossible.
+ *
+ * A container the table cannot resolve answers `application/octet-stream` rather than throwing,
+ * because that is what the mount serves; `isServableAudio` is where that becomes "not a track".
+ */
+export function audioMediaType(filePath: string): string {
+  const extension = extname(filePath).slice(1).toLowerCase();
+  return CONTAINERS_THE_TABLE_LACKS[extension] ?? mime.lookup(filePath);
+}
+
+/**
+ * Whether the mount would serve this file as audio — the one question the music library asks of each
+ * file it finds, and the reason `audioMediaType` is shared rather than written twice.
+ */
+export function isServableAudio(filePath: string): boolean {
+  const mediaType = audioMediaType(filePath);
+  return mediaType.startsWith("audio/") && !PLAYLIST_MEDIA_TYPES.has(mediaType);
 }
 
 /**

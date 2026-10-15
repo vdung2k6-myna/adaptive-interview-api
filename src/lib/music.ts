@@ -12,12 +12,18 @@
  * chooses from it, which is the part that repairs a title the transcriber heard wrongly and the part
  * no comparison of strings can. A second matcher here would be a worse copy of the bridge's, for a
  * turn that already has a model in it.
+ *
+ * **What counts as a track is the mount's answer, not a file extension.** A file is a track when the
+ * audio mount would serve it as audio — one table, shared with the mount itself, so the shelf a model
+ * is offered and the bytes a client fetches cannot disagree. That admits every audio container a
+ * deployment keeps, which is the point: a library of `.flac` is a library, and it was not one while
+ * this asked whether a name ended in `.mp3`.
  */
 
 import { readdir, stat } from "fs/promises";
-import { basename, join } from "path";
+import { basename, join, resolve } from "path";
 
-import { urlPathForFile } from "@/lib/audio/storage";
+import { AUDIO_ROOT, isServableAudio, urlPathForFile } from "@/lib/audio/storage";
 
 /** One track, as the model is offered it and as a client fetches it. */
 export interface Track {
@@ -44,6 +50,21 @@ export type Library = { ok: true; tracks: readonly Track[] } | { ok: false; deta
 export async function readLibrary(directory: string): Promise<Library> {
   if (directory === "") return { ok: false, detail: "this deployment has no music library" };
 
+  // The audio root holds every session's recordings as well as any music, and a session's recording
+  // is audio — a candidate's answer is written as `.wav`. So a library pointed at the root would walk
+  // into those directories and offer a person's own voice as a numbered track, to the model and to
+  // any client that asks. Refused on the same terms as a directory outside the root, and complete
+  // rather than a guess at directory names: sessions are only ever written directly beneath the root,
+  // so a library can hold one only if it *is* the root.
+  if (resolve(directory) === resolve(AUDIO_ROOT)) {
+    return {
+      ok: false,
+      detail:
+        `${directory} is the audio root, which holds every session's recordings as well as any ` +
+        `music. Point MUSIC_LIBRARY_DIR at a directory inside it.`,
+    };
+  }
+
   let files: string[];
   try {
     files = await listFiles(directory);
@@ -55,7 +76,7 @@ export async function readLibrary(directory: string): Promise<Library> {
   }
 
   const tracks: Track[] = [];
-  for (const file of files.filter((name) => name.toLowerCase().endsWith(".mp3"))) {
+  for (const file of files.filter((name) => isServableAudio(name))) {
     const url = urlPathForFile(join(directory, file));
     if (url === null) {
       // Nothing serves it, so offering it would be offering a name that plays silence. Reported
