@@ -3,7 +3,7 @@
  * Supports English and Vietnamese punctuation.
  *
  * Rules:
- * - Split on . ! ? … 。 ？ ！
+ * - Split on . ! ? … 。 ？ ！(but keep e.g. or i.e. )
  * - A period between two digits is part of a numeral, not a sentence end, so
  *   "3.5 năm" is one sentence while "Tổng cộng là 42." still ends one
  * - Preserve the delimiter in the returned sentence
@@ -14,7 +14,7 @@
 // follows", which is what makes a period part of a decimal numeral. They use
 // lookaround rather than consuming the neighbouring character, so the match
 // stays exactly the delimiter the caller slices on.
-const SENTENCE_END_REGEX = /(?:\.(?![0-9])|(?<![0-9])\.|[!?…。？！])+/g;
+const SENTENCE_END_REGEX = /(?:\.(?![0-9])|(?<![0-9])\.|([a-z]\.[a-z]\.)|[!?…。？！])+/g;
 const WHITESPACE_ONLY = /^\s*$/;
 
 /**
