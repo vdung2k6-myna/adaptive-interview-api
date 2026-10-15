@@ -341,7 +341,10 @@ curl http://localhost:8080/health
 npm run start:audio
 ```
 
-### Audio Files Not Found (404 on `/audio/...`)
+### Audio Files Not Found (`404` or `401` on `/audio/...`)
+
+`/audio` is served behind the API's Bearer token, so a request without a valid one is answered `401` whether or not the file exists — an absent file and a rejected credential are deliberately indistinguishable.
 
 - Verify `AUDIO_STORAGE_DIR` is set to a writable path.
 - On Windows, `/tmp/audio` may not exist — set `AUDIO_STORAGE_DIR` to a valid local path.
+- A `401` means the request carried no valid `Authorization: Bearer` header, not that the recording is missing.

@@ -11,11 +11,11 @@ Frontend: http://localhost:3000/api/...  →  Backend: http://localhost:4000/api
 Frontend: http://localhost:3000/audio/... →  Backend: http://localhost:4000/audio/...
 ```
 
-In production, a reverse proxy (nginx, Vercel, etc.) should route `/api/*` and `/audio/*` to the backend.
+In production, a reverse proxy (nginx, Vercel, etc.) should route `/api/*` and `/audio/*` to the backend. Both require the same credential — `/audio` is served behind the API's Bearer token, so a proxy that forwards `/audio` to an unauthenticated caller hands out interview recordings by URL alone.
 
 ## Authentication
 
-All API routes require a Bearer token when `API_AUTH_TOKEN` is configured. Token validation is performed by the Express backend.
+All routes under `/api/*`, and the `/audio/*` static mount, require a Bearer token when `API_AUTH_TOKEN` is configured. `GET /health` is public, and `/api/mcp` carries its own token instead. Token validation is performed by the Express backend. An unset `API_AUTH_TOKEN` disables authentication entirely rather than refusing to start.
 
 **Header:**
 
@@ -662,12 +662,15 @@ data: {"session":{"status":"in_progress","currentTurn":3,"maxTurns":8},"messageI
 
 Serve a stored audio file. Files are organized under the configured `AUDIO_STORAGE_DIR` (default `/tmp/audio/{sessionId}/`).
 
+**Authentication:** Required. This route takes the same `Authorization: Bearer` header as `/api/*`; there is no unauthenticated way to fetch a recording.
+
 **Response:** Audio stream (`audio/wav`, `audio/webm`, or `audio/mpeg`)
 
 **Status Codes:**
 
 - `200` — Audio file served
-- `404` — File not found
+- `401` — Missing or invalid Bearer token
+- `404` — File not found (only reachable with a valid token; without one an absent file answers `401` as well, so a caller cannot tell which recordings exist)
 
 ---
 
