@@ -1,6 +1,7 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { parseWav } from "./wav-utils";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -171,5 +172,40 @@ describe("the media type the mount serves a file with", () => {
     // shelf where a track belongs. The exclusion is named rather than inferred from the prefix.
     assert.equal(storage.audioMediaType("list.m3u"), "audio/x-mpegurl", "typed as audio");
     assert.equal(storage.isServableAudio("list.m3u"), false, "and still not a track");
+  });
+});
+
+describe("saveAudioFromPcm", () => {
+  it("writes a WAV whose header describes the PCM the windows carried", async () => {
+    const pcm = Buffer.from([1, 0, 2, 0, 3, 0, 4, 0]);
+    const pcmPath = join(root, "turn-0001.pcm");
+    await writeFile(pcmPath, pcm);
+
+    const { filePath, urlPath } = await storage.saveAudioFromPcm(
+      SESSION,
+      pcmPath,
+      pcm.length,
+      "candidate"
+    );
+
+    assert.match(urlPath, /^\/audio\/[0-9a-f-]+\/[0-9a-f-]+-candidate\.wav$/);
+
+    const wav = await readFile(filePath);
+    const parsed = parseWav(wav);
+
+    assert.deepEqual(parsed.fmt, {
+      audioFormat: 1,
+      numChannels: 1,
+      sampleRate: 16_000,
+      byteRate: 32_000,
+      blockAlign: 2,
+      bitsPerSample: 16,
+    });
+    assert.equal(parsed.pcmLength, pcm.length, "the header states the length the answer ended up having");
+    assert.deepEqual(
+      [...wav.subarray(parsed.pcmOffset, parsed.pcmOffset + parsed.pcmLength)],
+      [...pcm],
+      "and the bytes behind it are the windows' PCM, in order"
+    );
   });
 });

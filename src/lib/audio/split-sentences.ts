@@ -51,6 +51,23 @@ export function splitSentences(text: string): string[] {
 }
 
 /**
+ * Where the last complete sentence ends, using the same delimiter rules as
+ * `splitSentences`.
+ *
+ * Exposed for a streaming caller that needs to know how much of its buffer has
+ * been read: keeping only what follows this offset makes the next token re-read
+ * one unfinished sentence rather than the whole reply. Zero when the text holds
+ * no delimiter yet.
+ */
+export function lastSentenceBoundary(text: string): number {
+  let end = 0;
+  for (const match of text.matchAll(SENTENCE_END_REGEX)) {
+    end = match.index! + match[0].length;
+  }
+  return end;
+}
+
+/**
  * Extract only *new* sentences that have appeared since the last buffer.
  * Used during streaming: given previous accumulated text and new accumulated text,
  * return the sentences that are fully closed (have a delimiter) and newly available.

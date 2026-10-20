@@ -63,6 +63,49 @@ describe("the material settings each environment defaults to", () => {
   });
 });
 
+describe("the bounds work under load is held to", () => {
+  it("keeps this process below the model's measured concurrency ceiling", () => {
+    // The account was measured to refuse above ~15 requests in flight
+    // (docs/CAPACITY.md). Twelve is the bound that leaves room to retry before a
+    // refusal ever reaches a turn.
+    for (const [name, config] of ENVIRONMENTS) {
+      assert.equal(
+        config.ollama.maxConcurrentRequests,
+        12,
+        `${name}: ${envNote("OLLAMA_MAX_CONCURRENT_REQUESTS")}`
+      );
+    }
+  });
+
+  it("gives a refusal a deadline long enough to be retried, shorter in development", () => {
+    assert.equal(
+      developmentConfig.ollama.retryDeadlineMs,
+      20_000,
+      envNote("OLLAMA_RETRY_DEADLINE_MS")
+    );
+    assert.equal(
+      productionConfig.ollama.retryDeadlineMs,
+      30_000,
+      envNote("OLLAMA_RETRY_DEADLINE_MS")
+    );
+  });
+
+  it("attempts a refused request more often in production than in development", () => {
+    assert.equal(developmentConfig.ollama.retries, 1, envNote("OLLAMA_RETRIES"));
+    assert.equal(productionConfig.ollama.retries, 2, envNote("OLLAMA_RETRIES"));
+  });
+
+  it("bounds one turn's syntheses so a long reply cannot take the gateway", () => {
+    for (const [name, config] of ENVIRONMENTS) {
+      assert.equal(
+        config.audio.synthesisConcurrency,
+        4,
+        `${name}: ${envNote("AUDIO_SYNTHESIS_CONCURRENCY")}`
+      );
+    }
+  });
+});
+
 describe("the bounds a turn's tool calls are held to", () => {
   it("gives a turn three rounds, which is one request for a track answered in two calls", () => {
     // Two was set for a person asking for two things in one breath. A request for a track is one

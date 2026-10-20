@@ -9,7 +9,29 @@ export interface AppConfig {
     embedModel: string;
     chatTimeoutMs: number;
     embedTimeoutMs: number;
+    /**
+     * How many further attempts a request refused before any content streamed
+     * is given. A refusal there is the service saying it is at its concurrency
+     * limit, not that the request was wrong, so the turn waits rather than
+     * failing. A failure after content has started is never retried: the reply
+     * would be spoken twice.
+     */
     retries: number;
+    /**
+     * The whole retry budget, attempts included. Bounded separately from the
+     * attempt count because backoff spends time, not attempts, and a turn that
+     * has waited longer than this is worse than one that reports it could not
+     * be answered.
+     */
+    retryDeadlineMs: number;
+    /**
+     * How many model requests this process may have in flight at once.
+     *
+     * Below the service's own ceiling on purpose: a refusal that is avoided is a
+     * turn that never has to wait for a retry. It counts every caller — turns,
+     * the agent's tool rounds, embedding — because they share one account.
+     */
+    maxConcurrentRequests: number;
   };
   evaluation: {
     temperature: number;
@@ -34,6 +56,15 @@ export interface AppConfig {
     defaultEngine: "kokoro" | "piper" | "supertonic"; // default TTS engine
     defaultVoice: string;   // voice ID, e.g. "F1" (supertonic) or "af_heart" (kokoro)
     timeoutMs: number;
+    /**
+     * How many syntheses one turn may have in flight at once.
+     *
+     * A reply hands over every segment it has at a sentence boundary, and the
+     * gateway serves them one at a time; without this bound a long reply
+     * occupies the gateway with its own backlog and every other turn waits
+     * behind it.
+     */
+    synthesisConcurrency: number;
     /**
      * How long a streamed turn's per-segment files stay on disk after they are
      * written. It only has to outlast a client's fetch of a segment it has just
@@ -72,6 +103,18 @@ export interface AppConfig {
       piper: number;
       supertonic: number;
     };
+  };
+  /**
+   * How long a turn's windows are held before the turn has to claim them.
+   *
+   * The buffer holds what has been transcribed and the audio those windows
+   * carried; a turn that is never submitted — a person who stops and walks away —
+   * would otherwise leave both until the process exits. Long enough to outlast the
+   * longest answer the transport accepts, short enough that an abandoned turn is
+   * not held for a day.
+   */
+  transcriptBuffer: {
+    retentionMs: number;
   };
   docEtl: {
     apiUrl: string;          // Document ETL service URL for knowledge retrieval

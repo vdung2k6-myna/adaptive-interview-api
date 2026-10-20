@@ -3,13 +3,17 @@
  * Files are organized under /tmp/audio/{sessionId}/.
  */
 
-import { mkdir, writeFile, readFile, access, unlink, readdir, stat } from "fs/promises";
+import { copyFile, mkdir, writeFile, readFile, access, unlink, readdir, stat } from "fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
+import { writeWavHeader, type WavFmt } from "./wav-utils";
 import { extname, isAbsolute, join, relative, resolve, sep } from "path";
 import { randomUUID } from "crypto";
 // The default import is the `Mime` **instance** `mime@1.6.0` exports, and `lookup` is a method on
 // it (`this.types`) rather than a free function — so it is called as `mime.lookup(...)` and not
 // destructured off, which would lose `this` and throw on every call.
 import mime from "mime";
+import { sweepStaleUploads } from "@/lib/upload";
 
 /**
  * The directory the audio mount serves.
@@ -132,7 +136,7 @@ async function ensureSessionDir(sessionId: string): Promise<string> {
  */
 export async function saveAudio(
   sessionId: string,
-  blob: Blob | Buffer,
+  blob: Blob | Buffer | string,
   prefix: string,
   ext: string
 ): Promise<{ filePath: string; urlPath: string }> {
@@ -140,6 +144,16 @@ export async function saveAudio(
   const id = randomUUID();
   const filename = `${id}-${prefix}.${ext}`;
   const filePath = join(dir, filename);
+
+  // A path is copied rather than read: an uploaded recording is already on disk,
+  // and reading it here would put the whole recording back in the heap — which is
+  // what receiving it on disk was for. `copyFile` streams in the kernel.
+  if (typeof blob === "string") {
+    await copyFile(blob, filePath);
+    console.log(`[saveAudio] Copied ${filePath} from ${blob}`);
+    const urlPath = `/audio/${sessionId}/${filename}`;
+    return { filePath, urlPath };
+  }
 
   let buffer: Buffer;
   if (Buffer.isBuffer(blob)) {
@@ -156,6 +170,49 @@ export async function saveAudio(
   const urlPath = `/audio/${sessionId}/${filename}`;
 
   return { filePath, urlPath };
+}
+
+/**
+ * The one format a turn's windows are sent in — the capture contract the
+ * `voice-ingest` spec states: one channel at 16 kHz, 16-bit samples.
+ *
+ * Fixed here rather than carried on the wire: every window is checked against
+ * this at the route, so a stream of them can be concatenated by appending bytes
+ * with no per-window parsing left to do at the end.
+ */
+const WINDOW_WAV_FORMAT: WavFmt = {
+  audioFormat: 1,
+  numChannels: 1,
+  sampleRate: 16_000,
+  byteRate: 32_000,
+  blockAlign: 2,
+  bitsPerSample: 16,
+};
+
+/**
+ * Write a recording assembled from a turn's raw window PCM.
+ *
+ * The header is written first with the length the PCM ended up having, then the
+ * PCM is streamed in behind it — the same order the client's own assembly uses,
+ * and for the same reason: nothing has to hold the recording to know its size.
+ */
+export async function saveAudioFromPcm(
+  sessionId: string,
+  pcmPath: string,
+  pcmBytes: number,
+  prefix: string
+): Promise<{ filePath: string; urlPath: string }> {
+  const dir = await ensureSessionDir(sessionId);
+  const filename = `${randomUUID()}-${prefix}.wav`;
+  const filePath = join(dir, filename);
+
+  await writeFile(filePath, writeWavHeader(pcmBytes, WINDOW_WAV_FORMAT));
+  if (pcmBytes > 0) {
+    await pipeline(createReadStream(pcmPath), createWriteStream(filePath, { flags: "a" }));
+  }
+
+  console.log(`[saveAudioFromPcm] Wrote ${pcmBytes} PCM bytes to ${filePath}`);
+  return { filePath, urlPath: `/audio/${sessionId}/${filename}` };
 }
 
 /**
@@ -317,8 +374,14 @@ export async function sweepStaleSegments(
     }
   }
 
+  // An upload that was never consumed — a request that died between multer
+  // writing it and the route taking it — is reclaimed by the same sweep, so a
+  // crash cannot leave bodies on disk forever. Its age is its own: an upload is
+  // dead after an hour, not after the segment window.
+  removed.push(...(await sweepStaleUploads(now).catch(() => [])));
+
   if (removed.length > 0) {
-    console.log(`[sweepStaleSegments] Removed ${removed.length} aged-out segment file(s)`);
+    console.log(`[sweepStaleSegments] Removed ${removed.length} aged-out file(s)`);
   }
 
   return removed;

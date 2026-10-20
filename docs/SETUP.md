@@ -193,56 +193,37 @@ curl http://localhost:11434/api/tags
 
 ## 7. Audio Services (Optional — for Voice Interviews)
 
-Voice interviews require an audio stack (STT + TTS) maintained in this repository.
+Voice interviews require an audio tier maintained in this repository. It runs as one
+compose project: speech-to-text behind a proxy, three TTS engines, and the gateway.
 
 | Service | Port | Directory | Purpose |
 |---------|------|-----------|---------|
-| **audio.cpp** | 8080 | External | Speech-to-text (STT) transcription |
+| **audio.cpp** | 8080 (via proxy) | `audiocpp-service/` | Speech-to-text (STT), pinned upstream CUDA image |
 | **Kokoro** | 8081 | `kokoro-service/` | Text-to-speech (TTS) — fast, high quality |
 | **Piper** | 8083 | `piper-service/` | Text-to-speech (TTS) — multiple voices |
 | **Supertonic** | 8084 | `supertonic-service/` | Text-to-speech (TTS) — 31 languages, 44.1kHz, voice cloning |
 | **Audio Gateway** | 8082 | `audio-gateway/` | Unified TTS proxy — routes to Kokoro, Piper, or Supertonic |
 
+Only 8080 and 8082 are published; every engine port stays inside the compose network.
+
 ### Setup
 
 ```bash
-# Kokoro (currently ships a Vietnamese model)
-cd kokoro-service
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python download_models.py
+# 1. Provision models once under AUDIO_MODELS_DIR (default ./audio-models):
+#    audiocpp, kokoro, piper, supertonic. See docs/AUDIO_TIER.md.
 
-# Piper
-cd ../piper-service
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-# piper-tts is a required import but is NOT in requirements.txt (it is
-# GPL-3.0-or-later). Install it explicitly or the service starts with 0 voices:
-pip install piper-tts
-
-# Download the English voice for English interviews (optional if only Vietnamese is needed)
-# Place in ../pipervoices/:
-#   en_US-lessac-medium.onnx
-#   en_US-lessac-medium.onnx.json
-
-# Supertonic (model weights download on first use)
-cd ../supertonic-service
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python -c "from supertonic import TTS; _ = TTS()"
-
-# Audio Gateway
-cd ../audio-gateway
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+# 2. Start the tier and wait for health:
+npm run start:audio
+# or: docker compose -f docker-compose.audio.yml up -d --build
 ```
 
-See each service's README for detailed setup:
+Docker is required. The STT service needs an NVIDIA GPU and the NVIDIA Container
+Toolkit; the TTS engines are CPU-only. See [AUDIO_TIER.md](AUDIO_TIER.md) for host
+prerequisites, model provisioning, private binding on a server, and scaling STT.
 
+Per-service READMEs cover the HTTP contracts and the pins:
+
+- [`audiocpp-service/README.md`](../audiocpp-service/README.md)
 - [`audio-gateway/README.md`](../audio-gateway/README.md)
 - [`kokoro-service/README.md`](../kokoro-service/README.md)
 - [`piper-service/README.md`](../piper-service/README.md)

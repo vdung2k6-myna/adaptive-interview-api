@@ -12,7 +12,18 @@ export const developmentConfig: AppConfig = {
     embedModel: process.env.OLLAMA_EMBED_MODEL || "mxbai-embed-large",
     chatTimeoutMs: 120_000, // 120s — kimi-k2.6:cloud needs more time for long context
     embedTimeoutMs: 15_000, // 15s
-    retries: 1,
+    retries: parsePositiveInt(process.env.OLLAMA_RETRIES, 1),
+    retryDeadlineMs: parsePositiveInt(process.env.OLLAMA_RETRY_DEADLINE_MS, 20_000),
+    // Twelve, below the fifteen the cloud account was measured to accept
+    // (`docs/CAPACITY.md`). Staying under it is the point: a turn queues here,
+    // where it can be ordered, instead of being refused upstream.
+    maxConcurrentRequests: parsePositiveInt(process.env.OLLAMA_MAX_CONCURRENT_REQUESTS, 12),
+  },
+  transcriptBuffer: {
+    // Fifteen minutes: the transport accepts about five and a half of speech, so
+    // this is the answer plus the pause after it, and an abandoned turn is
+    // reclaimed well before a process restart would do it.
+    retentionMs: parsePositiveInt(process.env.TRANSCRIPT_BUFFER_RETENTION_MS, 15 * 60_000),
   },
   evaluation: {
     temperature: 0.3,
@@ -37,6 +48,10 @@ export const developmentConfig: AppConfig = {
     defaultEngine: (process.env.DEFAULT_TTS_ENGINE as "kokoro" | "piper" | "supertonic") || "supertonic",
     defaultVoice: process.env.DEFAULT_VOICE || "F1",
     timeoutMs: 60_000,
+    // Four: enough that a reply's segments are spoken as they are produced, few
+    // enough that one long reply cannot occupy the gateway. The gateway was
+    // measured at 23x real-time and serializing (`docs/CAPACITY.md`).
+    synthesisConcurrency: parsePositiveInt(process.env.AUDIO_SYNTHESIS_CONCURRENCY, 4),
     // 10 minutes — the generous end of "a few minutes". Disk here is one
     // developer's, and the case a tight window would break is exactly the one
     // that happens on a dev machine: a tab left open across a restart, still

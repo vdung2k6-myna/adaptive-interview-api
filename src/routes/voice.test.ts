@@ -1,7 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { Server } from "node:http";
+import { readFile, readdir } from "node:fs/promises";
 import express from "express";
+import { UPLOAD_TEMP_DIR } from "../lib/upload";
+import { turnTranscripts } from "../lib/turn-transcript";
+import { writeWavHeader } from "../lib/audio/wav-utils";
 import { createVoiceRouter, type VoiceRouteDeps, type SessionForTurn } from "./voice";
 
 interface Harness {
@@ -523,3 +527,227 @@ describe("POST /api/voice/speak-stream — the router's other routes", () => {
     });
   });
 });
+
+describe("POST /api/voice/turn — an upload the route cannot take", () => {
+  it("leaves no temporary file behind", async () => {
+    await withServer({}, async (api) => {
+      const before = new Set(await readdir(UPLOAD_TEMP_DIR).catch(() => [] as string[]));
+
+      const form = new FormData();
+      const part = new Uint8Array(9);
+      part.set(Buffer.from("not audio"));
+      form.append("audio", new Blob([part], { type: "audio/webm" }), "answer.webm");
+      // No sessionId, so the handler returns before it copies anything: the case
+      // where the body was received but never adopted.
+      const response = await fetch(api.turn, { method: "POST", body: form });
+      assert.equal(response.status, 400);
+
+      // The handler's `finally` runs once the response has ended.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const after = await readdir(UPLOAD_TEMP_DIR).catch(() => [] as string[]);
+      assert.deepEqual(
+        after.filter((name) => !before.has(name)),
+        [],
+        "a rejected upload must not leave its body on disk"
+      );
+    });
+  });
+});
+
+describe("POST /api/voice/window — a turn transcribed while it is spoken", () => {
+  /** A window in the one format the route accepts. */
+  function windowWav(pcm: Buffer, overrides: Partial<Parameters<typeof writeWavHeader>[1]> = {}): Buffer {
+    const header = writeWavHeader(pcm.length, {
+      audioFormat: 1,
+      numChannels: 1,
+      sampleRate: 16_000,
+      byteRate: 32_000,
+      blockAlign: 2,
+      bitsPerSample: 16,
+      ...overrides,
+    });
+    return Buffer.concat([header, pcm]);
+  }
+
+  function windowForm(turnId: string, sessionId: string, audio: Buffer, index = 0): FormData {
+    const form = new FormData();
+    form.append("audio", new Blob([new Uint8Array(audio)], { type: "audio/wav" }), "window.wav");
+    form.append("turnId", turnId);
+    form.append("index", String(index));
+    form.append("sessionId", sessionId);
+    form.append("language", "english");
+    return form;
+  }
+
+  it("transcribes a window and holds its text and audio for the turn", async () => {
+    const turnId = "turn-window-0001";
+    const sessionId = "session-window-0001";
+    const pcm = Buffer.from([1, 2, 3, 4]);
+
+    const languages: (string | undefined)[] = [];
+
+    await withServer(
+      {
+        transcribeAudio: async (_path, _model, language) => {
+          languages.push(language);
+          return { text: "  Hello from the window.  ", confidence: 0.9 };
+        },
+      },
+      async (api) => {
+        const response = await fetch(api.stream.replace(/\/stream$/, "/window"), {
+          method: "POST",
+          body: windowForm(turnId, sessionId, windowWav(pcm)),
+        });
+        assert.equal(response.status, 202);
+      }
+    );
+
+    assert.deepEqual(languages, ["en"], "the session's language is pinned, as on a turn");
+
+    const claim = await turnTranscripts.claim({ turnId, sessionId });
+    assert.ok(claim, "the window is held under the turn it names");
+    assert.deepEqual(claim.outcome, { ok: true, text: "Hello from the window." });
+    assert.deepEqual([...(await readFile(claim.pcmPath))], [1, 2, 3, 4], "the PCM is what the window carried");
+    await turnTranscripts.discard(claim);
+  });
+
+  it("refuses a window that is not the platform's capture format", async () => {
+    const turnId = "turn-window-0002";
+    const sessionId = "session-window-0002";
+
+    await withServer({}, async (api) => {
+      const stereo = windowWav(Buffer.from([1, 2, 3, 4]), { numChannels: 2, blockAlign: 4, byteRate: 64_000 });
+      const response = await fetch(api.stream.replace(/\/stream$/, "/window"), {
+        method: "POST",
+        body: windowForm(turnId, sessionId, stereo),
+      });
+      assert.equal(response.status, 400);
+    });
+
+    assert.equal(await turnTranscripts.claim({ turnId, sessionId }), null);
+  });
+
+  it("marks the turn unanswerable when a window cannot be transcribed", async () => {
+    const turnId = "turn-window-0003";
+    const sessionId = "session-window-0003";
+
+    await withServer(
+      {
+        transcribeAudio: async () => {
+          throw new Error("the transcriber is down");
+        },
+      },
+      async (api) => {
+        const response = await fetch(api.stream.replace(/\/stream$/, "/window"), {
+          method: "POST",
+          body: windowForm(turnId, sessionId, windowWav(Buffer.from([1, 2]))),
+        });
+        assert.equal(response.status, 502);
+      }
+    );
+
+    const claim = await turnTranscripts.claim({ turnId, sessionId });
+    assert.ok(claim);
+    assert.deepEqual(claim.outcome, {
+      ok: false,
+      message: "Part of the answer could not be transcribed.",
+    });
+    await turnTranscripts.discard(claim);
+  });
+});
+
+describe("POST /api/voice/window — a window sent twice", () => {
+  function windowWav(pcm: Buffer): Buffer {
+    return Buffer.concat([
+      writeWavHeader(pcm.length, {
+        audioFormat: 1,
+        numChannels: 1,
+        sampleRate: 16_000,
+        byteRate: 32_000,
+        blockAlign: 2,
+        bitsPerSample: 16,
+      }),
+      pcm,
+    ]);
+  }
+
+  it("is taken once, so the answer is not spoken twice", async () => {
+    const turnId = "turn-window-dup-0001";
+    const sessionId = "session-window-dup-0001";
+    const pcm = Buffer.from([1, 2, 3, 4]);
+
+    // The same request twice, as a client retry after a lost answer would send it.
+    await withServer(
+      {
+        transcribeAudio: async () => ({ text: "The whole window.", confidence: 0.9 }),
+      },
+      async (api) => {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const form = windowFormFor(turnId, sessionId, windowWav(pcm), 0);
+          const response = await fetch(api.stream.replace(/\/stream$/, "/window"), {
+            method: "POST",
+            body: form,
+          });
+          assert.equal(response.status, 202);
+        }
+      }
+    );
+
+    const claim = await turnTranscripts.claim({ turnId, sessionId });
+    assert.ok(claim);
+    assert.deepEqual(claim.outcome, { ok: true, text: "The whole window." });
+    assert.equal(claim.pcmBytes, 4, "the retry added no audio");
+    assert.deepEqual([...(await readFile(claim.pcmPath))], [1, 2, 3, 4]);
+    await turnTranscripts.discard(claim);
+  });
+
+  it("takes a window from a client too old to name its place", async () => {
+    const turnId = "turn-window-noindex-0001";
+    const sessionId = "session-window-noindex-0001";
+
+    await withServer(
+      { transcribeAudio: async () => ({ text: "From an older client.", confidence: 0.9 }) },
+      async (api) => {
+        const form = windowFormFor(turnId, sessionId, windowWav(Buffer.from([1, 2])), null);
+        const response = await fetch(api.stream.replace(/\/stream$/, "/window"), {
+          method: "POST",
+          body: form,
+        });
+        assert.equal(response.status, 202, "an older client keeps working while it is rebuilt");
+      }
+    );
+
+    const claim = await turnTranscripts.claim({ turnId, sessionId });
+    assert.ok(claim);
+    assert.deepEqual(claim.outcome, { ok: true, text: "From an older client." });
+    await turnTranscripts.discard(claim);
+  });
+
+  it("refuses an index that is not a place in the turn", async () => {
+    await withServer({}, async (api) => {
+      const form = windowFormFor("turn-window-badindex", "session-window-badindex", windowWav(Buffer.from([1])), -1);
+      const response = await fetch(api.stream.replace(/\/stream$/, "/window"), {
+        method: "POST",
+        body: form,
+      });
+      assert.equal(response.status, 400);
+    });
+  });
+});
+
+/** A window request with an explicit index; `null` omits the field entirely. */
+function windowFormFor(
+  turnId: string,
+  sessionId: string,
+  audio: Buffer,
+  index: number | null
+): FormData {
+  const form = new FormData();
+  form.append("audio", new Blob([new Uint8Array(audio)], { type: "audio/wav" }), "window.wav");
+  form.append("turnId", turnId);
+  if (index !== null) form.append("index", String(index));
+  form.append("sessionId", sessionId);
+  form.append("language", "english");
+  return form;
+}

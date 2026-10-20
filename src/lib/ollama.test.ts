@@ -1,9 +1,10 @@
-import { after, afterEach, before, describe, it, mock } from "node:test";
+import { after, afterEach, before, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { generateChatResponseStream } from "./ollama";
+import config from "./config";
 
 /**
  * What the streaming chat call reports about its own cost.
@@ -153,5 +154,115 @@ describe("generateChatResponseStream token counts", () => {
     assert.equal(logs.length, 1, `expected the counts, got ${JSON.stringify(logs)}`);
     assert.match(logs[0], /prompt_eval_count=12/);
     assert.match(logs[0], /eval_count=3/);
+  });
+});
+
+/**
+ * A model that answers "too many concurrent requests" is not a model that failed
+ * — it is one at its limit, and the turn should wait for it. These drive the
+ * retry against a stub that refuses, and then either answers or is cut off
+ * mid-stream, which is the case that must *not* be retried: the reply has already
+ * been spoken once.
+ */
+describe("generateChatResponseStream under a concurrency refusal", () => {
+  let server: Server;
+  let requests = 0;
+  let respond: (res: ServerResponse) => void;
+
+  before(async () => {
+    server = createServer((_req: IncomingMessage, res: ServerResponse) => {
+      requests++;
+      respond(res);
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    process.env.OLLAMA_BASE_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  after(async () => {
+    delete process.env.OLLAMA_BASE_URL;
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  beforeEach(() => {
+    requests = 0;
+  });
+
+  function refuse(res: ServerResponse, status = 429) {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "too many concurrent requests" }));
+  }
+
+  function speak(res: ServerResponse) {
+    res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+    res.end(
+      [
+        JSON.stringify({ message: { content: "Hello" }, done: false }),
+        JSON.stringify({ done: true }),
+        "",
+      ].join("\n")
+    );
+  }
+
+  async function drive(): Promise<string> {
+    const result = generateChatResponseStream({
+      model: "stub-model",
+      messages: [{ role: "user", content: "hello" }],
+    });
+    const reader = result.stream.getReader();
+    let text = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      text += value;
+    }
+    return text;
+  }
+
+  it("retries a refusal made before any content and answers the turn", async () => {
+    let calls = 0;
+    respond = (res) => {
+      calls++;
+      if (calls === 1) refuse(res);
+      else speak(res);
+    };
+
+    const text = await drive();
+
+    assert.equal(text, "Hello", "the second attempt's content reaches the turn");
+    assert.equal(requests, 2, "the refusal is asked again exactly once");
+  });
+
+  it("reports the refusal when every attempt is refused", async () => {
+    respond = (res) => refuse(res);
+
+    await assert.rejects(drive(), (err: Error) => {
+      assert.match(err.message, /429/, "the caller is told what the service said");
+      return true;
+    });
+
+    assert.equal(
+      requests,
+      config.ollama.retries + 1,
+      "attempts stop at the configured count rather than retrying forever"
+    );
+  });
+
+  it("does not retry once content has streamed", async () => {
+    respond = (res) => {
+      res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+      res.write(`${JSON.stringify({ message: { content: "Half" }, done: false })}\n`);
+      // The connection dies after the first chunk, as a dropped upstream would.
+      setTimeout(() => res.destroy(), 5);
+    };
+
+    await assert.rejects(drive(), "a reply interrupted mid-stream is a failure");
+
+    assert.equal(
+      requests,
+      1,
+      "asking again would speak the whole reply twice, so this failure is not retried"
+    );
   });
 });

@@ -17,6 +17,10 @@ backend.log
 # Audio models (large binary files)
 pipervoices/
 kokoro-service/models/
+# The containerized tier's single persistent model directory. Models are
+# provisioned per host (see audiocpp-service/download_models.py and
+# docs/AUDIO_TIER.md), never baked into an image or committed.
+audio-models/
 
 # Voice style files. These are learned tensors, not configuration: a cloned
 # voice is derived from a recording of a real person, and its metadata names
@@ -49,3 +53,4 @@ scratch-e2e/topics.json
 scratch-e2e/turnA.answer.txt
 scratch-e2e/turnB.answer.txt
 docs/LICENSE_AUDIT.md
+docs/DEPLOYMENT.md

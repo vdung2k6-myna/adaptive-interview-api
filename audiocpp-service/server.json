@@ -1,0 +1,15 @@
+{
+  "host": "0.0.0.0",
+  "port": 8080,
+  "backend": "cuda",
+  "device": 0,
+  "models": [
+    {
+      "id": "stt",
+      "family": "qwen3_asr",
+      "path": "/app/models/Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-q8_0.gguf",
+      "task": "asr",
+      "mode": "offline"
+    }
+  ]
+}

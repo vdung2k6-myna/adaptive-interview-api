@@ -1,9 +1,11 @@
 import { Router, type Request, type Response } from "express";
-import multer from "multer";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, writeFile, rm } from "fs/promises";
-import { tmpdir } from "os";
-import { join } from "path";
+import { audioUpload, discardUpload } from "@/lib/upload";
+import {
+  readTurnId,
+  turnTranscripts,
+  type TurnTranscriptStore,
+} from "@/lib/turn-transcript";
 import { buildVoiceAgentPrompt, trimVoiceAgentHistory, type VoiceAgentMessage } from "@/lib/prompts";
 import {
   generateChatResponse,
@@ -34,7 +36,9 @@ import {
   type SynthesizeOptions,
 } from "@/lib/audio";
 
-const upload = multer({ storage: multer.memoryStorage() });
+// The body is written to disk as it arrives; see `lib/upload.ts` for why, and
+// for the sweep that reclaims one nothing consumed.
+const upload = audioUpload;
 
 /**
  * The two tools this platform answers itself, named under a prefix of its own.
@@ -108,8 +112,10 @@ export function createVoiceAgentRouter(overrides: Partial<VoiceAgentDeps> = {}):
   // told what the gadget did about it. One registry per router instance, like the holds above.
   const toolCalls = createToolCallStore();
 
+  // The windows a turn's client sent while the answer was being recorded: the
+  // process's buffer, because they arrive on the voice route's `/window`.
   router.post("/stream", upload.single("audio"), (req, res) =>
-    handleStream(req, res, deps, prefetch, session, toolCalls)
+    handleStream(req, res, deps, prefetch, session, toolCalls, turnTranscripts)
   );
   router.post("/prefetch", (req, res) => handlePrefetch(req, res, prefetch));
 
@@ -246,19 +252,6 @@ function canLocateMaterial(chunks: KnowledgeChunk[], answerMode: AnswerMode): bo
   }).ok;
 }
 
-/**
- * Save uploaded audio to a temp file for STT, then clean it up.
- */
-async function withTempAudioFile(buffer: Buffer, ext: string, fn: (path: string) => Promise<void>) {
-  const tmpDir = await mkdtemp(join(tmpdir(), "voice-agent-"));
-  const tmpPath = join(tmpDir, `audio.${ext}`);
-  try {
-    await writeFile(tmpPath, buffer);
-    await fn(tmpPath);
-  } finally {
-    await rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
-  }
-}
 
 /* ── POST /api/voice-agent/stream ───────────────────────────────── */
 
@@ -268,7 +261,8 @@ async function handleStream(
   deps: VoiceAgentDeps,
   prefetch: PrefetchStore,
   session: SessionKnowledge,
-  toolCalls: ToolCallStore
+  toolCalls: ToolCallStore,
+  transcripts: TurnTranscriptStore
 ): Promise<void> {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -426,20 +420,43 @@ async function handleStream(
     }
 
     let userText = "";
-    if (audioFile) {
-      const audioExt = audioFile.mimetype === "audio/wav" ? "wav" : "webm";
-      await withTempAudioFile(audioFile.buffer, audioExt, async (tmpPath) => {
-        // The turn already carries its language, which is the one thing the
-        // transcriber cannot work out for itself on this audio: left to detect,
-        // it answers short Vietnamese in Chinese, and the persona then corrects
-        // the person for words they never said. See resolveSttLanguage.
-        const sttResult = await deps.transcribeAudio(
-          tmpPath,
-          undefined,
-          resolveSttLanguage(language)
-        );
-        userText = sttResult.text;
-      });
+    const turnId = readTurnId(req.body.turnId);
+    if (turnId) {
+      // The answer was transcribed window by window while it was being spoken;
+      // the turn only names it. A turn this process no longer holds — expired, or
+      // one whose windows were never sent here — is refused rather than answered
+      // from nothing.
+      const claim = await transcripts.claim({ turnId });
+      if (!claim) {
+        sendSseEvent(res, "error", { message: "This turn is no longer available." });
+        res.end();
+        return;
+      }
+      try {
+        if (!claim.outcome.ok) {
+          sendSseEvent(res, "error", { message: claim.outcome.message });
+          res.end();
+          return;
+        }
+        userText = claim.outcome.text;
+      } finally {
+        await transcripts.discard(claim);
+      }
+    } else if (audioFile) {
+      // The upload is already a file on disk — multer wrote it as it arrived —
+      // so there is nothing to copy before transcribing, and nothing this route
+      // ever holds in the heap.
+      //
+      // The turn already carries its language, which is the one thing the
+      // transcriber cannot work out for itself on this audio: left to detect,
+      // it answers short Vietnamese in Chinese, and the persona then corrects
+      // the person for words they never said. See resolveSttLanguage.
+      const sttResult = await deps.transcribeAudio(
+        audioFile.path,
+        undefined,
+        resolveSttLanguage(language)
+      );
+      userText = sttResult.text;
     } else if (textInput) {
       userText = textInput;
     }
@@ -596,6 +613,11 @@ async function handleStream(
     // across them (D3) — the index used to live in a route-level counter that
     // both sites incremented. This route is the caller that discovers its
     // sentences one at a time, so each is pushed as it is extracted.
+    // The per-turn synthesis bound is the core's own serial drain: it synthesizes
+    // one chunk at a time (`sentence-stream.ts`), so this route can never have
+    // more than one in flight, and one long reply cannot occupy the gateway.
+    // The bound in the config is the ceiling both routes are held to; the other
+    // route, which schedules its own chunks, enforces it explicitly.
     const sentenceStream = new SentenceStream({
       // A muted turn answers every chunk with no audio rather than not answering
       // at all: the stream still walks every chunk, so the indices, the texts and
@@ -997,6 +1019,7 @@ async function handleStream(
     // Also covers the early return on a missing systemPrompt, which leaves
     // before the streaming block's own finally.
     cleanupHeartbeat();
+    await discardUpload(req.file);
   }
 }
 
