@@ -91,6 +91,27 @@ describe("AudioCppClient.transcribe", () => {
     );
   });
 
+  it("sends the file's bytes as they are on disk", async () => {
+    answerJson(200, { text: "heard" });
+
+    // A marker at each end, and enough of a middle that a body assembled from a
+    // truncated read would be visible. The audio is handed to fetch as a Blob over
+    // the file, so this is the check that "streamed from disk" still means "all of
+    // it, in order".
+    const payload = Buffer.concat([
+      Buffer.from("START-MARKER"),
+      Buffer.alloc(64 * 1024, 0x42),
+      Buffer.from("END-MARKER"),
+    ]);
+    await writeFile(audioPath, payload);
+
+    await client.transcribe(audioPath);
+
+    const body = requests.at(-1)!.body;
+    assert.ok(body.includes(payload.subarray(0, 12)), "the first bytes reached the service");
+    assert.ok(body.includes(payload.subarray(payload.length - 10)), "and so did the last");
+  });
+
   it("answers an empty transcript instead of throwing — nobody spoke", async () => {
     // The reported bug: this used to throw, so a silent recording reached every
     // caller looking exactly like a dead STT service, and each reported a failed

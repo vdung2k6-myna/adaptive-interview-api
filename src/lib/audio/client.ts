@@ -8,6 +8,7 @@
  * the selected engine internally.
  */
 
+import { openAsBlob } from "node:fs";
 import config from "@/lib/config";
 import { applyGainToWav } from "./wav-utils";
 
@@ -75,10 +76,12 @@ export class AudioCppClient {
     language?: string
   ): Promise<TranscriptionResult> {
     const formData = new FormData();
-    const { readFile } = await import("fs/promises");
-    const buffer = await readFile(audioPath);
-    const blob = new Blob([buffer], { type: "audio/wav" });
-    formData.append("file", blob, "audio.wav");
+    // Handed over as a Blob that reads the file as it is sent. Reading it here
+    // would put the whole recording back in the heap — the one copy the upload
+    // path was moved to disk to avoid — and several answers being transcribed at
+    // once would scale with their combined size.
+    const file = await openAsBlob(audioPath, { type: "audio/wav" });
+    formData.append("file", file, "audio.wav");
     formData.append("model", model || config.audio.sttModel);
     if (language) {
       formData.append("language", language);
