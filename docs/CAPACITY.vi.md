@@ -37,6 +37,10 @@ tổng hợp gồm 20 tin nhắn.
 khi độ trễ tăng tuyến tính: các yêu cầu xếp hàng sau nhau. Gửi thêm yêu cầu không
 mua được thêm song song.
 
+Đo lại sau đó cùng ngày trên đầu vào 66,3 giây: 5,15 giây, **12,9x**. Dịch vụ không
+thay đổi giữa hai lần đo; con số thấp hơn là con số thận trọng được dùng trong phần
+tính toán bên dưới.
+
 Một câu trả lời dài 90 giây tốn khoảng 10 giây thời gian phục vụ. Năm người cùng
 bấm dừng trong vài giây sẽ đẩy người thứ năm vào khoảng 40 giây hàng đợi.
 
@@ -149,6 +153,63 @@ Sự tương tác này quan trọng với các đòn bẩy bên dưới. Làm ST
 1 hoặc 2) vừa bỏ được hàng đợi, vừa bỏ luôn cái van hãm tình cờ; khi đó, nếu không
 có hàng đợi hoặc retry trước mô hình, cùng một đợt bùng nổ sẽ bắt đầu làm lượt
 *thất bại* thay vì chỉ làm chậm chúng. Hai việc nên đi cùng nhau.
+
+### Sau khi nhận dạng theo cửa sổ
+
+Đo trên stack đã triển khai với `NEXT_PUBLIC_WINDOWED_INGEST=true`: câu trả lời 11,5 giây
+gửi thành hai cửa sổ, rồi một lượt chỉ mang id của lượt. Cùng route,
+`POST /api/voice-agent/stream`.
+
+| số lượt đồng thời | hoàn tất | `text` đầu tiên sau khi gửi (nhỏ nhất / trung vị / lớn nhất) | tải cửa sổ xong (luồng chậm nhất) | tổng |
+|---|---|---|---|---|
+| 1 | 1/1 | 1,43 s | 1,4 s | 2,95 s |
+| 8 | 8/8 | 0,76 / 1,26 / 1,75 s | 8,5 s | 10,1 s |
+| 16 | 16/16 | 0,67 / 0,83 / 1,65 s | 17,0 s | 18,3 s |
+| 24 | 24/24 | 0,56 / 0,84 / 1,48 s | 25,5 s | 26,6 s |
+
+Thời gian chờ sau khi bấm dừng không còn bao gồm phiên âm: ở 24 lượt đồng thời, thời
+gian tệ nhất là 1,5 giây, so với 27,3 giây trước đó. Mọi lượt đều hoàn tất, và trần của
+mô hình vẫn chưa bị chạm tới — các cửa sổ đến mô hình lần lượt, giống như bản ghi nguyên
+khối trước đây.
+
+Cột tải lên là trường hợp xấu nhất của phép đo, không phải của sản phẩm. Cả 24 câu trả
+lời được gửi cửa sổ cùng một lúc, nên chúng xếp hàng sau bộ phiên âm tuần tự; trong
+client, các cửa sổ được gửi đi trong lúc người dùng đang nói, đó chính là mục đích —
+khi họ dừng lại, hàng đợi đã trống. Câu trả lời 14,1 giây trước đó và 11,5 giây ở đây
+khác nhau, nên hãy so sánh hình dạng của thời gian chờ hơn là hai con số chính xác.
+
+### Đo lại sau khi thay đổi (cùng ngày, muộn hơn)
+
+Stack đã thay đổi; ba dịch vụ thì không. Chạy lại cả hai ma trận lượt với cùng độ dài
+câu trả lời và cùng route cho kết quả sau — câu trả lời nguyên khối 14,0 giây, câu trả
+lời dạng cửa sổ 11,6 giây trong hai cửa sổ:
+
+| đồng thời | nguyên khối hoàn tất | `text` đầu tiên (nhỏ nhất / trung vị / lớn nhất) |
+|---|---|---|
+| 1 | 1/1 | 8,83 s |
+| 8 | 8/8 | 4,33 / 7,42 / 16,99 s |
+| 16 | 16/16 | 4,89 / 12,70 / 21,97 s |
+| 24 | 24/24 | 3,29 / 16,10 / 32,18 s |
+
+| đồng thời | cửa sổ hoàn tất | `text` đầu tiên (nhỏ nhất / trung vị / lớn nhất) | tải cửa sổ xong |
+|---|---|---|---|
+| 1 | 1/1 | 1,11 s | 1,4 s |
+| 8 | 8/8 | 0,73 / 0,90 / 1,10 s | 8,6 s |
+| 16 | 16/16 | 0,84 / 1,48 / 15,14 s | 17,2 s |
+| 24 | 24/24 | 0,70 / 18,28 / 39,34 s | 25,9 s |
+
+**Khác biệt nằm ở hàng đợi của mô hình, không phải ở các route.** Gọi thẳng mô hình,
+không qua API: nội dung đầu tiên là 0,92 giây ở lần đo trước, và 9,07 giây, 0,92 giây,
+16,7 giây ở ba lần đo sau lần này. Độ trễ của nhà cung cấp thay đổi hơn một bậc độ lớn
+trong vòng một giờ. Trong khi đó STT đo được 12,9x — nhanh hơn trước.
+
+Vì vậy hãy đọc hai phần từ đầu đến cuối như hai đầu của độ biến thiên đó, không phải
+trước và sau. Điều các thay đổi này sở hữu là hình dạng: ở 8 lượt đồng thời, đường cửa
+sổ vẫn dưới một giây ngay trong lần chạy này, thời gian chờ sau khi dừng không bao giờ
+gồm phiên âm, và mọi lượt đều hoàn tất ở cả hai bảng — retry biến một lần từ chối thành
+một khoảng chờ thay vì một lượt thất bại. Phần đuôi ở 16 và 24 bám theo hàng đợi của mô
+hình, đúng thứ mà `OLLAMA_MAX_CONCURRENT_REQUESTS` và ngân sách retry chặn lại; tăng
+chúng chỉ đẩy hàng đợi lên phía tài khoản với lỗi 429 của chính nó.
 
 ---
 

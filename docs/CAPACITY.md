@@ -35,6 +35,10 @@ service (a fixed sentence repeated to 58 s); the LLM was given a synthetic
 scales linearly: requests queue behind one another. There is no parallelism to
 buy by asking for more.
 
+Re-measured later the same day on a 66.3 s input: 5.15 s, **12.9x**. The service was
+not changed between the two runs; the lower figure is the conservative one used in
+the arithmetic below.
+
 A 90-second answer costs about 10 s of service time. Five people pressing stop
 within a few seconds of each other put the fifth behind roughly 40 s of queue.
 
@@ -162,15 +166,49 @@ same route, `POST /api/voice-agent/stream`.
 | 16 | 16/16 | 0.67 / 0.83 / 1.65 s | 17.0 s | 18.3 s |
 | 24 | 24/24 | 0.56 / 0.84 / 1.48 s | 25.5 s | 26.6 s |
 
-The wait after pressing stop no longer contains transcription: at 24 concurrent turns it
-is 1.5 s at worst, against 27.3 s before. Every turn completed, and the model's ceiling
-was still not reached — the windows reach it in sequence, just as whole recordings did.
+The wait after pressing stop no longer contains transcription: in this run, at 24
+concurrent turns it was 1.5 s at worst, against 27.3 s before. Every turn completed,
+and the model's ceiling was still not reached — the windows reach it in sequence, just
+as whole recordings did. The later re-measurement below shows how much of a tail is
+the model's own queue rather than this path.
 
 The upload column is the probe's worst case, not the product's. All 24 answers' windows
 were sent at once, so they queued behind the serialized transcriber; in the client the
 windows go out while the person is speaking, which is the point — by the time they stop,
 the queue is empty. The earlier 14.1 s answer and this 11.5 s one differ, so compare the
 shape of the wait rather than the two numbers exactly.
+
+### Re-measured after the changes (same day, later)
+
+The stack changed; the three services did not. Re-running both turn matrices with the same
+answer lengths and the same route gave this — the whole-body answer 14.0 s, the windowed one
+11.6 s in two windows:
+
+| concurrent | whole-body completed | whole-body first `text` (min / median / max) |
+|---|---|---|
+| 1 | 1/1 | 8.83 s |
+| 8 | 8/8 | 4.33 / 7.42 / 16.99 s |
+| 16 | 16/16 | 4.89 / 12.70 / 21.97 s |
+| 24 | 24/24 | 3.29 / 16.10 / 32.18 s |
+
+| concurrent | windowed completed | windowed first `text` (min / median / max) | window uploads done |
+|---|---|---|---|
+| 1 | 1/1 | 1.11 s | 1.4 s |
+| 8 | 8/8 | 0.73 / 0.90 / 1.10 s | 8.6 s |
+| 16 | 16/16 | 0.84 / 1.48 / 15.14 s | 17.2 s |
+| 24 | 24/24 | 0.70 / 18.28 / 39.34 s | 25.9 s |
+
+**The difference is the model's queue, not the routes.** Probing the model directly, with the
+API out of the path: first content was 0.92 s in the earlier run, and 9.07 s, 0.92 s and
+16.7 s in three probes after this one. The provider's latency varies by more than an order of
+magnitude within an hour. STT, meanwhile, measured 12.9x — faster than before.
+
+So read the two end-to-end sections as the two ends of that variance, not as a before and
+after. What the changes own is the shape: at 8 concurrent turns the windowed path is under a
+second even in this run, the wait after stop never includes transcription, and every turn
+completed in both tables — the retry turns a refusal into a wait instead of a failed turn. The
+tails at 16 and 24 tracks the model's queue, which is what `OLLAMA_MAX_CONCURRENT_REQUESTS`
+and the retry budget bound; raising them moves the queue upstream to the account's own 429.
 
 ---
 
