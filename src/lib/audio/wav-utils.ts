@@ -3,7 +3,7 @@
  * Assumes all inputs are standard PCM WAV (16-bit, mono or stereo).
  */
 
-interface WavFmt {
+export interface WavFmt {
   audioFormat: number;
   numChannels: number;
   sampleRate: number;
@@ -101,8 +101,12 @@ function validateCompatible(buffers: Buffer[]): WavFmt {
 
 /**
  * Write a standard PCM WAV header.
+ *
+ * Exported for a caller assembling a recording from pieces: the header has to be
+ * written before the PCM is known to be complete only when the caller knows the
+ * length in advance, which is the case once every window has arrived.
  */
-function writeWavHeader(
+export function writeWavHeader(
   pcmLength: number,
   fmt: WavFmt
 ): Buffer {

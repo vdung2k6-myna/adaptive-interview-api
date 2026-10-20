@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from "express";
-import multer from "multer";
+import { readFile } from "node:fs/promises";
 import { db } from "@/lib/db";
 import { interviewSessions, candidates, positions, messages } from "@/lib/schema";
 import { eq } from "drizzle-orm";
@@ -7,14 +7,22 @@ import { buildPrompt, type PromptMessage } from "@/lib/prompts";
 import { generateChatResponse, generateChatResponseStream } from "@/lib/ollama";
 import { OllamaError } from "@/lib/errors";
 import config from "@/lib/config";
+import { createSemaphore } from "@/lib/semaphore";
+import { audioUpload, discardUpload } from "@/lib/upload";
+import {
+  readTurnId,
+  turnTranscripts,
+  type TurnTranscriptStore,
+} from "@/lib/turn-transcript";
 import {
   transcribeAudio,
   saveAudio,
+  saveAudioFromPcm,
+  parseWav,
   deleteAudio,
   detectAudioFormat,
   splitSentences,
   stripMarkdown,
-  splitForTTS,
   synthesizeSpeechWithFallback,
   synthesizeLongText,
   concatWavBuffers,
@@ -22,12 +30,15 @@ import {
   resolveEngineForLanguage,
   resolveSttLanguage,
   SentenceStream,
+  SentenceExtractor,
   sweepStaleSegments,
   SEGMENT_MARKER,
   type SynthesizeOptions,
 } from "@/lib/audio";
 
-const upload = multer({ storage: multer.memoryStorage() });
+// The body is written to disk as it arrives; see `lib/upload.ts` for why, and
+// for the sweep that reclaims one nothing consumed.
+const upload = audioUpload;
 
 /**
  * The collaborators a caller may replace. `speak-stream` needs its synthesizer
@@ -42,6 +53,9 @@ export interface VoiceRouteDeps {
   synthesizeSpeechWithFallback: typeof synthesizeSpeechWithFallback;
   transcribeAudio: typeof transcribeAudio;
   saveAudio: typeof saveAudio;
+  /** Writes the recording a turn's windows carried; absent for a caller that
+   *  never sends windows, which is why the test seam and the default agree. */
+  saveAudioFromPcm: typeof saveAudioFromPcm;
   /** The session a turn belongs to, or why it cannot be recorded. */
   sessionForTurn: (sessionId: string) => Promise<SessionForTurn>;
 }
@@ -303,7 +317,99 @@ router.post("/start", async (req, res) => {
 });
 
 /* ── POST /api/voice/turn ───────────────────────────────────────── */
-async function handleTurn(req: Request, res: Response, deps: VoiceRouteDeps): Promise<void> {
+type ResolvedTurnAudio =
+  | {
+      ok: true;
+      transcription: string;
+      confidence?: number;
+      audioUrl: string;
+      audioFormat: string;
+    }
+  | { ok: false; status: number; error: string };
+
+/**
+ * The audio a turn is answered from, and the recording it keeps.
+ *
+ * Two paths, one shape: a turn that names a turn id is answered from the windows
+ * already transcribed and recorded from their PCM, and one that does not is the
+ * whole-body path exactly as it was. The claim is given back here — its PCM has
+ * been streamed into the recording by then — so neither caller has to remember.
+ */
+async function resolveTurnAudio(
+  req: Request,
+  sessionId: string,
+  language: "english" | "vietnamese",
+  deps: VoiceRouteDeps,
+  transcripts: TurnTranscriptStore
+): Promise<ResolvedTurnAudio> {
+  const turnId = readTurnId(req.body.turnId);
+
+  if (turnId) {
+    const claim = await transcripts.claim({ turnId, sessionId });
+    if (!claim) {
+      return { ok: false, status: 400, error: "This turn is no longer available." };
+    }
+    try {
+      if (!claim.outcome.ok) {
+        return { ok: false, status: 400, error: claim.outcome.message };
+      }
+      const recording = await deps.saveAudioFromPcm(
+        sessionId,
+        claim.pcmPath,
+        claim.pcmBytes,
+        "candidate"
+      );
+      return {
+        ok: true,
+        transcription: claim.outcome.text,
+        audioUrl: recording.urlPath,
+        audioFormat: "wav",
+      };
+    } finally {
+      await transcripts.discard(claim);
+    }
+  }
+
+  const audioFile = req.file;
+  if (!audioFile) return { ok: false, status: 400, error: "audio is required" };
+
+  const audioExt = audioFile.mimetype === "audio/wav" ? "wav" : "webm";
+  // The upload is already a file on disk, so it is copied to the recording's
+  // home without ever being read into this process's heap.
+  const { filePath, urlPath } = await deps.saveAudio(
+    sessionId,
+    audioFile.path,
+    "candidate",
+    audioExt
+  );
+
+  try {
+    // Pin the session's language: the service's own detection answers short
+    // Vietnamese in Chinese (see resolveSttLanguage).
+    const sttResult = await deps.transcribeAudio(
+      filePath,
+      undefined,
+      resolveSttLanguage(language)
+    );
+    return {
+      ok: true,
+      transcription: sttResult.text,
+      confidence: sttResult.confidence,
+      audioUrl: urlPath,
+      audioFormat: audioExt,
+    };
+  } catch (err) {
+    console.error("[voice] STT error:", err);
+    return { ok: false, status: 500, error: "Failed to transcribe audio. Please try again." };
+  }
+}
+
+async function handleTurn(
+  req: Request,
+  res: Response,
+  deps: VoiceRouteDeps,
+  transcripts: TurnTranscriptStore
+): Promise<void> {
   const abortController = new AbortController();
   const onDisconnect = () => {
     if (!abortController.signal.aborted && !res.writableEnded) {
@@ -320,7 +426,9 @@ async function handleTurn(req: Request, res: Response, deps: VoiceRouteDeps): Pr
       res.status(400).json({ error: "sessionId is required" });
       return;
     }
-    if (!audioFile) {
+    // A windowed turn names the turn instead of sending the recording: what the
+    // windows carried is already held under that id.
+    if (!audioFile && !readTurnId(req.body.turnId)) {
       res.status(400).json({ error: "audio is required" });
       return;
     }
@@ -338,32 +446,16 @@ async function handleTurn(req: Request, res: Response, deps: VoiceRouteDeps): Pr
     // it too, so it is declared once rather than cast twice.
     const language = (session.language as "english" | "vietnamese") || "english";
 
-    const audioExt = audioFile.mimetype === "audio/wav" ? "wav" : "webm";
-    const audioBuffer = audioFile.buffer;
-    const { filePath: candidateAudioPath, urlPath: candidateAudioUrl } = await deps.saveAudio(
-      sessionId,
-      audioBuffer,
-      "candidate",
-      audioExt
-    );
-
-    let transcription: string;
-    let sttConfidence: number | undefined;
-    try {
-      // Pin the session's language: the service's own detection answers short
-      // Vietnamese in Chinese (see resolveSttLanguage).
-      const sttResult = await deps.transcribeAudio(
-        candidateAudioPath,
-        undefined,
-        resolveSttLanguage(language)
-      );
-      transcription = sttResult.text;
-      sttConfidence = sttResult.confidence;
-    } catch (err) {
-      console.error("[POST /api/voice/turn] STT error:", err);
-      res.status(500).json({ error: "Failed to transcribe audio. Please try again." });
+    const resolved = await resolveTurnAudio(req, sessionId, language, deps, transcripts);
+    if (!resolved.ok) {
+      res.status(resolved.status).json({ error: resolved.error });
       return;
     }
+
+    const transcription = resolved.transcription;
+    const sttConfidence = resolved.confidence;
+    const candidateAudioUrl = resolved.audioUrl;
+    const candidateAudioFormat = resolved.audioFormat;
 
     // Heard nothing. The STT client reports this as an empty transcript rather
     // than throwing, which is the right shape for an answer that was not given —
@@ -384,7 +476,7 @@ async function handleTurn(req: Request, res: Response, deps: VoiceRouteDeps): Pr
         role: "candidate",
         content: transcription,
         audioUrl: candidateAudioUrl,
-        audioFormat: audioExt,
+        audioFormat: candidateAudioFormat,
         sttConfidence: sttConfidence ? Math.round(sttConfidence * 100) : null,
       })
       .returning();
@@ -590,11 +682,20 @@ async function handleTurn(req: Request, res: Response, deps: VoiceRouteDeps): Pr
   } catch (err) {
     console.error("[POST /api/voice/turn] UNEXPECTED ERROR:", err);
     res.status(500).json({ error: err instanceof Error ? err.message : "Failed to process voice turn" });
+  } finally {
+    // The recording was copied into its session's directory, or the request
+    // never got that far; either way the temporary file is done with.
+    await discardUpload(req.file);
   }
 }
 
 /* ── POST /api/voice/stream ─────────────────────────────────────── */
-async function handleStreamTurn(req: Request, res: Response, deps: VoiceRouteDeps): Promise<void> {
+async function handleStreamTurn(
+  req: Request,
+  res: Response,
+  deps: VoiceRouteDeps,
+  transcripts: TurnTranscriptStore
+): Promise<void> {
   // Set SSE headers immediately
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -624,7 +725,9 @@ async function handleStreamTurn(req: Request, res: Response, deps: VoiceRouteDep
       res.end();
       return;
     }
-    if (!audioFile) {
+    // A windowed turn names the turn instead of sending the recording; see the
+    // `/turn` guard above.
+    if (!audioFile && !readTurnId(req.body.turnId)) {
       sendSseEvent(res, "error", { message: "audio is required" });
       res.end();
       return;
@@ -643,33 +746,17 @@ async function handleStreamTurn(req: Request, res: Response, deps: VoiceRouteDep
     // that needs it first and the engine that needs it later.
     const streamLanguage = (session.language as "english" | "vietnamese") || "english";
 
-    const audioExt = audioFile.mimetype === "audio/wav" ? "wav" : "webm";
-    const audioBuffer = audioFile.buffer;
-    const { filePath: candidateAudioPath, urlPath: candidateAudioUrl } = await deps.saveAudio(
-      sessionId,
-      audioBuffer,
-      "candidate",
-      audioExt
-    );
-
-    let transcription: string;
-    let sttConfidence: number | undefined;
-    try {
-      // Pin the session's language: the service's own detection answers short
-      // Vietnamese in Chinese (see resolveSttLanguage).
-      const sttResult = await deps.transcribeAudio(
-        candidateAudioPath,
-        undefined,
-        resolveSttLanguage(streamLanguage)
-      );
-      transcription = sttResult.text;
-      sttConfidence = sttResult.confidence;
-    } catch (err) {
-      console.error("[POST /api/voice/stream] STT error:", err);
-      sendSseEvent(res, "error", { message: "Failed to transcribe audio. Please try again." });
+    const resolved = await resolveTurnAudio(req, sessionId, streamLanguage, deps, transcripts);
+    if (!resolved.ok) {
+      sendSseEvent(res, "error", { message: resolved.error });
       res.end();
       return;
     }
+
+    const transcription = resolved.transcription;
+    const sttConfidence = resolved.confidence;
+    const candidateAudioUrl = resolved.audioUrl;
+    const candidateAudioFormat = resolved.audioFormat;
 
     // Heard nothing — see the `/api/voice/turn` note above: the same empty
     // transcript reaches here as a value rather than a throw, and storing it would
@@ -694,7 +781,7 @@ async function handleStreamTurn(req: Request, res: Response, deps: VoiceRouteDep
         role: "candidate",
         content: transcription,
         audioUrl: candidateAudioUrl,
-        audioFormat: audioExt,
+        audioFormat: candidateAudioFormat,
         sttConfidence: sttConfidence ? Math.round(sttConfidence * 100) : null,
       })
       .returning();
@@ -839,9 +926,28 @@ async function handleStreamTurn(req: Request, res: Response, deps: VoiceRouteDep
 
     let accumulatedText = "";
     const sentenceBuffers: (Buffer | null)[] = [];
-    let sentenceIndex = 0;
+    /**
+     * What turns the token stream into sentences.
+     *
+     * It reads only the sentence it has not finished, so a long answer costs per
+     * token what a short one does — and it owns the code-fence guard and the
+     * delimiter rule this loop used to re-apply to the whole reply on every
+     * token. `finalize` replaces the local sentence cursor the loop kept, because
+     * the extractor is the thing that knows what has already been spoken.
+     */
+    const extractor = new SentenceExtractor({ shouldSkip: hasUnclosedCodeFence });
     let chunkIndex = 0;
     const pendingTTS: Promise<void>[] = [];
+    /**
+     * One turn's bound on synthesis.
+     *
+     * The reply hands over every chunk it has at a sentence boundary, and the
+     * gateway serves one request at a time — so without this, one long reply
+     * occupies the gateway with its own backlog and every other turn waits
+     * behind it. The bound is per turn rather than per process: the process-wide
+     * one belongs in front of the model, where the account's ceiling is.
+     */
+    const ttsSlots = createSemaphore(config.audio.synthesisConcurrency);
 
     const resolvedMap = new Map<
       number,
@@ -873,7 +979,12 @@ async function handleStreamTurn(req: Request, res: Response, deps: VoiceRouteDep
       ttsFn: () => Promise<Buffer>
     ) => {
       const promise = (async () => {
+        let release: (() => void) | null = null;
         try {
+          // Waits rather than dropping the chunk: the index sequence is the
+          // client's playback cursor, so a chunk skipped to stay under the bound
+          // would stall everything after it.
+          release = await ttsSlots.acquire(abortController.signal);
           const buffer = await ttsFn();
           const fmt = detectAudioFormat(buffer);
           if (fmt === "bin") {
@@ -894,6 +1005,8 @@ async function handleStreamTurn(req: Request, res: Response, deps: VoiceRouteDep
           }
           console.error(`[POST /api/voice/stream] TTS error for sentence ${idx}:`, err);
           return { index: idx, buffer: null, text: sentenceText, urlPath: null };
+        } finally {
+          release?.();
         }
       })();
       pendingTTS.push(
@@ -918,35 +1031,18 @@ async function handleStreamTurn(req: Request, res: Response, deps: VoiceRouteDep
         if (value) {
           accumulatedText += value;
 
-          const strippedAccumulated = stripMarkdown(accumulatedText);
-
-          // If a fenced code block is still open, wait for the closing fence before
-          // splitting sentences. Otherwise the language tag (e.g., "markdown") and
-          // partial fence markers get sent to TTS.
-          if (hasUnclosedCodeFence(accumulatedText)) {
-            continue;
-          }
-
-          const allSentences = splitSentences(strippedAccumulated);
-          for (let i = sentenceIndex; i < allSentences.length; i++) {
-            if (abortController.signal.aborted || res.writableEnded) {
-              await reader.cancel();
-              break;
-            }
-            const sentenceText = allSentences[i];
-            if (!/[.!?…。？！]$/.test(sentenceText)) {
-              break;
-            }
-            const chunks = splitForTTS(sentenceText);
-            for (const chunk of chunks) {
+          for (const sentence of extractor.feed(value)) {
+            for (const chunk of sentence.chunks) {
               if (abortController.signal.aborted || res.writableEnded) {
-                await reader.cancel();
                 break;
               }
               const idx = chunkIndex++;
               enqueueTTS(idx, chunk, () => synthesizeSpeechWithFallback(chunk, ttsOptions, 0, abortController.signal));
             }
-            sentenceIndex++;
+            if (abortController.signal.aborted || res.writableEnded) {
+              await reader.cancel();
+              break;
+            }
           }
         }
       }
@@ -989,41 +1085,22 @@ async function handleStreamTurn(req: Request, res: Response, deps: VoiceRouteDep
       return;
     }
 
+    // What the turn stores and returns is the reply without its markup — the
+    // same text the segments were extracted from.
     const cleanFullText = stripMarkdown(fullText);
-    const finalSentences = splitSentences(cleanFullText);
-    if (finalSentences.length > sentenceIndex) {
-      for (let i = sentenceIndex; i < finalSentences.length; i++) {
-        const sentenceText = finalSentences[i];
-        const chunks = splitForTTS(sentenceText);
-        for (const chunk of chunks) {
-          if (abortController.signal.aborted || res.writableEnded) {
-            await cleanupSavedAudio(savedUrls);
-            res.end();
-            return;
-          }
-          const idx = chunkIndex++;
-          enqueueTTS(idx, chunk, () => synthesizeSpeechWithFallback(chunk, ttsOptions, 0, abortController.signal));
+
+    // Whatever the stream never finished: the sentences that arrived without a
+    // trailing delimiter, and a reply that ends mid-sentence. The extractor
+    // knows what it has already spoken, so nothing is said twice.
+    for (const sentence of extractor.finalize(fullText)) {
+      for (const chunk of sentence.chunks) {
+        if (abortController.signal.aborted || res.writableEnded) {
+          await cleanupSavedAudio(savedUrls);
+          res.end();
+          return;
         }
-        sentenceIndex++;
-      }
-    } else {
-      const lastDelimiterMatch = [...cleanFullText.matchAll(/[.!?…。？！]+/g)].pop();
-      const tailStart = lastDelimiterMatch
-        ? lastDelimiterMatch.index! + lastDelimiterMatch[0].length
-        : 0;
-      const tail = cleanFullText.slice(tailStart).trim();
-      if (tail) {
-        const chunks = splitForTTS(tail);
-        for (const chunk of chunks) {
-          if (abortController.signal.aborted || res.writableEnded) {
-            await cleanupSavedAudio(savedUrls);
-            res.end();
-            return;
-          }
-          const idx = chunkIndex++;
-          enqueueTTS(idx, chunk, () => synthesizeSpeechWithFallback(chunk, ttsOptions, 0, abortController.signal));
-        }
-        sentenceIndex++;
+        const idx = chunkIndex++;
+        enqueueTTS(idx, chunk, () => synthesizeSpeechWithFallback(chunk, ttsOptions, 0, abortController.signal));
       }
     }
 
@@ -1116,6 +1193,8 @@ async function handleStreamTurn(req: Request, res: Response, deps: VoiceRouteDep
       // Stream may already be closed
     }
     res.end();
+  } finally {
+    await discardUpload(req.file);
   }
 }
 
@@ -1178,9 +1257,115 @@ router.post("/speak", async (req, res) => {
  * with no Postgres, no audio directory and no STT service. Paths, bodies, status
  * codes and event sequences are unchanged.
  */
-function registerTurnRoutes(router: Router, deps: VoiceRouteDeps): void {
-  router.post("/turn", upload.single("audio"), (req, res) => handleTurn(req, res, deps));
-  router.post("/stream", upload.single("audio"), (req, res) => handleStreamTurn(req, res, deps));
+/**
+ * One window of a turn: transcribed now, and its audio kept for the recording.
+ *
+ * The format is the platform's one capture contract, checked here rather than
+ * trusted. Windows are concatenated by appending bytes, so a window in another
+ * format would not fail at the join — it would be mixed into a recording that
+ * plays back wrong, which is discovered by a person listening to their own answer.
+ */
+async function handleWindow(
+  req: Request,
+  res: Response,
+  deps: VoiceRouteDeps,
+  transcripts: TurnTranscriptStore
+): Promise<void> {
+  try {
+    const turnId = readTurnId(req.body.turnId);
+    if (!turnId) {
+      res.status(400).json({ error: "turnId is required" });
+      return;
+    }
+
+    // The window's own place in the turn, from zero. It is what makes a retry
+    // safe: the same index twice is the same window, not a second one.
+    //
+    // Optional, because a client built before the index existed still sends
+    // windows: its window is taken without de-duplication, exactly as it was.
+    const rawIndex = req.body.index;
+    const index =
+      rawIndex === undefined || rawIndex === ""
+        ? null
+        : Number.parseInt(String(rawIndex), 10);
+    if (index !== null && (!Number.isInteger(index) || index < 0 || index > 10_000)) {
+      res.status(400).json({ error: "index must be a non-negative integer" });
+      return;
+    }
+
+    const audioFile = req.file;
+    if (!audioFile) {
+      res.status(400).json({ error: "audio is required" });
+      return;
+    }
+
+    const sessionId =
+      typeof req.body.sessionId === "string" && req.body.sessionId.trim()
+        ? req.body.sessionId.trim()
+        : undefined;
+    const language = req.body.language === "vietnamese" ? "vietnamese" : "english";
+    const key = { turnId, sessionId };
+
+    let pcm: Buffer;
+    try {
+      const wav = await readFile(audioFile.path);
+      const parsed = parseWav(wav);
+      const { audioFormat, numChannels, sampleRate, bitsPerSample } = parsed.fmt;
+      if (
+        audioFormat !== 1 ||
+        numChannels !== 1 ||
+        sampleRate !== 16_000 ||
+        bitsPerSample !== 16
+      ) {
+        res.status(400).json({ error: "a window must be 16 kHz mono 16-bit PCM" });
+        return;
+      }
+      pcm = wav.subarray(parsed.pcmOffset, parsed.pcmOffset + parsed.pcmLength);
+    } catch {
+      res.status(400).json({ error: "audio is not a readable WAV file" });
+      return;
+    }
+
+    let text: string;
+    try {
+      const result = await deps.transcribeAudio(
+        audioFile.path,
+        undefined,
+        resolveSttLanguage(language)
+      );
+      text = result.text;
+    } catch (err) {
+      console.error("[POST /api/voice/window] STT error:", err);
+      // A gap is not a shorter answer: the turn reports this rather than being
+      // answered from the windows that did succeed. Recorded by index, so the
+      // client's retry of this same window clears it if it succeeds.
+      await transcripts.fail(key, index, "Part of the answer could not be transcribed.");
+      res.status(502).json({ error: "Failed to transcribe audio window" });
+      return;
+    }
+
+    await transcripts.appendWindow(key, index, text, pcm);
+    await transcripts.sweep();
+    res.status(202).json({ received: true });
+  } finally {
+    await discardUpload(req.file);
+  }
+}
+
+function registerTurnRoutes(
+  router: Router,
+  deps: VoiceRouteDeps,
+  transcripts: TurnTranscriptStore
+): void {
+  router.post("/window", upload.single("audio"), (req, res) =>
+    handleWindow(req, res, deps, transcripts)
+  );
+  router.post("/turn", upload.single("audio"), (req, res) =>
+    handleTurn(req, res, deps, transcripts)
+  );
+  router.post("/stream", upload.single("audio"), (req, res) =>
+    handleStreamTurn(req, res, deps, transcripts)
+  );
 }
 
 /**
@@ -1316,12 +1501,15 @@ export function createVoiceRouter(overrides: Partial<VoiceRouteDeps> = {}): Rout
     synthesizeSpeechWithFallback,
     transcribeAudio,
     saveAudio,
+    saveAudioFromPcm,
     sessionForTurn,
     ...overrides,
   };
+  // The process's buffer, not this router's: windows arrive on `/window` here,
+  // but the turn that names them may be submitted on the voice-agent route.
   const composed = Router();
   composed.use(router);
-  registerTurnRoutes(composed, deps);
+  registerTurnRoutes(composed, deps, turnTranscripts);
   registerSpeakStream(composed, deps);
   return composed;
 }

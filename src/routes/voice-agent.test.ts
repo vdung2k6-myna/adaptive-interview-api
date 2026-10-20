@@ -8,6 +8,7 @@ import { DEFAULT_PREFETCH_TOP_K } from "../lib/prefetch";
 import type { KnowledgeChunk, KnowledgeSearchOutcome, SearchOptions } from "../lib/knowledge";
 import { SentenceExtractor } from "../lib/audio/sentence-extractor";
 import { AUDIO_ROOT } from "../lib/audio/storage";
+import { turnTranscripts } from "../lib/turn-transcript";
 import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2261,6 +2262,60 @@ describe("POST /api/voice-agent/stream — the platform's own music", () => {
     await withServer({ ...h.deps, libraryDir: outside }, async (api) => {
       await readTurn(api.stream, h, { text: "co nhung bai gi" }, () => {});
       assert.match(h.prompts[1] ?? "", /not inside the audio root/);
+    });
+  });
+});
+
+/**
+ * A turn whose answer was transcribed window by window, while it was being
+ * spoken. The route never sees the audio: it sees the turn's id and answers from
+ * what the windows produced.
+ */
+describe("a turn answered from its windows", () => {
+  it("uses the buffered transcript instead of transcribing the request", async () => {
+    const turnId = "agent-window-0001";
+    await turnTranscripts.appendWindow({ turnId }, 0, "I led a migration last winter.", Buffer.from([1, 2]));
+
+    const h = harness();
+    await withServer(h.deps, async (api) => {
+      const sse = await sendTurn(api.stream, h, { turnId });
+
+      assert.equal(h.transcribeCalls.length, 0, "no audio crossed the wire, so nothing is transcribed again");
+      assert.ok(
+        h.prompts.some((prompt) => prompt.includes("I led a migration last winter.")),
+        "the buffered text is the turn's user message"
+      );
+      assert.ok(parseSse(sse).some((event) => event.event === "done"));
+    });
+  });
+
+  it("refuses a turn it no longer holds", async () => {
+    const h = harness();
+    await withServer(h.deps, async (api) => {
+      const events = parseSse(await sendTurn(api.stream, h, { turnId: "agent-window-missing" }));
+
+      assert.equal(
+        events.find((event) => event.event === "error")?.data.message,
+        "This turn is no longer available.",
+        "an expired turn is refused rather than answered from nothing"
+      );
+    });
+  });
+
+  it("refuses a turn one of whose windows could not be transcribed", async () => {
+    const turnId = "agent-window-0002";
+    await turnTranscripts.appendWindow({ turnId }, 0, "What was heard.", Buffer.from([1]));
+    await turnTranscripts.fail({ turnId }, 1, "Part of the answer could not be transcribed.");
+
+    const h = harness();
+    await withServer(h.deps, async (api) => {
+      const events = parseSse(await sendTurn(api.stream, h, { turnId }));
+
+      assert.equal(
+        events.find((event) => event.event === "error")?.data.message,
+        "Part of the answer could not be transcribed.",
+        "a gap is reported, not answered around"
+      );
     });
   });
 });

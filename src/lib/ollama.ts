@@ -1,5 +1,113 @@
 import { OllamaError } from "./errors";
 import config from "./config";
+import { createSemaphore, type ReleaseSlot } from "./semaphore";
+
+/**
+ * Every model request this process makes shares one account, so it shares one
+ * bound. Turns, the agent's tool rounds and embeddings all pass through here;
+ * counting them separately would let each caller be polite on its own while the
+ * process as a whole went over the ceiling.
+ */
+const modelSlots = createSemaphore(config.ollama.maxConcurrentRequests);
+
+/** A service at its limit answers these; they are the only statuses worth waiting on. */
+const RETRYABLE_STATUSES = new Set([429, 503]);
+
+/** Backoff starts here and is capped here; the whole sequence is bounded by the
+ *  retry deadline, so this cap only stops the jitter from spending it in one go. */
+const RETRY_BASE_DELAY_MS = 250;
+const RETRY_MAX_DELAY_MS = 4_000;
+
+function abortError(): Error {
+  const err = new Error("aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+/** Full jitter: a burst of turns refused together must not retry together. */
+function retryDelayMs(attempt: number): number {
+  const ceiling = Math.min(
+    RETRY_MAX_DELAY_MS,
+    RETRY_BASE_DELAY_MS * 2 ** (attempt - 1)
+  );
+  return Math.floor(Math.random() * ceiling);
+}
+
+function pause(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError());
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** A response with the slot it holds, which the caller gives back when it is done. */
+interface ModelCall {
+  res: Response;
+  release: ReleaseSlot;
+}
+
+/**
+ * Make a model request under the process's concurrency bound, retrying a refusal
+ * of the initial response.
+ *
+ * A retry is only ever made before content has started: a refusal arrives with
+ * no body to keep, so nothing is lost by asking again, while a failure once
+ * tokens have streamed would be answered by speaking the reply twice. The slot
+ * is given back while waiting, because a caller backing off is not using the
+ * service and must not stop another turn from using it.
+ *
+ * When the deadline leaves no room for another attempt, the refusal is returned
+ * as it is — the caller then reports what the service said, rather than a
+ * timeout of our own invention.
+ */
+async function requestModel(
+  url: string,
+  init: RequestInit,
+  signal: AbortSignal
+): Promise<ModelCall> {
+  const deadline = Date.now() + config.ollama.retryDeadlineMs;
+  const attempts = Math.max(1, config.ollama.retries + 1);
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const release = await modelSlots.acquire(signal);
+
+    let res: Response;
+    try {
+      res = await fetch(url, { ...init, signal });
+    } catch (err) {
+      release();
+      throw err;
+    }
+
+    if (!RETRYABLE_STATUSES.has(res.status) || attempt === attempts) {
+      return { res, release };
+    }
+
+    const wait = retryDelayMs(attempt);
+    if (Date.now() + wait >= deadline) {
+      return { res, release };
+    }
+
+    // Nothing in a refusal's body is kept, and the slot is not ours to hold
+    // while we sleep.
+    await res.text().catch(() => undefined);
+    release();
+    await pause(wait, signal);
+  }
+
+  throw new Error("unreachable: the retry loop always returns or throws");
+}
 
 /** One call a model asked for, as it reported it. `arguments` arrives already parsed — Ollama
  *  does that before the chunk reaches us — and is handed to the gadget as it stands. */
@@ -206,37 +314,44 @@ export async function embedText(text: string): Promise<number[]> {
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model, prompt: text }),
-      signal: controller.signal,
-    });
+    const { res, release } = await requestModel(
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model, prompt: text }),
+      },
+      controller.signal
+    );
 
-    clearTimeout(timeoutId);
-
-    if (!res.ok) {
-      const body = await res.text().catch(() => "Unknown error");
-      throw new OllamaError(
-        `Ollama embedding returned ${res.status}: ${body}`,
-        res.status
-      );
-    }
-
-    const raw = await res.text();
-    let data: { embedding?: number[] };
     try {
-      data = JSON.parse(raw);
-    } catch {
-      throw new OllamaError("Ollama embedding returned invalid JSON.", 502);
-    }
+      clearTimeout(timeoutId);
 
-    const embedding = data.embedding;
-    if (!Array.isArray(embedding) || embedding.length === 0) {
-      throw new OllamaError("Ollama embedding response contained no vector.", 502);
-    }
+      if (!res.ok) {
+        const body = await res.text().catch(() => "Unknown error");
+        throw new OllamaError(
+          `Ollama embedding returned ${res.status}: ${body}`,
+          res.status
+        );
+      }
 
-    return embedding;
+      const raw = await res.text();
+      let data: { embedding?: number[] };
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        throw new OllamaError("Ollama embedding returned invalid JSON.", 502);
+      }
+
+      const embedding = data.embedding;
+      if (!Array.isArray(embedding) || embedding.length === 0) {
+        throw new OllamaError("Ollama embedding response contained no vector.", 502);
+      }
+
+      return embedding;
+    } finally {
+      release();
+    }
   } catch (err) {
     clearTimeout(timeoutId);
 
@@ -277,42 +392,49 @@ export async function generateChatResponse(
       },
     });
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: requestBody,
-      signal: controller.signal,
-    });
+    const { res, release } = await requestModel(
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: requestBody,
+      },
+      controller.signal
+    );
 
-    clearTimeout(timeoutId);
-
-    if (!res.ok) {
-      const body = await res.text().catch(() => "Unknown error");
-      throw new OllamaError(
-        `Ollama returned ${res.status}: ${body}`,
-        res.status
-      );
-    }
-
-    const raw = await res.text();
-    let data: { message?: { content?: string } } & TokenCounts;
     try {
-      data = JSON.parse(raw);
-    } catch {
-      throw new OllamaError("Ollama returned invalid JSON.", 502);
+      clearTimeout(timeoutId);
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => "Unknown error");
+        throw new OllamaError(
+          `Ollama returned ${res.status}: ${body}`,
+          res.status
+        );
+      }
+
+      const raw = await res.text();
+      let data: { message?: { content?: string } } & TokenCounts;
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        throw new OllamaError("Ollama returned invalid JSON.", 502);
+      }
+
+      // Logged before the content guard: a response that arrived without content
+      // still evaluated the prompt, and that cost is worth seeing next to the error.
+      logTokenCounts(model, data);
+
+      const content = data.message?.content?.trim();
+
+      if (!content) {
+        throw new OllamaError("Ollama response contained no content.", 502);
+      }
+
+      return content;
+    } finally {
+      release();
     }
-
-    // Logged before the content guard: a response that arrived without content
-    // still evaluated the prompt, and that cost is worth seeing next to the error.
-    logTokenCounts(model, data);
-
-    const content = data.message?.content?.trim();
-
-    if (!content) {
-      throw new OllamaError("Ollama response contained no content.", 502);
-    }
-
-    return content;
   } catch (err) {
     clearTimeout(timeoutId);
 
@@ -345,6 +467,14 @@ export function generateChatResponseStream(
   let fullText = "";
   // What the model asked to be done, in the order it asked — see `getToolCalls`.
   const toolCalls: OllamaToolCall[] = [];
+  /**
+   * The slot this stream holds while the model is generating.
+   *
+   * Declared outside `start` because `cancel` has to be able to give it back: a
+   * turn the client walked away from must not keep the process at its bound for
+   * the length of a reply nobody is reading.
+   */
+  let releaseModelSlot: ReleaseSlot | null = null;
 
   const stream = new ReadableStream<string>({
     async start(streamController) {
@@ -363,12 +493,16 @@ export function generateChatResponseStream(
           },
         });
 
-        const res = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: requestBody,
-          signal: controller.signal,
-        });
+        const { res, release } = await requestModel(
+          url,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: requestBody,
+          },
+          controller.signal
+        );
+        releaseModelSlot = release;
 
         clearTimeout(timeoutId);
 
@@ -468,11 +602,19 @@ export function generateChatResponseStream(
                 500
               )
         );
+      } finally {
+        // The slot is held for the whole stream, not just the response headers:
+        // what the account counts is requests in flight, which is exactly this
+        // generation.
+        releaseModelSlot?.();
+        releaseModelSlot = null;
       }
     },
     cancel() {
       clearTimeout(timeoutId);
       controller.abort();
+      releaseModelSlot?.();
+      releaseModelSlot = null;
     },
   });
 

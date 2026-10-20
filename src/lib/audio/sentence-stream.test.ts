@@ -349,3 +349,33 @@ describe("SentenceStream — flush() and abort", () => {
     assert.deepEqual(recorded.announced.map((chunk) => chunk.index), [0]);
   });
 });
+
+/**
+ * The serial property both callers rely on.
+ *
+ * The voice agent passes this stream straight through as its turn's synthesis,
+ * and the per-turn bound the platform enforces is a ceiling, not a target — so
+ * what matters is that the core never runs two syntheses at once. A future
+ * drain that parallelized would silently turn every long reply into the
+ * unbounded fan-out the bound exists to prevent, and this is the test that would
+ * catch it.
+ */
+describe("the core's synthesis is serial", () => {
+  it("never runs two chunks' synthesis at once", async () => {
+    let active = 0;
+    let peak = 0;
+
+    const { stream, recorded } = recorder(async (chunk) => {
+      active++;
+      peak = Math.max(peak, active);
+      await settle();
+      active--;
+      return Buffer.from(chunk);
+    });
+
+    await stream.push(LONG_SENTENCE);
+
+    assert.ok(recorded.synthCalls.length > 1, "the sentence must split, or this proves nothing");
+    assert.equal(peak, 1, "two syntheses in flight would exceed a caller's per-turn bound");
+  });
+});

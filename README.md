@@ -90,6 +90,9 @@ curl http://localhost:4000/health
 | `OLLAMA_BASE_URL` | Yes | Ollama API URL |
 | `OLLAMA_MODEL` | No | Chat model (default: `llama3.1`) |
 | `OLLAMA_EMBED_MODEL` | No | Embedding model (default: `mxbai-embed-large`) |
+| `OLLAMA_RETRIES` | No | Further attempts after a refusal (`429`/`503`) made before any content streamed. Default: `1` development, `2` production. A refusal past this is reported to the turn |
+| `OLLAMA_RETRY_DEADLINE_MS` | No | The whole retry budget, attempts included (default: `20000` development, `30000` production). A turn that waited longer than this is worse than one that is told it could not be answered |
+| `OLLAMA_MAX_CONCURRENT_REQUESTS` | No | Model requests this process may have in flight (default: `12`). Kept below the account's measured ceiling of ~15, so a turn queues here — where it can be ordered — instead of being refused upstream. See [CAPACITY.md](docs/CAPACITY.md) |
 | `API_AUTH_TOKEN` | No | Enables Bearer token auth when set |
 | `MCP_ENABLED` | No | Enables `/api/mcp` when set to `true` |
 | `MCP_AUTH_TOKEN` | No | MCP auth token (required when MCP is enabled) |
@@ -97,6 +100,8 @@ curl http://localhost:4000/health
 | `AUDIO_STORAGE_DIR` | No | Audio file storage path (default: `/tmp/audio`) |
 | `AUDIOCPP_BASE_URL` | No | audio.cpp STT server URL |
 | `AUDIO_GATEWAY_URL` | No | Audio Gateway TTS server URL |
+| `AUDIO_SYNTHESIS_CONCURRENCY` | No | Syntheses one turn may have in flight (default: `4`). The gateway serves one request at a time, so an unbounded fan-out from one long reply would put every other turn's audio behind its backlog. See [CAPACITY.md](docs/CAPACITY.md) |
+| `TRANSCRIPT_BUFFER_RETENTION_MS` | No | How long a turn's windowed transcript and audio are held before the turn must claim them (default: `900000`, 15 minutes). Long enough to outlast the longest answer the transport accepts; short enough that a turn nobody submitted is reclaimed |
 | `DEFAULT_TTS_ENGINE` | No | `kokoro`, `piper`, or `supertonic` (default: `supertonic`) |
 | `DEFAULT_VOICE` | No | Voice ID used when the engine- and language-specific voice is unset (default: `F1`) |
 | `EMBEDDING_SIMILARITY_THRESHOLD` | No | Default: `0.75` |

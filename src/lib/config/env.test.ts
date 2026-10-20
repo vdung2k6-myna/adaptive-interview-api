@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseGain, parseList, parseUnitInterval } from "./env";
+import { parseGain, parseList, parsePositiveInt, parseUnitInterval } from "./env";
 
 describe("parseList", () => {
   it("falls back when the variable is not set at all", () => {
@@ -22,6 +22,30 @@ describe("parseList", () => {
     // operator may want to state rather than to inherit.
     assert.deepEqual(parseList("", ["a"]), []);
     assert.deepEqual(parseList("  ,  ", ["a"]), []);
+  });
+});
+
+describe("parsePositiveInt", () => {
+  it("reads a positive integer", () => {
+    assert.equal(parsePositiveInt("12", 4), 12);
+    assert.equal(parsePositiveInt("1", 4), 1, "one is a bound, not an absent one");
+  });
+
+  it("takes the fallback when the variable is unset or blank", () => {
+    assert.equal(parsePositiveInt(undefined, 12), 12);
+    assert.equal(parsePositiveInt("", 12), 12);
+  });
+
+  it("refuses zero and negative values rather than accepting them as a bound", () => {
+    // A bound of zero is not "no bound" — it is a guard that admits nothing.
+    // Reading it as a limit would disable the very thing the setting exists for.
+    assert.equal(parsePositiveInt("0", 12), 12);
+    assert.equal(parsePositiveInt("-3", 12), 12);
+  });
+
+  it("falls back for a value that is not a number", () => {
+    assert.equal(parsePositiveInt("many", 12), 12);
+    assert.equal(parsePositiveInt("1.5", 12), 1, "the integer part is read, as parseInt does");
   });
 });
 

@@ -1,7 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { SentenceExtractor } from "./sentence-extractor";
-import { hasUnclosedCodeFence } from "./text-processing";
+import { hasUnclosedCodeFence, stripMarkdown } from "./text-processing";
+import { splitSentences } from "./split-sentences";
 
 describe("SentenceExtractor", () => {
   it("emits nothing until a delimiter arrives", () => {
@@ -148,5 +149,53 @@ describe("SentenceExtractor", () => {
     const ex = new SentenceExtractor();
     ex.feed("Hello");
     assert.equal(ex.getAccumulated(), "Hello");
+  });
+});
+
+/**
+ * The extractor's buffer is the work a token costs. These three tests pin the
+ * property the change exists for: what is re-read is the unfinished sentence, not
+ * the reply, and the sentences that come out are the same ones a one-shot split
+ * of the whole reply would have produced.
+ */
+describe("SentenceExtractor — the unread buffer stays bounded", () => {
+  it("keeps only the unfinished sentence after each complete one", () => {
+    const ex = new SentenceExtractor();
+
+    for (let index = 0; index < 200; index++) {
+      ex.feed(`Sentence number ${index} is here. `);
+    }
+
+    assert.ok(
+      ex.pendingLength < 60,
+      `expected the buffer to hold one sentence, not 200; it held ${ex.pendingLength} characters`
+    );
+  });
+
+  it("produces the same sentences as one-shot splitting, across markdown and Vietnamese punctuation", () => {
+    const text =
+      "**Hello** there. This is e.g. a test. Tổng cộng là 3.5 năm. 42. Done!";
+    const ex = new SentenceExtractor();
+    const emitted: string[] = [];
+
+    for (const token of text.match(/\S+\s*/g) ?? []) {
+      for (const sentence of ex.feed(token)) emitted.push(sentence.clean);
+    }
+
+    const expected = splitSentences(stripMarkdown(text))
+      .map((sentence) => sentence.trim().replace(/^[-*•]\s+/, "").replace(/^\d+\.\s+/, ""))
+      .filter((sentence) => sentence && /\p{L}/u.test(sentence));
+
+    assert.deepEqual(emitted, expected);
+  });
+
+  it("does not leave a sentence's closing marker at the start of the next one", () => {
+    const ex = new SentenceExtractor();
+
+    const first = ex.feed("**Bold ending.** ");
+    const second = ex.feed("Next one.");
+    const cleans = [...first, ...second].map((sentence) => sentence.clean);
+
+    assert.deepEqual(cleans, ["Bold ending.", "Next one."]);
   });
 });

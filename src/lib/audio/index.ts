@@ -17,6 +17,7 @@ export { transcribeAudio } from "./stt";
 export { synthesizeSpeech, synthesizeSentences } from "./tts";
 export {
   saveAudio,
+  saveAudioFromPcm,
   readAudio,
   audioExists,
   deleteAudio,
@@ -28,7 +29,15 @@ export {
   SEGMENT_MARKER,
 } from "./storage";
 export { splitSentences, extractNewSentences } from "./split-sentences";
-export { concatWavBuffers, isValidWav, applyGainToWav, type GainResult } from "./wav-utils";
+export {
+  concatWavBuffers,
+  isValidWav,
+  parseWav,
+  writeWavHeader,
+  applyGainToWav,
+  type GainResult,
+  type WavFmt,
+} from "./wav-utils";
 export {
   stripMarkdown,
   normalizeNumbersForKokoro,
