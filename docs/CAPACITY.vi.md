@@ -252,6 +252,49 @@ một đợt năm lượt trong ~16 giây thời gian phục vụ, và LLM cùng
   MCP transports đều là map trong tiến trình, nên instance thứ hai sẽ cần sticky
   session hoặc đưa trạng thái ra ngoài.
 
+### Ở 100 người dùng voice agent
+
+Voice agent là cùng một route, `POST /api/voice-agent/stream`, dùng theo hai cách: trang trình
+duyệt, gửi theo cửa sổ như trang phỏng vấn, và gadget qua bridge, vẫn tải lên một utterance
+nguyên khối mỗi lượt. Route này là đường lượt rẻ nhất — không session, không cơ sở dữ liệu,
+lịch sử nằm trong request, tổng hợp tuần tự — nên thứ giới hạn nó là tốc độ lượt và các dịch
+vụ bên dưới, không phải API.
+
+Một lượt agent ngắn. Giả định chu kỳ khoảng 25 giây (khoảng 10 giây nói, 5 giây chờ, 8 giây
+phản hồi), so với 2,5 phút của một lượt phỏng vấn.
+
+| tài nguyên | phỏng vấn ở 100 | voice agent ở 100 |
+|---|---|---|
+| số lượt mỗi giây | ~0,7 | **~4** |
+| âm thanh STT | ~63 giây mỗi giây → 5-6 tiến trình | ~40 giây mỗi giây → **3-4 tiến trình** |
+| giọng nói TTS | ~50 giây mỗi giây → 3 worker | ~32 giây mỗi giây → **2 worker** |
+| luồng mô hình đang xử lý | ~6 — dưới trần ~15 | **~20 — vượt trần** ở tốc độ mô hình bình thường |
+| API mỗi lượt | session, messages | **không có cơ sở dữ liệu** |
+| bản ghi trên đĩa | ~7,2 GB/giờ | **không lưu** — route không giữ trạng thái |
+
+Trần của mô hình là bức tường đầu tiên ở đây, không phải tầng âm thanh. Ở 0,7 lượt/giây, mức
+trung bình nằm dưới ~15 khá xa; ở 4 lượt/giây, một luồng năm giây đưa khoảng hai mươi luồng
+vào xử lý, nên một phần số lượt bị từ chối và tiêu ngân sách retry để chờ. Không lượt nào
+thất bại — retry sinh ra chính vì thế — nhưng từ đầu tiên đến muộn hơn. Prompt agent ngắn
+hơn nên sinh nhanh hơn, đẩy con số xuống; ước lượng này cần kiểm lại với tài khoản thật.
+
+**Bridge là một tầng mà đường phỏng vấn không có.** Với người dùng gadget, nó giữ một socket
+cho mỗi thiết bị — âm thanh 24 kHz, VAD, Opus, một lần tải lên mỗi lượt — trong một tiến
+trình Node duy nhất trên máy này. Nó chưa từng chạy quá một thiết bị. Hãy đo nó bằng thiết bị
+giả lập trước khi các con số trên có ý nghĩa.
+
+Hai khác biệt đáng nêu:
+
+- **Gadget không hưởng cải thiện theo cửa sổ.** Bridge tự kết thúc lượt và tải lên utterance
+  đã cắt, nên thời gian chờ sau khi nói vẫn bao gồm phiên âm — hồ sơ nguyên khối. Truyền cửa
+  sổ từ bridge sẽ cần thay đổi bridge và giao thức; endpoint cửa sổ của API không tự làm được.
+- **Route này không lưu bản ghi**, nên bức tường đĩa 7,2 GB/giờ không áp dụng. Nếu phần lớn
+  100 người dùng là gadget, lưu trữ không còn là ràng buộc đầu tiên.
+
+Hồ sơ này được mô hình hoá từ chi phí mỗi lượt đã đo của route, không phải từ một lần chạy
+100 người dùng. Thứ sẽ làm nó có cơ sở: bridge dưới thiết bị giả lập, và 20-30 lượt agent
+đồng thời để xem điểm cân bằng giữa từ chối và retry thực sự nằm ở đâu với prompt ngắn.
+
 ---
 
 ## Các phát hiện từ những phép đo

@@ -252,6 +252,50 @@ concurrent streams.
   tool-call waits and MCP transports are in-process maps, so a second instance
   would need sticky sessions or externalized state.
 
+### At 100 voice-agent users
+
+The voice agent is the same route, `POST /api/voice-agent/stream`, used two ways: the browser
+page, which sends windows the way the interview page does, and the gadget through the bridge,
+which still uploads one whole utterance per turn. The route is the cheapest turn path — no
+session, no database, history carried in the request, synthesis serial by design — so what
+bounds it is the turn rate and the services beneath, not the API.
+
+An agent exchange is short. Assume a cycle of about 25 seconds (roughly 10 s of speech, 5 s
+waiting, 8 s of reply) against the interview's 2.5 minutes.
+
+| resource | interview at 100 | voice agent at 100 |
+|---|---|---|
+| turns per second | ~0.7 | **~4** |
+| STT audio | ~63 s per second → 5-6 processes | ~40 s per second → **3-4 processes** |
+| TTS speech | ~50 s per second → 3 workers | ~32 s per second → **2 workers** |
+| model streams in flight | ~6 — under the ~15 ceiling | **~20 — over it** at normal model speed |
+| API per turn | session, messages | **no database at all** |
+| recordings on disk | ~7.2 GB/hour | **none stored** — the route is stateless |
+
+The model ceiling is the first wall here, not the audio tier. At 0.7 turns/s the average sits
+well below ~15; at 4 turns/s, a five-second stream puts about twenty in flight, so a share of
+turns are refused and spend their retry budget waiting. Nothing fails — that is what the retry
+is for — but the first word arrives later than it should. Shorter agent prompts generate
+faster, which pushes the figure down; the estimate should be checked against the account.
+
+**The bridge is a tier the interview path does not have.** For gadget users it holds one
+device socket each — 24 kHz audio, VAD, Opus, one upload per turn — in a single Node service on
+this machine. It has never been run above one device. Measure it with simulated devices before
+any of the numbers above matter.
+
+Two differences worth naming:
+
+- **The gadget does not get the windowing improvement.** The bridge ends the turn itself and
+  uploads the trimmed utterance, so its wait after speaking includes transcription — the
+  whole-body profile. Streaming windows from the bridge would need a bridge and protocol
+  change; the API's window endpoint cannot provide it alone.
+- **No stored recordings on this route** means the 7.2 GB/hour disk wall does not apply. If
+  most of the 100 users are gadget conversations, storage stops being the first constraint.
+
+This profile is modelled from the route's measured turn costs, not from a 100-user run. What
+would ground it: the bridge under simulated devices, and 20-30 simultaneous agent turns to see
+where the refusal/retry trade-off actually lands with short prompts.
+
 ---
 
 ## Findings that came out of the probes
