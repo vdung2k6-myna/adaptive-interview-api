@@ -1,6 +1,8 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
-kokoro-vietnamese>=0.1.0
+# Not published on PyPI. Pinned to the commit the service was developed
+# against; the archive URL lets pip install it without git in the image.
+kokoro-vietnamese @ https://github.com/iamdinhthuan/Kokoro-Vietnamese/archive/a249afe5555aec6c435165c2f61ec0f71284812f.tar.gz
 soundfile>=0.13.0
 numpy>=1.26.0
 requests>=2.32.0

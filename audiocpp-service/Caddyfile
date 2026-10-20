@@ -1,0 +1,16 @@
+# The API holds one STT address. This proxy is that address: it fronts every
+# audiocpp instance, so adding capacity is a compose scale operation rather
+# than an API change.
+{
+	admin off
+	auto_https off
+}
+
+:8080 {
+	reverse_proxy audiocpp:8080 {
+		lb_policy least_conn
+		health_uri /health
+		health_interval 10s
+		health_timeout 5s
+	}
+}

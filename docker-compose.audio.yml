@@ -1,0 +1,172 @@
+# The audio tier: speech-to-text, three TTS engines, the gateway, and the STT
+# proxy. One project, started with:
+#
+#   docker compose -f docker-compose.audio.yml up -d --build
+#
+# Only two endpoints leave the project: the STT proxy on 8080 and the gateway
+# on 8082. Every engine port is reachable only inside the `audio` network.
+#
+# Environment (all optional; defaults are for a single development host):
+#   AUDIO_MODELS_DIR  host directory holding all four model sets
+#                     (default ./audio-models)
+#   AUDIO_BIND_ADDR   address the two published endpoints bind to
+#                     (default 127.0.0.1; set the private IP on a GPU host)
+#   AUDIO_TIER_TAG    tag for the four images built from this repository
+#                     (default dev)
+#   AUDIOCPP_IMAGE    upstream engine image; the default matches
+#                     audiocpp-service/Dockerfile's pin
+
+name: interview-audio
+
+services:
+  audiocpp:
+    build:
+      context: ./audiocpp-service
+      args:
+        AUDIOCPP_IMAGE: ${AUDIOCPP_IMAGE:-ghcr.io/0xshug0/audio.cpp:full-cuda12-20261020-99cd28e}
+    image: interview-audio/audiocpp:${AUDIO_TIER_TAG:-dev}
+    restart: unless-stopped
+    volumes:
+      - ${AUDIO_MODELS_DIR:-./audio-models}/audiocpp:/app/models:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1
+          || bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080'
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 120s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - audio
+
+  stt-proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      audiocpp:
+        condition: service_started
+    volumes:
+      - ./audiocpp-service/Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "${AUDIO_BIND_ADDR:-127.0.0.1}:8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - audio
+
+  gateway:
+    build:
+      context: ./audio-gateway
+    image: interview-audio/gateway:${AUDIO_TIER_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8082"
+      KOKORO_URL: http://kokoro:8081
+      PIPER_URL: http://piper:8083
+      SUPERTONIC_URL: http://supertonic:8084
+    ports:
+      - "${AUDIO_BIND_ADDR:-127.0.0.1}:8082:8082"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/health')"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - audio
+    # Deliberately no depends_on for the engines: the gateway must start and
+    # report "degraded" when an engine is missing, rather than refusing to run.
+
+  kokoro:
+    build:
+      context: ./kokoro-service
+    image: interview-audio/kokoro:${AUDIO_TIER_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8081"
+      DEVICE: cpu
+    volumes:
+      - ${AUDIO_MODELS_DIR:-./audio-models}/kokoro:/app/models:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health')"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    networks:
+      - audio
+
+  piper:
+    build:
+      context: ./piper-service
+    image: interview-audio/piper:${AUDIO_TIER_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8083"
+      PIPER_MODELS_DIR: /voices
+    volumes:
+      - ${AUDIO_MODELS_DIR:-./audio-models}/piper:/voices:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8083/health')"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      - audio
+
+  supertonic:
+    build:
+      context: ./supertonic-service
+    image: interview-audio/supertonic:${AUDIO_TIER_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8084"
+      SUPERTONIC_CACHE_DIR: /cache
+    volumes:
+      - ${AUDIO_MODELS_DIR:-./audio-models}/supertonic:/cache:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8084/health')"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    networks:
+      - audio
+
+networks:
+  audio:
+    driver: bridge

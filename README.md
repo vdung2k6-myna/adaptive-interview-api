@@ -199,25 +199,29 @@ curl -X POST -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/j
 
 ## Audio Services (for Voice Interviews)
 
-Voice interviews require an audio stack with four services plus an external STT binary.
+Voice interviews require an audio tier with four services plus a proxy in front of STT.
+The tier runs as one compose project.
 
 | Service | Port | Directory | Purpose |
 |---------|------|-----------|---------|
-| **audio.cpp** | 8080 | External | Speech-to-text (STT) transcription |
+| **audio.cpp** | 8080 (via proxy) | `audiocpp-service/` | Speech-to-text (STT) transcription, pinned upstream CUDA image |
 | **Kokoro** | 8081 | `kokoro-service/` | Text-to-speech (TTS) — fast, high quality |
 | **Piper** | 8083 | `piper-service/` | Text-to-speech (TTS) — multiple voices |
 | **Supertonic** | 8084 | `supertonic-service/` | Text-to-speech (TTS) — 31 languages, 44.1kHz, voice cloning |
 | **Audio Gateway** | 8082 | `audio-gateway/` | Unified TTS proxy — routes to Kokoro, Piper, or Supertonic |
 
 ```bash
-# Start all audio services
+# Start all audio services (builds images, starts compose, verifies health)
 npm run start:audio
 
 # Stop all audio services
 npm run stop:audio
 ```
 
-See [docs/SETUP.md](docs/SETUP.md) and the per-service READMEs for detailed setup.
+Only 8080 (the STT proxy) and 8082 (the gateway) are published; every engine port is
+internal to the compose network. Models live outside the images under
+`AUDIO_MODELS_DIR` — see [docs/AUDIO_TIER.md](docs/AUDIO_TIER.md) for provisioning,
+private binding, and scaling.
 
 ## License
 
