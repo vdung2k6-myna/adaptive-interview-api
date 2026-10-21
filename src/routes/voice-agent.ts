@@ -162,9 +162,20 @@ function validateLanguage(value: unknown): "english" | "vietnamese" {
   return "english";
 }
 
-function validateEngine(value: unknown): "kokoro" | "piper" | "supertonic" {
+/**
+ * An engine the caller actually asked for, or `undefined` when it named none.
+ *
+ * Returning a concrete engine here made "no choice" mean Kokoro, which then
+ * overrode the language mapping: an English turn with no engine was synthesized
+ * by Kokoro, which holds no English voice. `resolveEngineForLanguage` is the
+ * one place that decides the fallback (Piper for English, Kokoro for
+ * Vietnamese); this function must not pre-empt it.
+ */
+function validateEngine(
+  value: unknown
+): "kokoro" | "piper" | "supertonic" | undefined {
   if (value === "kokoro" || value === "piper" || value === "supertonic") return value;
-  return "kokoro";
+  return undefined;
 }
 
 function parseHistory(value: unknown): VoiceAgentMessage[] {

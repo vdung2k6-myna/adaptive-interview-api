@@ -1,8 +1,9 @@
 import { sql } from "drizzle-orm";
 import { db } from "./db";
+import { EMBED_DIMENSION } from "./embedding-dimension";
 import { embeddings } from "./schema";
 
-const EMBED_DIMENSION = 1024; // mxbai-embed-large
+export { EMBED_DIMENSION };
 
 export async function storeRequirementEmbedding(
   positionId: string,

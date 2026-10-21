@@ -7,6 +7,7 @@ import type { OllamaTool, OllamaToolCall } from "../lib/ollama";
 import { DEFAULT_PREFETCH_TOP_K } from "../lib/prefetch";
 import type { KnowledgeChunk, KnowledgeSearchOutcome, SearchOptions } from "../lib/knowledge";
 import { SentenceExtractor } from "../lib/audio/sentence-extractor";
+import type { SynthesizeOptions } from "../lib/audio";
 import { AUDIO_ROOT } from "../lib/audio/storage";
 import { turnTranscripts } from "../lib/turn-transcript";
 import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
@@ -45,6 +46,9 @@ interface Harness {
   /** The text of every chunk the route asked to synthesize, in order — what the
    * turn actually spoke, which is not the same claim as what it emitted. */
   synthCalls: string[];
+  /** The options the route passed with each synthesis, so "no engine was named"
+   * can be asserted to have reached the engine the language mapping chose. */
+  synthOptions: SynthesizeOptions[];
   /** Every transcription the route asked for, with the arguments it passed. The
    * language has to reach the transcriber, and "the route knows the language" is
    * not the same claim as "the transcriber was told it". */
@@ -110,6 +114,7 @@ function harness(
   const logs: string[] = [];
   const events: string[] = [];
   const synthCalls: string[] = [];
+  const synthOptions: SynthesizeOptions[] = [];
   const transcribeCalls: Array<{ language: string | undefined }> = [];
   const tokens = settings.stream ?? [];
   // Which model round the stub is answering, so one turn's rounds can be scripted apart.
@@ -123,6 +128,7 @@ function harness(
     logs,
     events,
     synthCalls,
+    synthOptions,
     transcribeCalls,
     deps: {
       searchKnowledge: async (query, topK, collections, options) => {
@@ -159,9 +165,10 @@ function harness(
         nonStreaming.push(options.messages.map((m) => m.content).join("\n---\n"));
         return "";
       },
-      synthesizeSpeechWithFallback: async (chunk) => {
+      synthesizeSpeechWithFallback: async (chunk, options) => {
         const call = synthCalls.length;
         synthCalls.push(chunk);
+        synthOptions.push(options);
         return await (settings.synthesize?.(chunk, call) ?? Buffer.alloc(0));
       },
     },
@@ -1446,6 +1453,34 @@ describe("POST /api/voice-agent/stream — the spoken chunk contract", () => {
         "the delimiter-less tail must still be spoken — that is the second emit site"
       );
     });
+  });
+
+  it("falls through to the language mapping when no engine is named", async () => {
+    const english = harness(
+      { ok: true, chunks: [] },
+      { stream: ["Hello there."], synthesize: (chunk) => Buffer.from(`wav:${chunk}`) }
+    );
+    await withServer(english.deps, async (api) => {
+      await sendTurn(api.stream, english, { language: "english" });
+    });
+    assert.equal(
+      english.synthOptions[0]?.engine,
+      "piper",
+      "an English turn with no engine must be synthesized by Piper, whose voices this repository provisions"
+    );
+
+    const vietnamese = harness(
+      { ok: true, chunks: [] },
+      { stream: ["Xin chào."], synthesize: (chunk) => Buffer.from(`wav:${chunk}`) }
+    );
+    await withServer(vietnamese.deps, async (api) => {
+      await sendTurn(api.stream, vietnamese, { language: "vietnamese" });
+    });
+    assert.equal(
+      vietnamese.synthOptions[0]?.engine,
+      "kokoro",
+      "a Vietnamese turn with no engine must keep the language mapping's Kokoro"
+    );
   });
 
   it("reports a failed chunk as null audio at its own index, and still reaches done", async () => {

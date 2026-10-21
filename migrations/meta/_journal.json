@@ -43,6 +43,13 @@
       "when": 1790658943629,
       "tag": "0005_fix_friendly_tutor_topics",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1792511718124,
+      "tag": "0006_enable_pgvector",
+      "breakpoints": true
     }
   ]
 }

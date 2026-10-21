@@ -12,6 +12,7 @@
     "test:tsx": "npx tsx --test src/**/*.test.ts",
     "db:migrate": "drizzle-kit migrate",
     "db:generate": "drizzle-kit generate",
+    "check:embed": "tsx scripts/check-embed-dimension.ts",
     "start:audio": "node scripts/start-audio.js",
     "stop:audio": "node scripts/stop-audio.js"
   },
