@@ -45,8 +45,10 @@ export const developmentConfig: AppConfig = {
     sttUrl: process.env.AUDIOCPP_BASE_URL || "http://localhost:8080",
     gatewayUrl: process.env.AUDIO_GATEWAY_URL || "http://localhost:8082",
     sttModel: process.env.AUDIOCPP_STT_MODEL || "stt",
-    defaultEngine: (process.env.DEFAULT_TTS_ENGINE as "kokoro" | "piper" | "supertonic") || "supertonic",
-    defaultVoice: process.env.DEFAULT_VOICE || "F1",
+    // Piper is the tier's measured-fast engine (23x real-time, against
+    // supertonic's 3.2x) and the one whose voice this repository provisions.
+    defaultEngine: (process.env.DEFAULT_TTS_ENGINE as "kokoro" | "piper" | "supertonic") || "piper",
+    defaultVoice: process.env.DEFAULT_VOICE || "bryce",
     timeoutMs: 60_000,
     // Four: enough that a reply's segments are spoken as they are produced, few
     // enough that one long reply cannot occupy the gateway. The gateway was
@@ -63,7 +65,7 @@ export const developmentConfig: AppConfig = {
         vietnamese: process.env.KOKORO_VOICE_VIETNAMESE || "",
       },
       piper: {
-        english: process.env.PIPER_VOICE_ENGLISH || "en_US-lessac-medium",
+        english: process.env.PIPER_VOICE_ENGLISH || "bryce",
         vietnamese: process.env.PIPER_VOICE_VIETNAMESE || "",
       },
       supertonic: {

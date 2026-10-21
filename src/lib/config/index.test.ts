@@ -106,6 +106,28 @@ describe("the bounds work under load is held to", () => {
   });
 });
 
+describe("the audio defaults an unconfigured deployment runs on", () => {
+  it("names the engine and English voice the audio tier provisions", () => {
+    for (const [name, config] of ENVIRONMENTS) {
+      assert.equal(
+        config.audio.defaultEngine,
+        "piper",
+        `${name}: ${envNote("DEFAULT_TTS_ENGINE")}`
+      );
+      assert.equal(
+        config.audio.defaultVoice,
+        "bryce",
+        `${name}: ${envNote("DEFAULT_VOICE")}`
+      );
+      assert.equal(
+        config.audio.voices.piper.english,
+        "bryce",
+        `${name}: ${envNote("PIPER_VOICE_ENGLISH")}`
+      );
+    }
+  });
+});
+
 describe("the bounds a turn's tool calls are held to", () => {
   it("gives a turn three rounds, which is one request for a track answered in two calls", () => {
     // Two was set for a person asking for two things in one breath. A request for a track is one

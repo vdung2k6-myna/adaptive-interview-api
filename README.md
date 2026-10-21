@@ -102,12 +102,12 @@ curl http://localhost:4000/health
 | `AUDIO_GATEWAY_URL` | No | Audio Gateway TTS server URL |
 | `AUDIO_SYNTHESIS_CONCURRENCY` | No | Syntheses one turn may have in flight (default: `4`). The gateway serves one request at a time, so an unbounded fan-out from one long reply would put every other turn's audio behind its backlog. See [CAPACITY.md](docs/CAPACITY.md) |
 | `TRANSCRIPT_BUFFER_RETENTION_MS` | No | How long a turn's windowed transcript and audio are held before the turn must claim them (default: `900000`, 15 minutes). Long enough to outlast the longest answer the transport accepts; short enough that a turn nobody submitted is reclaimed |
-| `DEFAULT_TTS_ENGINE` | No | `kokoro`, `piper`, or `supertonic` (default: `supertonic`) |
-| `DEFAULT_VOICE` | No | Voice ID used when the engine- and language-specific voice is unset (default: `F1`) |
+| `DEFAULT_TTS_ENGINE` | No | `kokoro`, `piper`, or `supertonic` (default: `piper`) |
+| `DEFAULT_VOICE` | No | Voice ID used when the engine- and language-specific voice is unset (default: `bryce`) |
 | `EMBEDDING_SIMILARITY_THRESHOLD` | No | Default: `0.75` |
 | `KOKORO_VOICE_ENGLISH` | No | Kokoro voice for English sessions (e.g. `af_heart`) |
 | `KOKORO_VOICE_VIETNAMESE` | No | Kokoro voice for Vietnamese sessions |
-| `PIPER_VOICE_ENGLISH` | No | Piper voice for English sessions (e.g. `en_US-lessac-medium`) |
+| `PIPER_VOICE_ENGLISH` | No | Piper voice for English sessions (default: `bryce`) |
 | `PIPER_VOICE_VIETNAMESE` | No | Piper voice for Vietnamese sessions |
 | `SUPERTONIC_VOICE_ENGLISH` | No | Supertonic voice for English sessions (default: `F1`). A name the synthesis service holds a style for — its ten built-ins or an installed style — see [supertonic-service](supertonic-service/README.md) |
 | `SUPERTONIC_VOICE_VIETNAMESE` | No | Supertonic voice for Vietnamese sessions (default: `F1`) |

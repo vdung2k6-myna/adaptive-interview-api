@@ -103,6 +103,10 @@ createdb ai_interview
 
 ### Enable pgvector Extension
 
+Migration `0006_enable_pgvector` creates the extension, so `npm run db:migrate` on a
+fresh database is enough. The manual command stays safe on a database created before
+that migration:
+
 ```bash
 psql ai_interview -c "CREATE EXTENSION IF NOT EXISTS vector;"
 ```
@@ -137,6 +141,20 @@ The same script repairs any database that was built by hand or by
 `drizzle-kit push`, and it refuses to record a migration whose objects are not
 in the database rather than marking unapplied work as applied. A database that
 has only ever been migrated by `drizzle-kit migrate` never needs it.
+
+### Check the embedding model
+
+The schema casts stored embeddings to `vector(1024)`. Before starting a deployment, and
+whenever `OLLAMA_EMBED_MODEL` changes, run:
+
+```bash
+npm run check:embed
+```
+
+It reads the model's dimension from Ollama and counts stored embedding rows whose
+dimension differs. It exits non-zero on either mismatch. The position query casts every
+matching row, so one row produced by a differently sized model fails the whole scan.
+Regenerate those embeddings — or remove test rows — before retrieval can work.
 
 ## 5. Seed Sample Data
 
@@ -309,6 +327,10 @@ pg_isready
 ```
 
 ### pgvector Extension Not Found
+
+Migration `0006_enable_pgvector` creates the extension. A database migrated with an older
+set needs the command below, or a fresh `npm run db:migrate`. `npm run check:embed` reports
+the model's dimension and any stored row that disagrees.
 
 ```bash
 psql ai_interview -c "CREATE EXTENSION IF NOT EXISTS vector;"
