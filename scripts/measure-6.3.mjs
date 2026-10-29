@@ -1,6 +1,6 @@
 /**
  * 6.3's measurement. Runs against the API instance on :4100 (the change's code)
- * and the live doc-etl-api on :8000. Not a repo artifact — the numbers it
+ * and the live doc-etl-api on :8005. Not a repo artifact — the numbers it
  * produces are recorded in tasks.md 6.3.
  *
  * Models a text turn the way the client now drives it: the user stops typing at
@@ -86,7 +86,7 @@ async function turn(text, prefetchId, extra = {}) {
 async function holdSearchLock(ms) {
   const controller = new AbortController();
   setTimeout(() => controller.abort(), ms);
-  const search = fetch("http://127.0.0.1:8000/search", {
+  const search = fetch("http://127.0.0.1:8005/search", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query: "lock holder", top_k: 1, collections: TOPICS.map(() => "truyen-kiem-hiep") }),

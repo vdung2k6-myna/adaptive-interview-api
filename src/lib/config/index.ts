@@ -25,6 +25,15 @@ export interface AppConfig {
      */
     retryDeadlineMs: number;
     /**
+     * The longest a provider's own `Retry-After` may be honoured. A provider
+     * that names a wait longer than this is reported rather than waited on: a
+     * request that is itself over the provider's ceiling cannot be helped by
+     * waiting, and a turn that sits for minutes is worse than one that says why.
+     * This bound is separate from `retryDeadlineMs`, which budgets the runtime's
+     * own backoff.
+     */
+    retryAfterMaxMs: number;
+    /**
      * How many model requests this process may have in flight at once.
      *
      * Below the service's own ceiling on purpose: a refusal that is avoided is a

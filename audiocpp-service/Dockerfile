@@ -14,4 +14,4 @@ EXPOSE 8080
 # The image's first argument selects the bundled binary; `server` is
 # audiocpp_server. Models are mounted at /app/models (see server.json) and are
 # never baked into this image.
-CMD ["server", "--config", "/app/server.json", "--backend", "cuda", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["server", "--config", "/app/server.json", "--backend", "cpu", "--host", "0.0.0.0", "--port", "8080"]

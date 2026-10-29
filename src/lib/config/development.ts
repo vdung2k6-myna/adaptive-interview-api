@@ -14,6 +14,7 @@ export const developmentConfig: AppConfig = {
     embedTimeoutMs: 15_000, // 15s
     retries: parsePositiveInt(process.env.OLLAMA_RETRIES, 1),
     retryDeadlineMs: parsePositiveInt(process.env.OLLAMA_RETRY_DEADLINE_MS, 20_000),
+    retryAfterMaxMs: parsePositiveInt(process.env.OLLAMA_RETRY_AFTER_MAX_MS, 60_000),
     // Twelve, below the fifteen the cloud account was measured to accept
     // (`docs/CAPACITY.md`). Staying under it is the point: a turn queues here,
     // where it can be ordered, instead of being refused upstream.
@@ -84,7 +85,7 @@ export const developmentConfig: AppConfig = {
     },
   },
   docEtl: {
-    apiUrl: process.env.DOC_ETL_API_URL || "http://localhost:8000",
+    apiUrl: process.env.DOC_ETL_API_URL || "http://localhost:8005",
     // doc-etl-api preloads its embedding model, so a search is a query embedding
     // plus an in-memory scan (~50-200ms). Retrieval is awaited before prompt
     // construction, so an over-long timeout costs first-token latency on every

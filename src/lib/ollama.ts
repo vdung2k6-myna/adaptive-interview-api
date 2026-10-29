@@ -1,4 +1,4 @@
-import { OllamaError } from "./errors";
+import { ModelProviderError, OllamaError } from "./errors";
 import config from "./config";
 import { createSemaphore, type ReleaseSlot } from "./semaphore";
 
@@ -10,13 +10,39 @@ import { createSemaphore, type ReleaseSlot } from "./semaphore";
  */
 const modelSlots = createSemaphore(config.ollama.maxConcurrentRequests);
 
-/** A service at its limit answers these; they are the only statuses worth waiting on. */
-const RETRYABLE_STATUSES = new Set([429, 503]);
-
 /** Backoff starts here and is capped here; the whole sequence is bounded by the
  *  retry deadline, so this cap only stops the jitter from spending it in one go. */
 const RETRY_BASE_DELAY_MS = 250;
 const RETRY_MAX_DELAY_MS = 4_000;
+
+/** The most jitter added to a provider-directed wait, so turns refused together do
+ *  not retry together. The provider's own duration remains the minimum. */
+const RETRY_AFTER_JITTER_MS = 250;
+
+/**
+ * The wait a response asks for, in milliseconds. `Retry-After` is delta-seconds or
+ * an HTTP date; an absent, malformed or already-past value is `undefined`.
+ */
+function retryAfterMs(res: Response): number | undefined {
+  const header = res.headers.get("retry-after")?.trim();
+  if (header === undefined || header === "") return undefined;
+
+  if (/^\d+$/.test(header)) return Number(header) * 1000;
+  const at = Date.parse(header);
+  if (Number.isNaN(at)) return undefined;
+  const wait = at - Date.now();
+  return wait > 0 ? wait : undefined;
+}
+
+/**
+ * A refusal worth asking again: 429 and 503, and a 413 that carries `Retry-After`.
+ * A 413 without one names a request over the provider's ceiling, which waiting
+ * cannot fix.
+ */
+function isRetryable(res: Response): boolean {
+  if (res.status === 429 || res.status === 503) return true;
+  return res.status === 413 && retryAfterMs(res) !== undefined;
+}
 
 function abortError(): Error {
   const err = new Error("aborted");
@@ -70,6 +96,12 @@ interface ModelCall {
  * When the deadline leaves no room for another attempt, the refusal is returned
  * as it is — the caller then reports what the service said, rather than a
  * timeout of our own invention.
+ *
+ * A provider that names a wait in `Retry-After` is honoured up to
+ * `retryAfterMaxMs`, even when that is longer than the deadline above: the
+ * deadline budgets this runtime's own backoff, while the header is the provider
+ * saying when its per-minute budget will recover. The attempt count still
+ * applies, and the turn's abort signal ends the wait.
  */
 async function requestModel(
   url: string,
@@ -90,13 +122,29 @@ async function requestModel(
       throw err;
     }
 
-    if (!RETRYABLE_STATUSES.has(res.status) || attempt === attempts) {
+    if (!isRetryable(res) || attempt === attempts) {
       return { res, release };
     }
 
-    const wait = retryDelayMs(attempt);
-    if (Date.now() + wait >= deadline) {
-      return { res, release };
+    const after = retryAfterMs(res);
+    let wait: number;
+    if (after !== undefined) {
+      if (after > config.ollama.retryAfterMaxMs) {
+        return { res, release };
+      }
+      const jitter = Math.min(
+        RETRY_AFTER_JITTER_MS,
+        Math.max(0, config.ollama.retryAfterMaxMs - after)
+      );
+      wait = Math.min(
+        after + Math.floor(Math.random() * (jitter + 1)),
+        config.ollama.retryAfterMaxMs
+      );
+    } else {
+      wait = retryDelayMs(attempt);
+      if (Date.now() + wait >= deadline) {
+        return { res, release };
+      }
     }
 
     // Nothing in a refusal's body is kept, and the slot is not ours to hold
@@ -110,8 +158,10 @@ async function requestModel(
 }
 
 /** One call a model asked for, as it reported it. `arguments` arrives already parsed — Ollama
- *  does that before the chunk reaches us — and is handed to the gadget as it stands. */
+ *  does that before the chunk reaches us — and is handed to the gadget as it stands. The `id`
+ *  is the provider's, when it supplies one; the OpenAI dialect needs it to pair a result. */
 export interface OllamaToolCall {
+  id?: string;
   function: {
     name: string;
     arguments: Record<string, unknown>;
@@ -132,6 +182,8 @@ export interface OllamaMessage {
   tool_calls?: OllamaToolCall[];
   /** The tool a `tool` message is the result of, by the name the model called. */
   tool_name?: string;
+  /** The call a `tool` message is the result of, in the OpenAI dialect. */
+  tool_call_id?: string;
 }
 
 /**
@@ -203,6 +255,19 @@ export function parseGadgetTools(raw: string | undefined): OllamaTool[] {
   return tools;
 }
 
+/**
+ * The account's own OpenAI-compatible endpoint. Present for a turn whose agent
+ * names a profile; absent for every other turn, which is the request this
+ * service made before any of this existed.
+ */
+export interface LlmTarget {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  /** null means the provider's own default; the field is then not sent. */
+  temperature: number | null;
+}
+
 export interface OllamaGenerateOptions {
   model?: string;
   messages: OllamaMessage[];
@@ -211,6 +276,8 @@ export interface OllamaGenerateOptions {
   /** What the model may ask to be done. Omitted — not empty — when there is nothing it may
    *  call, so a turn with no tools is the request it was before any of this existed. */
   tools?: OllamaTool[];
+  /** The account's model. Absent selects this deployment's own Ollama. */
+  llm?: LlmTarget;
 }
 
 export interface GenerateStreamResult {
@@ -243,7 +310,7 @@ function readToolCalls(message: { tool_calls?: unknown } | undefined): OllamaToo
   const calls: OllamaToolCall[] = [];
   for (const entry of raw) {
     if (typeof entry !== "object" || entry === null) continue;
-    const fn = (entry as { function?: unknown }).function;
+    const { id, function: fn } = entry as { id?: unknown; function?: unknown };
     if (typeof fn !== "object" || fn === null) continue;
     const { name, arguments: args } = fn as { name?: unknown; arguments?: unknown };
     if (typeof name !== "string" || name === "") continue;
@@ -260,7 +327,10 @@ function readToolCalls(message: { tool_calls?: unknown } | undefined): OllamaToo
     } else if (typeof args === "object" && args !== null) {
       parsed = args as Record<string, unknown>;
     }
-    calls.push({ function: { name, arguments: parsed } });
+    calls.push({
+      ...(typeof id === "string" && id !== "" ? { id } : {}),
+      function: { name, arguments: parsed },
+    });
   }
   return calls;
 }
@@ -370,9 +440,37 @@ export async function embedText(text: string): Promise<number[]> {
   }
 }
 
+/**
+ * A message in the native Ollama dialect. The internal shape now carries the OpenAI call id
+ * and the tool-result reference; both are dropped here, so `/api/chat` sees the body it saw
+ * before an account could name an OpenAI-compatible provider.
+ */
+function nativeMessages(messages: OllamaMessage[]): unknown[] {
+  return messages.map((message) => {
+    if (message.role === "assistant" && message.tool_calls !== undefined) {
+      return {
+        role: "assistant",
+        content: message.content,
+        tool_calls: message.tool_calls.map((call) => ({
+          function: { name: call.function.name, arguments: call.function.arguments },
+        })),
+      };
+    }
+    if (message.role === "tool") {
+      return {
+        role: "tool",
+        content: message.content,
+        ...(message.tool_name === undefined ? {} : { tool_name: message.tool_name }),
+      };
+    }
+    return message;
+  });
+}
+
 export async function generateChatResponse(
   options: OllamaGenerateOptions
 ): Promise<string> {
+  if (options.llm !== undefined) return generateOpenAiResponse(options, options.llm);
   const baseUrl = process.env.OLLAMA_BASE_URL || config.ollama.baseUrl;
   const model = options.model || process.env.OLLAMA_MODEL || config.ollama.chatModel;
   const url = `${baseUrl}/api/chat`;
@@ -384,7 +482,7 @@ export async function generateChatResponse(
   try {
     const requestBody = JSON.stringify({
       model,
-      messages: options.messages,
+      messages: nativeMessages(options.messages),
       stream: false,
       options: {
         temperature: options.temperature ?? 0.7,
@@ -456,6 +554,7 @@ export async function generateChatResponse(
 export function generateChatResponseStream(
   options: OllamaGenerateOptions
 ): GenerateStreamResult {
+  if (options.llm !== undefined) return generateOpenAiStream(options, options.llm);
   const baseUrl = process.env.OLLAMA_BASE_URL || config.ollama.baseUrl;
   const model = options.model || process.env.OLLAMA_MODEL || config.ollama.chatModel;
   const url = `${baseUrl}/api/chat`;
@@ -481,7 +580,7 @@ export function generateChatResponseStream(
       try {
         const requestBody = JSON.stringify({
           model,
-          messages: options.messages,
+          messages: nativeMessages(options.messages),
           stream: true,
           // Omitted rather than sent empty. An empty list is a claim that the model may call
           // nothing; silence is a turn that was asked without tools, which is every turn a
@@ -613,6 +712,300 @@ export function generateChatResponseStream(
     cancel() {
       clearTimeout(timeoutId);
       controller.abort();
+      releaseModelSlot?.();
+      releaseModelSlot = null;
+    },
+  });
+
+  return {
+    stream,
+    getFullText: () => fullText,
+    getToolCalls: () => toolCalls,
+  };
+}
+
+/**
+ * The account's own model, over the OpenAI-compatible protocol.
+ *
+ * One adapter covers OpenAI, Groq, OpenRouter, vLLM, LM Studio and Ollama's own
+ * `/v1`: they agree on `/chat/completions`, a bearer key, SSE deltas and the tool
+ * shape this service already sends. What it deliberately does not do is fall
+ * back — a provider that refuses is the turn's failure, never another model's
+ * answer, because a silent substitution would spend this deployment's money to
+ * hide the account's problem.
+ */
+
+function openAiChatUrl(baseUrl: string): string {
+  return `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
+}
+
+function openAiHeaders(llm: LlmTarget): Record<string, string> {
+  return { "Content-Type": "application/json", Authorization: `Bearer ${llm.apiKey}` };
+}
+
+/**
+ * A message in the OpenAI dialect. The internal shape is Ollama's — arguments are objects,
+ * and a tool result names its tool. This projection is the other dialect: arguments are a
+ * JSON string, every call has an id and a type, and a result names the call it answers.
+ */
+function openAiMessages(messages: OllamaMessage[]): unknown[] {
+  return messages.map((message, messageIndex) => {
+    if (
+      message.role === "assistant" &&
+      message.tool_calls !== undefined &&
+      message.tool_calls.length > 0
+    ) {
+      return {
+        role: "assistant",
+        content: message.content,
+        tool_calls: message.tool_calls.map((call, callIndex) => ({
+          id: call.id ?? `call_${messageIndex}_${callIndex}`,
+          type: "function",
+          function: {
+            name: call.function.name,
+            arguments: JSON.stringify(call.function.arguments),
+          },
+        })),
+      };
+    }
+    if (message.role === "tool") {
+      return {
+        role: "tool",
+        tool_call_id: message.tool_call_id ?? message.tool_name ?? "",
+        content: message.content,
+      };
+    }
+    return message;
+  });
+}
+
+function openAiBody(options: OllamaGenerateOptions, llm: LlmTarget, stream: boolean): string {
+  return JSON.stringify({
+    model: llm.model,
+    messages: openAiMessages(options.messages),
+    stream,
+    // Omitted rather than sent empty, exactly as the Ollama body does: a turn with
+    // no tools is one the model answers without them.
+    ...(options.tools && options.tools.length > 0 ? { tools: options.tools } : {}),
+    // The profile's temperature, or the provider's own default. The turn's 0.7 is
+    // a property of this deployment's model, not of the account's.
+    ...(llm.temperature === null ? {} : { temperature: llm.temperature }),
+  });
+}
+
+function providerError(url: string, status: number, body: string): ModelProviderError {
+  const detail = body.trim().slice(0, 200);
+  return new ModelProviderError(
+    `the model provider at ${url} returned ${status}${detail === "" ? "" : `: ${detail}`}`,
+    status
+  );
+}
+
+async function generateOpenAiResponse(
+  options: OllamaGenerateOptions,
+  llm: LlmTarget
+): Promise<string> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), config.ollama.chatTimeoutMs);
+
+  try {
+    const { res, release } = await requestModel(
+      openAiChatUrl(llm.baseUrl),
+      { method: "POST", headers: openAiHeaders(llm), body: openAiBody(options, llm, false) },
+      controller.signal
+    );
+
+    try {
+      clearTimeout(timeoutId);
+      if (!res.ok) throw providerError(openAiChatUrl(llm.baseUrl), res.status, await res.text().catch(() => ""));
+
+      const raw = await res.text();
+      let data: {
+        choices?: Array<{ message?: { content?: string; tool_calls?: unknown } }>;
+        usage?: { prompt_tokens?: number; completion_tokens?: number };
+      };
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        throw new ModelProviderError("the model provider returned invalid JSON", 502);
+      }
+
+      logTokenCounts(llm.model, {
+        prompt_eval_count: data.usage?.prompt_tokens,
+        eval_count: data.usage?.completion_tokens,
+      });
+
+      const content = data.choices?.[0]?.message?.content?.trim();
+      if (!content) throw new ModelProviderError("the model provider's answer contained no content", 502);
+      return content;
+    } finally {
+      release();
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err instanceof OllamaError) throw err;
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new ModelProviderError(
+        `the model provider timed out after ${config.ollama.chatTimeoutMs / 1000}s`,
+        504
+      );
+    }
+    throw new ModelProviderError(
+      `the model provider at ${openAiChatUrl(llm.baseUrl)} could not be reached: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      502
+    );
+  }
+}
+
+function generateOpenAiStream(
+  options: OllamaGenerateOptions,
+  llm: LlmTarget
+): GenerateStreamResult {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), config.ollama.chatTimeoutMs);
+
+  let fullText = "";
+  const toolCalls: OllamaToolCall[] = [];
+  let releaseModelSlot: ReleaseSlot | null = null;
+
+  const stream = new ReadableStream<string>({
+    async start(streamController) {
+      try {
+        const { res, release } = await requestModel(
+          openAiChatUrl(llm.baseUrl),
+          { method: "POST", headers: openAiHeaders(llm), body: openAiBody(options, llm, true) },
+          controller.signal
+        );
+        releaseModelSlot = release;
+        clearTimeout(timeoutId);
+
+        if (!res.ok) {
+          streamController.error(providerError(openAiChatUrl(llm.baseUrl), res.status, await res.text().catch(() => "")));
+          return;
+        }
+        if (!res.body) {
+          streamController.error(new ModelProviderError("the model provider returned an empty body", 502));
+          return;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        // Tool calls arrive as deltas too: the name and the arguments of one call
+        // are spread across chunks, so they are gathered by index and read once the
+        // stream ends.
+        const pending = new Map<number, { id?: string; name: string; arguments: string }>();
+        let buffer = "";
+
+        const consume = (payload: string): boolean => {
+          if (payload === "[DONE]") return true;
+          let event: {
+            choices?: Array<{
+              delta?: {
+                content?: string;
+                tool_calls?: Array<{
+                  index?: number;
+                  id?: string;
+                  function?: { name?: string; arguments?: string };
+                }>;
+              };
+            }>;
+            usage?: { prompt_tokens?: number; completion_tokens?: number };
+          };
+          try {
+            event = JSON.parse(payload);
+          } catch {
+            return false;
+          }
+
+          const delta = event.choices?.[0]?.delta;
+          const content = delta?.content ?? "";
+          if (content !== "") {
+            fullText += content;
+            streamController.enqueue(content);
+          }
+          for (const call of delta?.tool_calls ?? []) {
+            const index = call.index ?? 0;
+            const slot = pending.get(index) ?? { name: "", arguments: "" };
+            if (typeof call.id === "string" && call.id !== "") slot.id = call.id;
+            if (typeof call.function?.name === "string") slot.name += call.function.name;
+            if (typeof call.function?.arguments === "string") slot.arguments += call.function.arguments;
+            pending.set(index, slot);
+          }
+          if (event.usage !== undefined) {
+            logTokenCounts(llm.model, {
+              prompt_eval_count: event.usage.prompt_tokens,
+              eval_count: event.usage.completion_tokens,
+            });
+          }
+          return false;
+        };
+
+        let done = false;
+        while (!done) {
+          const read = await reader.read();
+          if (read.done) break;
+          buffer += decoder.decode(read.value, { stream: true });
+
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("data:")) continue;
+            if (consume(trimmed.slice(5).trim())) {
+              done = true;
+              break;
+            }
+          }
+        }
+
+        const tail = buffer.trim();
+        if (!done && tail.startsWith("data:")) consume(tail.slice(5).trim());
+
+        if (pending.size > 0) {
+          for (const call of readToolCalls({
+            tool_calls: [...pending.values()].map((entry) => ({
+              ...(entry.id === undefined ? {} : { id: entry.id }),
+              function: entry,
+            })),
+          })) {
+            toolCalls.push(call);
+          }
+        }
+
+        streamController.close();
+      } catch (err) {
+        clearTimeout(timeoutId);
+        if (err instanceof Error && err.name === "AbortError") {
+          streamController.error(
+            new ModelProviderError(
+              `the model provider timed out after ${config.ollama.chatTimeoutMs / 1000}s`,
+              504
+            )
+          );
+          return;
+        }
+        streamController.error(
+          err instanceof OllamaError
+            ? err
+            : new ModelProviderError(
+                `the model provider at ${openAiChatUrl(llm.baseUrl)} could not be reached: ` +
+                  `${err instanceof Error ? err.message : String(err)}`,
+                502
+              )
+        );
+      } finally {
+        // The slot is held for the whole stream, not just for the headers — and it
+        // must come back when the stream ends, or every provider turn would take
+        // one with it and the process would stall once it had served twelve.
+        releaseModelSlot?.();
+        releaseModelSlot = null;
+      }
+    },
+
+    cancel() {
+      controller.abort();
+      clearTimeout(timeoutId);
       releaseModelSlot?.();
       releaseModelSlot = null;
     },

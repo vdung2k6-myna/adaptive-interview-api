@@ -5,3 +5,4 @@ numpy==1.26.4
 soundfile==0.12.1
 pydantic==2.8.0
 python-multipart==0.0.9
+pydub==0.25.1

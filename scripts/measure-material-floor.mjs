@@ -14,7 +14,7 @@
  */
 import { writeFileSync, mkdirSync } from "node:fs";
 
-const SERVICE = process.env.DOC_ETL_API_URL || "http://127.0.0.1:8000";
+const SERVICE = process.env.DOC_ETL_API_URL || "http://127.0.0.1:8005";
 /** The collections a development deployment speaks (MATERIAL_COLLECTIONS). */
 const SPEAKABLE = ["truyen-kiem-hiep", "kiem-hiep"];
 const FLOOR_UNDER_TEST = Number(process.env.MATERIAL_SCORE_FLOOR || 0.55);

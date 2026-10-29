@@ -10,6 +10,7 @@ import { buildVoiceAgentPrompt, trimVoiceAgentHistory, type VoiceAgentMessage } 
 import {
   generateChatResponse,
   generateChatResponseStream,
+  type LlmTarget,
   parseGadgetTools,
   type OllamaTool,
   type OllamaToolCall,
@@ -178,6 +179,31 @@ function validateEngine(
   return undefined;
 }
 
+/**
+ * The account's model, read whole or refused whole.
+ *
+ * `undefined` is a turn with no profile: it is asked of this deployment's own
+ * model, exactly as before. `null` is a half-stated profile, which is refused at
+ * the route rather than quietly answered by another model — the same rule the
+ * provider's own failures follow.
+ */
+function readLlmTarget(body: Record<string, unknown>): LlmTarget | undefined | null {
+  const baseUrl = typeof body.llmBaseUrl === "string" ? body.llmBaseUrl.trim() : "";
+  const model = typeof body.llmModel === "string" ? body.llmModel.trim() : "";
+  const apiKey = typeof body.llmApiKey === "string" ? body.llmApiKey : "";
+  const hasTemperature = body.llmTemperature !== undefined && body.llmTemperature !== "";
+
+  if (baseUrl === "" && model === "" && apiKey === "" && !hasTemperature) return undefined;
+  if (baseUrl === "" || model === "" || apiKey === "") return null;
+
+  let temperature: number | null = null;
+  if (hasTemperature) {
+    temperature = Number(body.llmTemperature);
+    if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) return null;
+  }
+  return { baseUrl, apiKey, model, temperature };
+}
+
 function parseHistory(value: unknown): VoiceAgentMessage[] {
   if (typeof value !== "string") return [];
   try {
@@ -309,6 +335,13 @@ async function handleStream(
     const requestedEngine = validateEngine(req.body.engine);
     const engine = resolveEngineForLanguage(requestedEngine, language);
     const systemPrompt = typeof req.body.systemPrompt === "string" ? req.body.systemPrompt : "";
+    // The account's own model, when the bridge carries one. Absent for every turn
+    // this deployment answers with its own model — which is every turn today.
+    const llm = readLlmTarget(req.body as Record<string, unknown>);
+    if (llm === null) {
+      res.status(400).json({ error: "the llm fields must name a base URL, a model and a key together" });
+      return;
+    }
     const rawHistory = parseHistory(req.body.history);
     // What the gadget says it can be asked to do, carried by the bridge with the turn and
     // already the gadget's own words. Empty for every client that is not a gadget — the
@@ -839,6 +872,7 @@ async function handleStream(
             // What this gadget reported it can be asked to do. Absent for a turn that carries
             // none, so a browser turn — and every turn before this existed — asks as it did.
             ...(mayCall ? { tools } : {}),
+            ...(llm ? { llm } : {}),
           });
 
         const reader = llmStream.getReader();
@@ -873,7 +907,12 @@ async function handleStream(
         }
 
         finalText = getFullText();
-        const calls = mayCall ? getToolCalls() : [];
+        // The id is what the OpenAI dialect pairs a result with. Keep the provider's when it
+        // supplies one, and name the call by its round and position otherwise — the native
+        // path ignores it, and the result below carries it either way.
+        const calls: Array<OllamaToolCall & { id: string }> = (mayCall ? getToolCalls() : []).map(
+          (call, index) => ({ ...call, id: call.id ?? `call_${rounds}_${index}` })
+        );
 
         // Some cloud models (e.g. kimi-k2.6:cloud) stream with empty content
         // but return full text in non-streaming mode. Fall back when streaming
@@ -883,7 +922,12 @@ async function handleStream(
         // learning nothing.
         if (calls.length === 0 && (streamEmpty || !finalText.trim())) {
           console.log("[VoiceAgent] Streaming yielded no text; falling back to non-streaming generateChatResponse");
-          finalText = await deps.generateChatResponse({ messages: prompt, temperature: 0.7, repeat_penalty: 1.2 });
+          finalText = await deps.generateChatResponse({
+            messages: prompt,
+            temperature: 0.7,
+            repeat_penalty: 1.2,
+            ...(llm ? { llm } : {}),
+          });
         }
 
         if (calls.length === 0) break;
@@ -960,6 +1004,7 @@ async function handleStream(
             role: "tool" as const,
             content: outcomes[index]!.ok ? outcomes[index]!.text : outcomes[index]!.message,
             tool_name: call.function.name,
+            tool_call_id: call.id,
           })),
         ];
         rounds++;

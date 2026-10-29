@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { developmentConfig } from "./development";
 import { productionConfig } from "./production";
+import { parsePositiveInt } from "./env";
 
 /**
  * These assertions are about each environment's *defaults* — the value the
@@ -93,6 +94,21 @@ describe("the bounds work under load is held to", () => {
   it("attempts a refused request more often in production than in development", () => {
     assert.equal(developmentConfig.ollama.retries, 1, envNote("OLLAMA_RETRIES"));
     assert.equal(productionConfig.ollama.retries, 2, envNote("OLLAMA_RETRIES"));
+  });
+
+  it("gives a provider-directed wait one minute, and reads an override", () => {
+    for (const [name, config] of ENVIRONMENTS) {
+      assert.equal(
+        config.ollama.retryAfterMaxMs,
+        60_000,
+        `${name}: ${envNote("OLLAMA_RETRY_AFTER_MAX_MS")}`
+      );
+    }
+    assert.equal(
+      parsePositiveInt("1234", 60_000),
+      1234,
+      "an explicit OLLAMA_RETRY_AFTER_MAX_MS overrides the default"
+    );
   });
 
   it("bounds one turn's syntheses so a long reply cannot take the gateway", () => {

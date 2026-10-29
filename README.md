@@ -90,8 +90,9 @@ curl http://localhost:4000/health
 | `OLLAMA_BASE_URL` | Yes | Ollama API URL |
 | `OLLAMA_MODEL` | No | Chat model (default: `llama3.1`) |
 | `OLLAMA_EMBED_MODEL` | No | Embedding model (default: `mxbai-embed-large`) |
-| `OLLAMA_RETRIES` | No | Further attempts after a refusal (`429`/`503`) made before any content streamed. Default: `1` development, `2` production. A refusal past this is reported to the turn |
-| `OLLAMA_RETRY_DEADLINE_MS` | No | The whole retry budget, attempts included (default: `20000` development, `30000` production). A turn that waited longer than this is worse than one that is told it could not be answered |
+| `OLLAMA_RETRIES` | No | Further attempts after a refusal (`429`/`503`, or `413` carrying `Retry-After`) made before any content streamed. Default: `1` development, `2` production. A refusal past this is reported to the turn |
+| `OLLAMA_RETRY_DEADLINE_MS` | No | The retry budget for this service's own backoff, attempts included (default: `20000` development, `30000` production). A turn that waited longer than this is worse than one that is told it could not be answered |
+| `OLLAMA_RETRY_AFTER_MAX_MS` | No | The longest a provider's `Retry-After` is honoured (default: `60000`). A `413` without it is a permanent refusal; a wait longer than this is reported rather than waited on |
 | `OLLAMA_MAX_CONCURRENT_REQUESTS` | No | Model requests this process may have in flight (default: `12`). Kept below the account's measured ceiling of ~15, so a turn queues here — where it can be ordered — instead of being refused upstream. See [CAPACITY.md](docs/CAPACITY.md) |
 | `API_AUTH_TOKEN` | No | Enables Bearer token auth when set |
 | `MCP_ENABLED` | No | Enables `/api/mcp` when set to `true` |
@@ -222,6 +223,40 @@ Only 8080 (the STT proxy) and 8082 (the gateway) are published; every engine por
 internal to the compose network. Models live outside the images under
 `AUDIO_MODELS_DIR` — see [docs/AUDIO_TIER.md](docs/AUDIO_TIER.md) for provisioning,
 private binding, and scaling.
+
+## Model Providers
+
+A turn is answered by one of two paths:
+
+- **This deployment's Ollama** — the default. `OLLAMA_BASE_URL` and
+  `OLLAMA_MODEL` decide where the model is and which one answers; an empty or
+  absent choice is this path, and the request it makes is unchanged since before
+  any account could bring a model.
+- **The account's own OpenAI-compatible endpoint** — chosen per turn by four
+  fields on the voice-agent request: `llmBaseUrl`, `llmModel`, `llmApiKey` and an
+  optional `llmTemperature`. The bridge sends them from the agent's LLM profile;
+  a browser turn sends none.
+
+Both paths stream, both accept the same tool list (the function shape OpenAI
+uses), and both report a provider failure as the turn's failure. A provider that
+refuses is never replaced by this deployment's model: substituting it would spend
+this deployment's money to hide the account's problem.
+
+A refusal before any content has streamed is retried: `429` and `503`, and a
+`413` that carries `Retry-After`. The provider's own wait is honoured up to
+`OLLAMA_RETRY_AFTER_MAX_MS`, and the concurrency slot is released while waiting.
+A `413` without that header names a request over the provider's ceiling and is
+not retried.
+
+When a turn calls a tool and the result goes back to the model, each path uses its
+own dialect. The OpenAI-compatible path sends `tool_calls[].function.arguments` as
+a JSON string, gives every call an `id` and `type: "function"`, and marks each
+`tool` message with the `tool_call_id` it answers; a provider that supplies no id
+gets `call_<round>_<index>`. The native `/api/chat` path keeps object arguments
+and names the result by `tool_name`.
+
+The key travels in the request body, is used only to build the `Authorization`
+header, and is never logged.
 
 ## License
 

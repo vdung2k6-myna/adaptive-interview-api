@@ -15,10 +15,12 @@ import os
 import traceback
 import wave
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from pydub import AudioSegment
 
 # ── Configuration ──────────────────────────────────────────────────────
 
@@ -92,7 +94,7 @@ app.add_middleware(
 )
 
 # ── Model loading ──────────────────────────────────────────────────────
-_voices: dict[str, object] = {}
+_voices: dict[str, Any] = {}
 _voice_configs: dict[str, dict] = {}
 _DEFAULT_VOICE: str = ""
 
@@ -114,6 +116,22 @@ def _discover_voices() -> dict[str, Path]:
     return voices
 
 
+def _import_piper_voice() -> Any:
+    """Import PiperVoice from the optional piper-tts package with a safe fallback."""
+    try:
+        from piper.voice import PiperVoice  # pyright: ignore[reportMissingImports]
+        return PiperVoice
+    except ImportError:
+        try:
+            from piper import PiperVoice  # pyright: ignore[reportMissingImports]
+            return PiperVoice
+        except ImportError as exc:  # pragma: no cover - handled at runtime
+            raise ImportError(
+                "piper-tts package not installed or the module layout changed. "
+                "Install it with: pip install piper-tts"
+            ) from exc
+
+
 def _load_voices() -> None:
     """Load all discovered Piper voice models."""
     global _voices, _voice_configs, _DEFAULT_VOICE
@@ -124,7 +142,7 @@ def _load_voices() -> None:
         return
 
     try:
-        from piper.voice import PiperVoice
+        PiperVoice = _import_piper_voice()
     except ImportError:
         print("[Piper] ERROR: piper-tts package not installed. Run: pip install piper-tts")
         return
@@ -174,6 +192,20 @@ def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
         wav_file.writeframes(pcm_bytes)
     return buf.getvalue()
 
+def _pcm_to_mp3(pcm_bytes: bytes, sample_rate: int) -> bytes:
+    """Convert raw PCM bytes into an MP3 container."""
+    # Load raw PCM data (16-bit, mono)
+    audio = AudioSegment.from_raw(
+        io.BytesIO(pcm_bytes),
+        sample_width=2,      # 2 bytes = 16-bit
+        frame_rate=sample_rate,
+        channels=1           # Mono
+    )
+    
+    # Export to MP3 bytes
+    buf = io.BytesIO()
+    audio.export(buf, format="mp3", bitrate="64k")  # 64k is plenty for 16khz mono voice
+    return buf.getvalue()
 
 def _get_sample_rate(voice_id: str) -> int:
     """Get sample rate from voice config, default to 22050."""
@@ -239,6 +271,62 @@ async def synthesize(req: SynthesizeRequest) -> Response:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Synthesis failed: {exc}")
 
+@app.post("/v1/audio/speech1")
+async def synthesize_mp3(req: SynthesizeRequest) -> Response:
+    """Synthesize text to speech using Piper."""
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+
+    voice_id = req.voice or _DEFAULT_VOICE
+    if not voice_id:
+        raise HTTPException(status_code=500, detail="No voices loaded")
+
+    voice = _voices.get(voice_id)
+    if not voice:
+        available = sorted(_voices.keys())
+        raise HTTPException(
+            status_code=400,
+            detail=f"Voice '{voice_id}' not found. Available: {available}"
+        )
+
+    try:
+        sample_rate = _get_sample_rate(voice_id)
+
+        synthesize_args: dict = {"text": req.text}
+        if req.speaker_id is not None:
+            synthesize_args["speaker_id"] = req.speaker_id
+
+        synthesizer = voice.synthesize(**synthesize_args)
+        pcm_chunks: list[bytes] = []
+        chunk_count = 0
+
+        for item in synthesizer:
+            chunk_count += 1
+            # PiperVoice.synthesize() yields AudioChunk objects
+            if hasattr(item, "audio_int16_bytes"):
+                # Preferred: direct PCM bytes from AudioChunk
+                pcm_chunks.append(item.audio_int16_bytes)
+                if hasattr(item, "sample_rate") and item.sample_rate:
+                    sample_rate = item.sample_rate
+            elif isinstance(item, tuple) and len(item) >= 1:
+                audio = item[0]
+                if isinstance(audio, bytes):
+                    pcm_chunks.append(audio)
+                elif hasattr(audio, "audio_int16_bytes"):
+                    pcm_chunks.append(audio.audio_int16_bytes)
+            elif isinstance(item, bytes):
+                pcm_chunks.append(item)
+
+        if not pcm_chunks:
+            raise RuntimeError("Piper produced no audio data")
+
+        combined_pcm = b"".join(pcm_chunks)
+        mp3_bytes = _pcm_to_mp3(combined_pcm, sample_rate)
+        return Response(content=mp3_bytes, media_type="audio/mpeg")
+
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Synthesis failed: {exc}")
 
 @app.get("/health")
 async def health() -> dict:

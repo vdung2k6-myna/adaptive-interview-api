@@ -14,6 +14,7 @@ export const productionConfig: AppConfig = {
     embedTimeoutMs: 30_000, // 30s
     retries: parsePositiveInt(process.env.OLLAMA_RETRIES, 2),
     retryDeadlineMs: parsePositiveInt(process.env.OLLAMA_RETRY_DEADLINE_MS, 30_000),
+    retryAfterMaxMs: parsePositiveInt(process.env.OLLAMA_RETRY_AFTER_MAX_MS, 60_000),
     // Twelve, below the fifteen the cloud account was measured to accept
     // (`docs/CAPACITY.md`). Staying under it is the point: a turn queues here,
     // where it can be ordered, instead of being refused upstream.
@@ -85,7 +86,7 @@ export const productionConfig: AppConfig = {
     },
   },
   docEtl: {
-    apiUrl: process.env.DOC_ETL_API_URL || "http://localhost:8000",
+    apiUrl: process.env.DOC_ETL_API_URL || "http://localhost:8005",
     // See development.ts — keep this tight; it is paid on every turn while the
     // service is unreachable.
     searchTimeoutMs: parsePositiveInt(process.env.DOC_ETL_SEARCH_TIMEOUT_MS, 1_500),

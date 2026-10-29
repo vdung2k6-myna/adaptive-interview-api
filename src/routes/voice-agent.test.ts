@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { Server } from "node:http";
 import express from "express";
 import { createVoiceAgentRouter, type VoiceAgentDeps } from "./voice-agent";
-import type { OllamaTool, OllamaToolCall } from "../lib/ollama";
+import type { OllamaMessage, OllamaTool, OllamaToolCall } from "../lib/ollama";
 import { DEFAULT_PREFETCH_TOP_K } from "../lib/prefetch";
 import type { KnowledgeChunk, KnowledgeSearchOutcome, SearchOptions } from "../lib/knowledge";
 import { SentenceExtractor } from "../lib/audio/sentence-extractor";
@@ -30,6 +30,8 @@ interface Harness {
   searches: SearchCall[];
   /** Every message array the route gave the LLM, flattened to text. */
   prompts: string[];
+  /** The same message arrays unflattened, so a call id and a tool_call_id can be read. */
+  messageRounds: OllamaMessage[][];
   /** What each model call was told it might call, in order. `undefined` is a turn that
    *  carried no catalogue — which is every turn a browser client takes. */
   toolSets: Array<OllamaTool[] | undefined>;
@@ -109,6 +111,7 @@ function harness(
 ): Harness {
   const searches: SearchCall[] = [];
   const prompts: string[] = [];
+  const messageRounds: OllamaMessage[][] = [];
   const toolSets: Array<OllamaTool[] | undefined> = [];
   const nonStreaming: string[] = [];
   const logs: string[] = [];
@@ -123,6 +126,7 @@ function harness(
   return {
     searches,
     prompts,
+    messageRounds,
     toolSets,
     nonStreaming,
     logs,
@@ -147,6 +151,7 @@ function harness(
       },
       generateChatResponseStream: (options) => {
         prompts.push(options.messages.map((m) => m.content).join("\n---\n"));
+        messageRounds.push(options.messages);
         toolSets.push(options.tools);
         const round = modelRounds++;
         const roundTokens = settings.streamRounds?.[round] ?? tokens;
@@ -514,6 +519,53 @@ describe("POST /api/voice-agent/stream — the gadget's own tools", () => {
       // makes its reply about the change rather than about the question.
       assert.match(h.prompts[1] ?? "", /volume 60/, "the result reached the model");
       assert.deepEqual(h.toolSets[1], h.toolSets[0], "and it is still asked with the gadget's tools");
+    });
+  });
+
+  it("pairs each replayed call with its result by id", async () => {
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [[], ["Xong rồi."]],
+      toolCallRounds: [[
+        {
+          id: "call_provider",
+          function: { name: "self.audio_speaker.set_volume", arguments: { volume: 60 } },
+        },
+        { function: { name: "self.audio_speaker.set_volume", arguments: { volume: 40 } } },
+      ]],
+    });
+
+    await withServer(h.deps, async (api) => {
+      await readTurn(api.stream, h, { text: "đặt âm lượng", tools: REPORT }, async (event, data) => {
+        if (event !== "tool_call") return;
+        const answer = await sendToolResult(api.toolResult, h, {
+          turnId: data.turnId,
+          index: data.index,
+          ok: true,
+          text: `volume ${data.index}`,
+        });
+        assert.equal(answer.status, 200, "both calls are answered");
+      });
+
+      const second = h.messageRounds[1] ?? [];
+      const assistant = second.find(
+        (message) => message.role === "assistant" && message.tool_calls !== undefined
+      );
+      assert.deepEqual(
+        assistant?.tool_calls?.map((call) => call.id),
+        ["call_provider", "call_0_1"],
+        "the provider's id is kept, and a call without one is named by round and position"
+      );
+      const results = second.filter((message) => message.role === "tool");
+      assert.deepEqual(
+        results.map((message) => message.tool_call_id),
+        ["call_provider", "call_0_1"],
+        "each result names the call it answers"
+      );
+      assert.deepEqual(
+        results.map((message) => message.tool_name),
+        ["self.audio_speaker.set_volume", "self.audio_speaker.set_volume"],
+        "and the native dialect still has the tool name"
+      );
     });
   });
 

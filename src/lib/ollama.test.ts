@@ -29,11 +29,18 @@ describe("generateChatResponseStream token counts", () => {
   let ndjson: string;
   /** Everything logged during one test. */
   let logs: string[];
+  /** The body of the last request the stub received. */
+  let lastBody = "";
 
   before(async () => {
-    server = createServer((_req: IncomingMessage, res: ServerResponse) => {
-      res.writeHead(200, { "Content-Type": "application/x-ndjson" });
-      res.end(ndjson);
+    server = createServer((req: IncomingMessage, res: ServerResponse) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        lastBody = Buffer.concat(chunks).toString("utf8");
+        res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+        res.end(ndjson);
+      });
     });
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
@@ -154,6 +161,53 @@ describe("generateChatResponseStream token counts", () => {
     assert.equal(logs.length, 1, `expected the counts, got ${JSON.stringify(logs)}`);
     assert.match(logs[0], /prompt_eval_count=12/);
     assert.match(logs[0], /eval_count=3/);
+  });
+
+  it("replays a tool call in the native dialect", async () => {
+    // The internal shape carries an OpenAI call id and a tool_call_id; /api/chat must
+    // still see Ollama's own dialect — object arguments and a tool name.
+    ndjson = [JSON.stringify({ message: { content: "ok" }, done: true }), ""].join("\n");
+    lastBody = "";
+
+    const result = generateChatResponseStream({
+      model: "stub-model",
+      messages: [
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            {
+              id: "call_abc",
+              function: { name: "bridge.play_music", arguments: { q: "bolero" } },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          content: "playing",
+          tool_name: "bridge.play_music",
+          tool_call_id: "call_abc",
+        },
+      ],
+    });
+
+    const reader = result.stream.getReader();
+    while (true) {
+      const read = await reader.read();
+      if (read.done) break;
+    }
+
+    const body = JSON.parse(lastBody) as { messages: unknown };
+    assert.deepEqual(body.messages, [
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          { function: { name: "bridge.play_music", arguments: { q: "bolero" } } },
+        ],
+      },
+      { role: "tool", content: "playing", tool_name: "bridge.play_music" },
+    ]);
   });
 });
 
