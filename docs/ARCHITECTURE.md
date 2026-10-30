@@ -354,19 +354,19 @@ Runtime configuration is loaded from `.env` via `dotenv`. Key variables:
 | `MCP_AUTH_TOKEN` | MCP endpoint token |
 | `MCP_ENABLED` | Enables/disables MCP route |
 | `AUDIO_STORAGE_DIR` | Audio file storage path |
-| `AUDIOCPP_BASE_URL` | STT server URL |
-| `AUDIO_GATEWAY_URL` | TTS gateway URL |
-| `DEFAULT_TTS_ENGINE` | `kokoro`, `piper`, or `supertonic` (default `supertonic`) |
-| `DEFAULT_VOICE` | Default voice ID (default `F1`) |
+| `AUDIOCPP_BASE_URL` | STT server URL; unset means the deployment runs no transcriber |
+| `AUDIO_GATEWAY_URL` | TTS gateway URL; unset means the deployment runs no synthesizer, and no localhost address is assumed |
+| `DEFAULT_TTS_ENGINE` | `kokoro`, `piper`, or `supertonic`; unset means no engine, so only a turn that names one is synthesized |
+| `DEFAULT_VOICE` | Default voice ID (default `bryce`) |
 | `KOKORO_VOICE_ENGLISH` | English voice ID for Kokoro (default `af_heart`) |
 | `PIPER_VOICE_ENGLISH` | English voice ID for Piper (default `en_US-lessac-medium`) |
 | `SUPERTONIC_VOICE_ENGLISH` | English voice ID for Supertonic (empty = service default) |
 | `KOKORO_VOICE_VIETNAMESE` | Override Vietnamese voice ID for Kokoro (empty = service default) |
 | `PIPER_VOICE_VIETNAMESE` | Override Vietnamese voice ID for Piper (empty = service default) |
 | `SUPERTONIC_VOICE_VIETNAMESE` | Override Vietnamese voice ID for Supertonic (empty = service default) |
-| `KOKORO_VOLUME` | Per-engine linear volume for Kokoro, applied to the PCM the gateway returns (default `0.5`) |
-| `PIPER_VOLUME` | Per-engine linear volume for Piper (default `0.7`) |
-| `SUPERTONIC_VOLUME` | Per-engine linear volume for Supertonic (default `1.2`) |
+| `KOKORO_VOLUME` | Per-engine linear volume for Kokoro, read by the audio gateway (default `0.5`) |
+| `PIPER_VOLUME` | Per-engine linear volume for Piper, read by the audio gateway (default `0.7`) |
+| `SUPERTONIC_VOLUME` | Per-engine linear volume for Supertonic, read by the audio gateway (default `1.2`) |
 | `MATERIAL_COLLECTIONS` | Knowledge collections the material-reply search is scoped to |
 | `FRONTEND_URL` | CORS origin |
 | `PORT` | Server port (default 4000) |

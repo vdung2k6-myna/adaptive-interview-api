@@ -3,7 +3,7 @@
  * Provides a simple interface for transcribing audio files.
  */
 
-import { audioClient, type TranscriptionResult } from "./client";
+import { audioClient, type ProviderTarget, type TranscriptionResult } from "./client";
 
 /**
  * Transcribe an audio file to text.
@@ -13,12 +13,15 @@ import { audioClient, type TranscriptionResult } from "./client";
  * language genuinely is not known: the service then detects one, and on the audio
  * this product takes its detection misfires on Vietnamese (see
  * `resolveSttLanguage`).
+ * @param target The profile's endpoint and key, when the turn names one. Absent
+ * means the deployment's own audio.cpp service.
  * @returns Transcription text and optional confidence score.
  */
 export async function transcribeAudio(
   audioPath: string,
   model?: string,
-  language?: string
+  language?: string,
+  target?: ProviderTarget
 ): Promise<TranscriptionResult> {
-  return audioClient.transcribe(audioPath, model, language);
+  return audioClient.transcribe(audioPath, model, language, target);
 }

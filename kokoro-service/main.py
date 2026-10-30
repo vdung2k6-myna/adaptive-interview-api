@@ -12,6 +12,7 @@ Endpoints:
 
 import io
 import os
+import threading
 import traceback
 from pathlib import Path
 
@@ -45,6 +46,37 @@ app.add_middleware(
 _tts = None
 _AVAILABLE_VOICES: list[str] = []
 _DEFAULT_VOICE: str = ""
+
+# One model, one style pack per voice. A voicepack is the speaker's style tensor;
+# swapping it is what changes the voice, and loading it once per voice keeps the
+# model (the expensive part) shared.
+_VOICEPACKS: dict[str, object] = {}
+_VOICE_LOCK = threading.Lock()
+
+
+def _voicepack_for(voice: str):
+    """The style pack for a voice: the default's loaded pack, a local file, or the repo."""
+    if voice == _DEFAULT_VOICE:
+        return _tts.voicepack
+    if voice in _VOICEPACKS:
+        return _VOICEPACKS[voice]
+
+    from kokoro_vietnamese.core import DEFAULT_HF_REPO_ID, resolve_voicepack_filename
+    import torch
+
+    filename = resolve_voicepack_filename(voice, None)  # e.g. voicepacks/tuan_ngoc.pt
+    local = MODELS_DIR / filename
+    if local.exists():
+        path = local
+    else:
+        from huggingface_hub import hf_hub_download
+
+        path = Path(hf_hub_download(repo_id=DEFAULT_HF_REPO_ID, filename=filename))
+
+    pack = torch.load(path, map_location="cpu", weights_only=True)
+    _VOICEPACKS[voice] = pack
+    print(f"  Voicepack for {voice}: {path}")
+    return pack
 
 
 def _load_model() -> None:
@@ -122,13 +154,23 @@ async def synthesize(req: SpeechRequest) -> Response:
             detail=f"Voice '{voice}' not found. Available: {_AVAILABLE_VOICES}",
         )
 
+    # Backticks crash the phonemizer on Windows; replace with single quotes.
+    safe_text = text.replace("`", "'")
     try:
-        # Backticks crash the phonemizer on Windows; replace with single quotes
-        safe_text = text.replace("`", "'")
-        audio, _phonemes = tts.synthesize(safe_text)
+        # The model is shared, so the style pack is swapped under a lock: two
+        # voices asked for at once must not synthesize each other's speaker.
+        with _VOICE_LOCK:
+            tts.voicepack = _voicepack_for(voice)
+            audio, _phonemes = tts.synthesize(safe_text)
     except Exception as exc:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"TTS synthesis failed: {exc}") from exc
+        # A voice whose pack cannot be obtained is refused. The alternative — the
+        # default speaker — is the bug this path exists to remove: the caller asks
+        # for one voice and hears another with nothing in the response to say so.
+        raise HTTPException(
+            status_code=503,
+            detail=f"Voice '{voice}' could not be used: {exc}",
+        ) from exc
 
     # Write WAV to memory buffer
     buffer = io.BytesIO()

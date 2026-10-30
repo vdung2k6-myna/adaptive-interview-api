@@ -46,22 +46,19 @@ export function resolveVoice(
 }
 
 /**
- * Resolve the TTS engine to use for a given interview language.
+ * The engine a turn speaks through on the legacy path, or undefined when the
+ * deployment names none.
  *
- * Engine ↔ Language mapping is forced at runtime because the deployed voice
- * models are language-specific:
- * - English interviews must use Piper (only English voices are installed there).
+ * An engine the caller asked for is honored. An absent request reads the
+ * deployment's configured default and nothing else: the language mapping that
+ * used to supply Piper or Kokoro here baked one deployment's stack into the
+ * runtime, and a deployment that names no engine has none to offer.
  */
 export function resolveEngineForLanguage(
   requestedEngine: "kokoro" | "piper" | "supertonic" | undefined,
-  language: InterviewLanguage
-): "kokoro" | "piper" | "supertonic" {
-  if (language === "english") {
-    // When a specific engine was requested (including supertonic), honor it.
-    // Otherwise fall back to piper for English since kokoro only has Vietnamese voices.
-    return requestedEngine ?? "piper";
-  }
-  return requestedEngine ?? "kokoro";
+  _language: InterviewLanguage
+): "kokoro" | "piper" | "supertonic" | undefined {
+  return requestedEngine ?? config.audio.defaultEngine;
 }
 
 /**
@@ -777,8 +774,11 @@ export async function synthesizeSpeechWithFallback(
     );
   }
 
-  const engine = ttsOptions.engine ?? "kokoro";
-  const normalizedText = normalizeTextForEngine(text, engine);
+  // A turn naming a provider profile has no engine this service knows: the
+  // model is the provider's, and what characters it can speak is not something
+  // to guess at. The text is then passed as written, and the provider decides.
+  const normalizedText =
+    ttsOptions.engine === undefined ? text : normalizeTextForEngine(text, ttsOptions.engine);
 
   // Skip pure punctuation / whitespace chunks silently.
   if (!hasSynthesizableContent(normalizedText)) {

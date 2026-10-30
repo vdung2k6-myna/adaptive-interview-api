@@ -1,4 +1,4 @@
-import { after, before, describe, it, mock } from "node:test";
+import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { once } from "node:events";
@@ -7,7 +7,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { AudioCppClient, AudioGatewayClient } from "./client";
-import { parseWav } from "./wav-utils";
 import config from "@/lib/config";
 
 /**
@@ -34,7 +33,7 @@ describe("AudioCppClient.transcribe", () => {
   let respond: (res: ServerResponse) => void = () => {};
   /** Every request the stub saw: the audio client's side of the wire, which is
    * itself part of the contract. */
-  const requests: { method: string; url: string; body: Buffer }[] = [];
+  const requests: { method: string; url: string; body: Buffer; authorization?: string }[] = [];
 
   before(async () => {
     server = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -45,6 +44,7 @@ describe("AudioCppClient.transcribe", () => {
           method: req.method ?? "",
           url: req.url ?? "",
           body: Buffer.concat(chunks),
+          authorization: req.headers.authorization,
         });
         respond(res);
       });
@@ -186,40 +186,84 @@ describe("AudioCppClient.transcribe", () => {
       "no language was known, so none may be claimed on the wire"
     );
   });
+
+  it("sends a profile's key to that profile's endpoint", async () => {
+    // A profile is an endpoint of its own, and its key authorizes only that
+    // endpoint: a local service gets no header at all.
+    const profile = createServer((req: IncomingMessage, res: ServerResponse) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        requests.push({
+          method: req.method ?? "",
+          url: req.url ?? "",
+          body: Buffer.concat(chunks),
+          authorization: req.headers.authorization,
+        });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ text: "heard" }));
+      });
+    });
+    profile.listen(0, "127.0.0.1");
+    await once(profile, "listening");
+    const { port } = profile.address() as AddressInfo;
+    try {
+      const result = await client.transcribe(audioPath, undefined, "vi", {
+        baseUrl: `http://127.0.0.1:${port}`,
+        apiKey: "sk-test",
+      });
+      assert.equal(result.text, "heard");
+    } finally {
+      profile.closeAllConnections();
+      await new Promise<void>((resolve) => profile.close(() => resolve()));
+    }
+
+    const sent = requests.at(-1);
+    assert.ok(sent);
+    assert.equal(sent.url, "/v1/audio/transcriptions");
+    assert.equal(sent.authorization, "Bearer sk-test");
+    assert.equal(requests[0].authorization, undefined, "the deployment's own service needs no key");
+  });
 });
 
 /**
- * The per-engine volume, at the one place the whole system's audio comes through.
+ * The request this client makes, as one OpenAI-shaped call.
  *
- * The gateway has no volume parameter — it forwards `text`, `voice` and `model`
- * and nothing else — so the levelling happens on the PCM it returned, here. That
- * makes this the only place a test can pin the wiring: which engine selects which
- * volume, and that a volume set above an engine's headroom is reported rather
- * than passed off as a volume that worked.
+ * A deployment turn names its engine in `model` and asks the gateway; a turn
+ * with a provider profile names that profile's endpoint, model and key. Both
+ * end at the same contract, and the answer has to be WAV because the bridge
+ * reads nothing else.
  */
 describe("AudioGatewayClient.synthesize", () => {
-  /** The volume map and default engine the config shipped with, so each test can
-   * put them back rather than leaving the next one to inherit its setup. */
-  const ORIGINAL_VOLUME = { ...config.audio.volume };
   const ORIGINAL_ENGINE = config.audio.defaultEngine;
 
   let gateway: Server;
   let client: AudioGatewayClient;
   /** What the stub gateway answers with, per test. */
   let reply: Buffer;
-  /** Every request body the stub saw, in order. */
-  const payloads: { text?: string; engine?: string; voice?: string }[] = [];
+  /** Every request the stubs saw, in order. */
+  const requests: {
+    url: string;
+    authorization?: string;
+    body: Record<string, unknown>;
+  }[] = [];
+
+  function record(req: IncomingMessage, res: ServerResponse): void {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      requests.push({
+        url: req.url ?? "",
+        authorization: req.headers.authorization,
+        body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+      });
+      res.writeHead(200, { "Content-Type": "audio/wav" });
+      res.end(reply);
+    });
+  }
 
   before(async () => {
-    gateway = createServer((req: IncomingMessage, res: ServerResponse) => {
-      const chunks: Buffer[] = [];
-      req.on("data", (chunk: Buffer) => chunks.push(chunk));
-      req.on("end", () => {
-        payloads.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-        res.writeHead(200, { "Content-Type": "audio/wav" });
-        res.end(reply);
-      });
-    });
+    gateway = createServer(record);
     gateway.listen(0, "127.0.0.1");
     await once(gateway, "listening");
 
@@ -231,17 +275,14 @@ describe("AudioGatewayClient.synthesize", () => {
   after(async () => {
     gateway.closeAllConnections();
     await new Promise<void>((resolve) => gateway.close(() => resolve()));
-    Object.assign(config.audio.volume, ORIGINAL_VOLUME);
     config.audio.defaultEngine = ORIGINAL_ENGINE;
   });
 
-  /** A 16-bit mono WAV of the given samples, as the gateway would return. */
-  function wav(samples: number[]): Buffer {
+  /** The smallest thing the client accepts as a WAV answer. */
+  function wav(): Buffer {
     const header = Buffer.alloc(44);
-    const pcm = Buffer.alloc(samples.length * 2);
-    samples.forEach((sample, i) => pcm.writeInt16LE(sample, i * 2));
     header.write("RIFF", 0);
-    header.writeUInt32LE(36 + pcm.length, 4);
+    header.writeUInt32LE(36, 4);
     header.write("WAVE", 8);
     header.write("fmt ", 12);
     header.writeUInt32LE(16, 16);
@@ -252,71 +293,98 @@ describe("AudioGatewayClient.synthesize", () => {
     header.writeUInt16LE(2, 32);
     header.writeUInt16LE(16, 34);
     header.write("data", 36);
-    header.writeUInt32LE(pcm.length, 40);
-    return Buffer.concat([header, pcm]);
+    header.writeUInt32LE(0, 40);
+    return header;
   }
 
-  function samplesOf(buffer: Buffer, count: number): number[] {
-    const { pcmOffset } = parseWav(buffer);
-    return Array.from({ length: count }, (_, i) => buffer.readInt16LE(pcmOffset + i * 2));
-  }
+  it("asks the deployment gateway for its engine as the model", async () => {
+    reply = wav();
 
-  it("levels the reply by the volume of the engine it asked for", async () => {
-    reply = wav([1000, -2000, 3000]);
-    config.audio.volume.kokoro = 0.5;
+    await client.synthesize("xin chào", { engine: "kokoro", voice: "example_voice" });
 
-    const buffer = await client.synthesize("xin chào", { engine: "kokoro", voice: "diem_trinh" });
-
-    assert.equal(payloads.at(-1)?.engine, "kokoro");
-    assert.deepEqual(samplesOf(buffer, 3), [500, -1000, 1500]);
+    const sent = requests.at(-1);
+    assert.ok(sent);
+    assert.equal(sent.url, "/v1/audio/speech");
+    assert.deepEqual(sent.body, {
+      model: "kokoro",
+      input: "xin chào",
+      voice: "example_voice",
+      response_format: "wav",
+    });
+    assert.equal(sent.authorization, undefined, "the deployment's own gateway needs no key");
   });
 
-  it("levels by the default engine's volume when the caller names no engine", async () => {
-    // The volume and the request have to be read from the same resolved engine,
-    // or audio is asked for from one engine and levelled as if it were another.
-    reply = wav([1000, -2000]);
-    config.audio.defaultEngine = "piper";
-    config.audio.volume.piper = 0.7;
-
-    const buffer = await client.synthesize("xin chào", { voice: "vi_VN-vais1000-medium" });
-
-    assert.equal(payloads.at(-1)?.engine, "piper");
-    assert.deepEqual(samplesOf(buffer, 2), [700, -1400]);
-  });
-
-  it("clamps what a volume set too high cannot fit, and reports it", async () => {
-    // Kokoro and piper arrive at full scale, so a volume above 1 clips them. A
-    // clamped sample is distortion, and distortion nobody is told about is the
-    // failure this feature is meant to remove.
-    reply = wav([30000, -30000, 1000]);
-    config.audio.volume.piper = 2;
-    const warn = mock.method(console, "warn", () => {});
+  it("calls a profile's endpoint with its model and key", async () => {
+    reply = wav();
+    const profile = createServer(record);
+    profile.listen(0, "127.0.0.1");
+    await once(profile, "listening");
+    const { port } = profile.address() as AddressInfo;
     try {
-      const buffer = await client.synthesize("xin chào", {
-        engine: "piper",
-        voice: "vi_VN-vais1000-medium",
+      await client.synthesize("xin chào", {
+        baseUrl: `http://127.0.0.1:${port}`,
+        apiKey: "sk-test",
+        model: "tts-1",
+        voice: "alloy",
       });
-
-      assert.deepEqual(samplesOf(buffer, 3), [32767, -32768, 2000]);
-      assert.equal(warn.mock.calls.length, 1, "the clipping must be reported exactly once");
-      assert.match(String(warn.mock.calls[0]?.arguments[0]), /clipped 2\/3 samples/);
-      assert.match(String(warn.mock.calls[0]?.arguments[0]), /PIPER_VOLUME/);
     } finally {
-      mock.restoreAll();
+      profile.closeAllConnections();
+      await new Promise<void>((resolve) => profile.close(() => resolve()));
+    }
+
+    const sent = requests.at(-1);
+    assert.ok(sent);
+    assert.equal(sent.url, "/v1/audio/speech");
+    assert.deepEqual(sent.body, {
+      model: "tts-1",
+      input: "xin chào",
+      voice: "alloy",
+      response_format: "wav",
+    });
+    assert.equal(sent.authorization, "Bearer sk-test");
+  });
+
+  it("refuses an answer that is not WAV", async () => {
+    reply = Buffer.from('{"error":"no audio"}');
+
+    await assert.rejects(
+      () => client.synthesize("xin chào", { engine: "kokoro", voice: "example_voice" }),
+      /not WAV/
+    );
+  });
+
+  it("names a deployment with no synthesis service instead of fetching a relative path", async () => {
+    const previous = config.audio.gatewayUrl;
+    const previousEngine = config.audio.defaultEngine;
+    config.audio.gatewayUrl = "";
+    config.audio.defaultEngine = undefined;
+    try {
+      const bare = new AudioGatewayClient();
+      await assert.rejects(
+        () => bare.synthesize("xin chào", { engine: "kokoro", voice: "example_voice" }),
+        /no synthesis service is configured/
+      );
+    } finally {
+      config.audio.gatewayUrl = previous;
+      config.audio.defaultEngine = previousEngine;
     }
   });
 
-  it("says nothing when nothing clipped", async () => {
-    reply = wav([1000, -2000]);
-    config.audio.volume.kokoro = 1.2;
-    const warn = mock.method(console, "warn", () => {});
+  it("names a deployment with no transcription service instead of fetching a relative path", async () => {
+    const previous = config.audio.sttUrl;
+    config.audio.sttUrl = "";
+    const dir = await mkdtemp(join(tmpdir(), "stt-bare-"));
+    const path = join(dir, "turn.wav");
+    await writeFile(path, Buffer.from([0x52, 0x49, 0x46, 0x46]));
     try {
-      const buffer = await client.synthesize("xin chào", { engine: "kokoro", voice: "diem_trinh" });
-
-      assert.deepEqual(samplesOf(buffer, 2), [1200, -2400]);
-      assert.equal(warn.mock.calls.length, 0, "a volume with headroom is not a problem to report");
+      const bare = new AudioCppClient();
+      await assert.rejects(
+        () => bare.transcribe(path),
+        /no transcription service is configured/
+      );
     } finally {
-      mock.restoreAll();
+      config.audio.sttUrl = previous;
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

@@ -61,7 +61,8 @@ PIPER_VOICE_ENGLISH=en_US-lessac-medium
 # PIPER_VOICE_VIETNAMESE=
 
 # Per-engine volume: 1 is unchanged. The engines are not equally loud, so these
-# are how they are matched; measure with `node scripts/measure-engine-levels.mjs`.
+# are how they are matched. The audio gateway reads them; this server does not.
+# Measure with `node scripts/measure-engine-levels.mjs`.
 KOKORO_VOLUME=0.5
 PIPER_VOLUME=0.7
 SUPERTONIC_VOLUME=1.2

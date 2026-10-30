@@ -1,3 +1,5 @@
+import type { ProviderKind, ProviderProfile } from "@/lib/providers";
+
 export interface AppConfig {
   env: "development" | "production" | "test";
   database: {
@@ -59,10 +61,16 @@ export interface AppConfig {
     apiToken: string; // API_AUTH_TOKEN — if empty, auth is disabled
   };
   audio: {
-    sttUrl: string;        // audio.cpp server (STT)
-    gatewayUrl: string;      // Audio Gateway (TTS)
+    /** Empty when the deployment names no transcription service. */
+    sttUrl: string;
+    /** Empty when the deployment names no synthesis gateway. */
+    gatewayUrl: string;
     sttModel: string;
-    defaultEngine: "kokoro" | "piper" | "supertonic"; // default TTS engine
+    /**
+     * The engine the legacy path speaks through, or undefined when the deployment
+     * names none. No turn reaches a localhost address on its behalf.
+     */
+    defaultEngine?: "kokoro" | "piper" | "supertonic";
     defaultVoice: string;   // voice ID, e.g. "F1" (supertonic) or "af_heart" (kokoro)
     timeoutMs: number;
     /**
@@ -97,21 +105,20 @@ export interface AppConfig {
         vietnamese: string;
       };
     };
-    /**
-     * A linear volume multiplier per engine, applied to the PCM the gateway
-     * returns; 1 leaves it as the engine produced it.
-     *
-     * Per engine rather than one number because the engines do not agree on
-     * loudness: measured on the same Vietnamese sentence, kokoro and piper come
-     * back at full scale (0 dBFS peak) while supertonic sits ~8 dB below it
-     * (`scripts/measure-engine-levels.mjs`). One shared level would be a
-     * compromise between them; this is the knob that makes them match.
-     */
-    volume: {
-      kokoro: number;
-      piper: number;
-      supertonic: number;
-    };
+  };
+  /**
+   * The provider profiles this deployment publishes to its browser surface, and
+   * which one answers a turn that names none of a kind.
+   *
+   * Operator configuration, not a table: the browser only chooses from what the
+   * operator wrote, so no account owns a row and no key reaches a browser. The
+   * catalog is read at boot; an entry that is malformed refuses the deployment
+   * rather than the turn that would have named it.
+   */
+  providers: {
+    catalog: ProviderProfile[];
+    /** A profile id per kind, or null for "this deployment names no default". */
+    defaults: Record<ProviderKind, string | null>;
   };
   /**
    * How long a turn's windows are held before the turn has to claim them.

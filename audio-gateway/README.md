@@ -1,20 +1,30 @@
 # Audio Gateway (Unified TTS)
 
-A lightweight HTTP gateway that exposes a single TTS endpoint and routes to **Kokoro**, **Piper**, or **Supertonic** based on the `engine` parameter.
+A lightweight HTTP gateway that exposes the OpenAI speech contract and routes to
+**Kokoro**, **Piper**, or **Supertonic**, named in `model`.
 
 ## Why This Exists
 
-Instead of the backend talking directly to multiple TTS services, it talks to **one** gateway. The gateway handles routing, health checks, and pass-through proxying. It does not choose a voice: the `voice` it is given is forwarded unchanged, and each downstream service decides what to do with a name it does not hold.
+Instead of the backend talking directly to multiple TTS services, it talks to **one**
+gateway. The gateway routes by `model`, health-checks the services, forwards the
+`voice` unchanged, and levels the engines against each other. One speech contract is
+what lets every provider — the local engines here and a hosted endpoint a profile
+names — be configured the same way.
 
 ```
 Express Backend (:4000)
-    │ POST /v1/audio/speech { text, engine, voice }
+    │ POST /v1/audio/speech { model, input, voice, response_format }
     ▼
 Audio Gateway (:8082)
-    ├─ engine=kokoro     ──▶ Kokoro Service (:8081)
-    ├─ engine=piper      ──▶ Piper Service (:8083)
-    └─ engine=supertonic ──▶ Supertonic Service (:8084)
+    ├─ model=kokoro     ──▶ Kokoro Service (:8081)
+    ├─ model=piper      ──▶ Piper Service (:8083)
+    ├─ model=supertonic ──▶ Supertonic Service (:8084)
+    └─ anything else    ──▶ 400, naming the value
 ```
+
+`text` and `engine` are the gateway's own older spellings and are still accepted, so
+a caller that has not moved yet keeps working. `model` and `input` win when both are
+present.
 
 ## Setup
 
@@ -44,26 +54,32 @@ uvicorn main:app --host 127.0.0.1 --port 8082
 **Request:**
 ```json
 {
-  "text": "Xin chào, bạn khỏe không?",
-  "engine": "piper",
-  "voice": "vi_VN-vais1000-medium"
+  "model": "piper",
+  "input": "Xin chào, bạn khỏe không?",
+  "voice": "vi_VN-vais1000-medium",
+  "response_format": "wav"
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `text` | string | Yes | Text to synthesize |
-| `engine` | `"kokoro"` \| `"piper"` \| `"supertonic"` | No | Default: `"kokoro"` |
+| `input` | string | Yes¹ | Text to synthesize (OpenAI's field) |
+| `text` | string | Yes¹ | Legacy alias for `input` |
+| `model` | `"kokoro"` \| `"piper"` \| `"supertonic"` | Yes² | The engine to route to |
+| `engine` | same as `model` | Yes² | Legacy alias for `model` |
 | `voice` | string | Yes | Voice ID, forwarded to the downstream service unchanged |
-| `model` | string | No | Model override, forwarded to Kokoro and Supertonic. Piper ignores it |
+| `response_format` | `"wav"` | No | Default: `"wav"`. Any other value is refused |
 
-**Response:** `audio/wav` — WAV file bytes.
+¹ One of `input` or `text` is required.
+² One of `model` or `engine` is required; neither present defaults to `kokoro`.
+
+**Response:** `audio/wav` — WAV file bytes, levelled by that engine's volume.
 
 **Errors:**
-- `400` — `text` missing or whitespace-only
-- `422` — Body failed validation: `voice` absent, or `engine` outside the enum. The `Literal` rejects an unknown engine during parsing, so this is what an unknown engine returns — the `400 "Unknown engine"` branch in the handler is unreachable from JSON
-- `502` — Downstream refused the request (status ≥ 400) or could not be reached
-- `504` — Downstream timed out (60s)
+- `400` — no text, an unknown `model`/`engine`, or a `response_format` other than `wav`
+- `422` — body failed validation, most often a missing `voice`
+- `502` — downstream refused the request (status ≥ 400) or could not be reached
+- `504` — downstream timed out (60s)
 
 ### GET /health
 
@@ -80,7 +96,9 @@ uvicorn main:app --host 127.0.0.1 --port 8082
 
 `status` values: `"ok"` (all up), `"degraded"` (some up), `"down"` (none up).
 
-`voices` is relayed from the Supertonic service's own `/health`, so a caller can check its configured voice names against what is actually installed. The key is **absent**, not empty, when that service could not be reached.
+`voices` is relayed from the Supertonic service's own `/health`, so a caller can
+check its configured voice names against what is actually installed. The key is
+**absent**, not empty, when that service could not be reached.
 
 ## Environment Variables
 
@@ -91,3 +109,19 @@ uvicorn main:app --host 127.0.0.1 --port 8082
 | `SUPERTONIC_URL` | `http://localhost:8084` | Supertonic service base URL |
 | `PORT` | `8082` | Gateway HTTP port |
 | `HOST` | `127.0.0.1` | Gateway HTTP host |
+| `KOKORO_VOLUME` | `0.5` | Linear level for Kokoro |
+| `PIPER_VOLUME` | `0.7` | Linear level for Piper |
+| `SUPERTONIC_VOLUME` | `1.2` | Linear level for Supertonic |
+
+The levels are here because the gateway is where the engine is known and where every
+caller's audio passes. The engines do not agree on loudness — kokoro and piper arrive
+at full scale and supertonic about 8 dB below — so each is matched here rather than by
+each caller. A value above what an engine's headroom allows is clamped, and the share
+of clipped samples is logged.
+
+## Tests
+
+```bash
+cd audio-gateway
+python -m pytest tests -q
+```

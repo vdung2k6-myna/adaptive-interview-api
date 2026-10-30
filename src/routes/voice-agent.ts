@@ -24,6 +24,7 @@ import { createSessionKnowledge, type SessionKnowledge } from "@/lib/session-kno
 import { createToolCallStore, type ToolCallOutcome, type ToolCallStore } from "@/lib/tool-calls";
 import { resolveCollections } from "@/lib/topics";
 import { readLibrary, type Track } from "@/lib/music";
+import { defaultProviderFor, findProvider, type ProviderKind } from "@/lib/providers";
 import config from "@/lib/config";
 import {
   transcribeAudio,
@@ -204,6 +205,77 @@ function readLlmTarget(body: Record<string, unknown>): LlmTarget | undefined | n
   return { baseUrl, apiKey, model, temperature };
 }
 
+/** A provider a turn names, resolved from a profile id, its fields, or the default. */
+interface TurnProvider {
+  baseUrl: string;
+  model: string;
+  voice?: string;
+  apiKey?: string;
+}
+
+function fieldText(body: Record<string, unknown>, name: string): string {
+  const value = body[name];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+/**
+ * The provider a turn names for one kind.
+ *
+ * `undefined` means "this deployment's own service", which is the path every
+ * turn took before profiles existed. A profile id is resolved against the boot
+ * catalog; inline fields are the bridge's path, where the console has already
+ * resolved the profile; and naming neither falls to the kind's default profile.
+ * An id that names nothing, or the wrong kind, is a refusal rather than a quiet
+ * fall to the default — the same rule a failing provider follows.
+ */
+function readTurnProvider(
+  body: Record<string, unknown>,
+  kind: ProviderKind
+): { provider?: TurnProvider; error?: string } {
+  const id = fieldText(body, `${kind}ProfileId`);
+  if (id !== "") {
+    const profile = findProvider(config.providers.catalog, id);
+    if (profile === undefined) return { error: `${kind}ProfileId names no profile: ${id}` };
+    if (profile.kind !== kind) return { error: `${kind}ProfileId names a ${profile.kind} profile` };
+    return {
+      provider: {
+        baseUrl: profile.baseUrl,
+        model: profile.model,
+        ...(profile.voice === undefined ? {} : { voice: profile.voice }),
+        ...(profile.apiKey === undefined ? {} : { apiKey: profile.apiKey }),
+      },
+    };
+  }
+
+  const baseUrl = fieldText(body, `${kind}BaseUrl`);
+  if (baseUrl !== "") {
+    const model = fieldText(body, `${kind}Model`);
+    if (model === "") return { error: `${kind}Model is required with ${kind}BaseUrl` };
+    const voice = fieldText(body, `${kind}Voice`);
+    if (kind === "tts" && voice === "") return { error: `ttsVoice is required with ttsBaseUrl` };
+    const apiKey = fieldText(body, `${kind}ApiKey`);
+    return {
+      provider: {
+        baseUrl,
+        model,
+        ...(voice === "" ? {} : { voice }),
+        ...(apiKey === "" ? {} : { apiKey }),
+      },
+    };
+  }
+
+  const fallback = defaultProviderFor(config.providers.catalog, kind, config.providers.defaults);
+  if (fallback === undefined) return {};
+  return {
+    provider: {
+      baseUrl: fallback.baseUrl,
+      model: fallback.model,
+      ...(fallback.voice === undefined ? {} : { voice: fallback.voice }),
+      ...(fallback.apiKey === undefined ? {} : { apiKey: fallback.apiKey }),
+    },
+  };
+}
+
 function parseHistory(value: unknown): VoiceAgentMessage[] {
   if (typeof value !== "string") return [];
   try {
@@ -335,9 +407,34 @@ async function handleStream(
     const requestedEngine = validateEngine(req.body.engine);
     const engine = resolveEngineForLanguage(requestedEngine, language);
     const systemPrompt = typeof req.body.systemPrompt === "string" ? req.body.systemPrompt : "";
-    // The account's own model, when the bridge carries one. Absent for every turn
-    // this deployment answers with its own model — which is every turn today.
-    const llm = readLlmTarget(req.body as Record<string, unknown>);
+
+    // Which provider answers each half of this turn: a profile the browser chose
+    // by id, the fields the bridge resolved from the console, or this deployment's
+    // own service. A bad id refuses the turn here rather than being replaced by
+    // the default.
+    const body = req.body as Record<string, unknown>;
+    const sttProvider = readTurnProvider(body, "stt");
+    const ttsProvider = readTurnProvider(body, "tts");
+    const llmProvider = readTurnProvider(body, "llm");
+    const providerError = sttProvider.error ?? ttsProvider.error ?? llmProvider.error;
+    if (providerError !== undefined) {
+      // The SSE headers are already on the wire, so this is reported on the
+      // turn's own error channel rather than as a status the client can no
+      // longer be sent. Nothing is transcribed or spoken for a refused provider.
+      sendSseEvent(res, "error", { message: providerError });
+      res.end();
+      return;
+    }
+
+    // The account's own model, when the bridge carries one or a profile id names
+    // one. Absent for every turn this deployment answers with its own model.
+    const llmBody = { ...body };
+    if (llmProvider.provider !== undefined) {
+      llmBody.llmBaseUrl = llmProvider.provider.baseUrl;
+      llmBody.llmModel = llmProvider.provider.model;
+      llmBody.llmApiKey = llmProvider.provider.apiKey ?? "";
+    }
+    const llm = readLlmTarget(llmBody);
     if (llm === null) {
       res.status(400).json({ error: "the llm fields must name a base URL, a model and a key together" });
       return;
@@ -495,10 +592,19 @@ async function handleStream(
       // transcriber cannot work out for itself on this audio: left to detect,
       // it answers short Vietnamese in Chinese, and the persona then corrects
       // the person for words they never said. See resolveSttLanguage.
+      const stt = sttProvider.provider;
+      if (stt === undefined && config.audio.sttUrl === "") {
+        sendSseEvent(res, "error", {
+          message: "no transcription provider is configured for this turn",
+        });
+        res.end();
+        return;
+      }
       const sttResult = await deps.transcribeAudio(
         audioFile.path,
-        undefined,
-        resolveSttLanguage(language)
+        stt?.model,
+        resolveSttLanguage(language),
+        stt === undefined ? undefined : { baseUrl: stt.baseUrl, apiKey: stt.apiKey }
       );
       userText = sttResult.text;
     } else if (textInput) {
@@ -646,11 +752,30 @@ async function handleStream(
       }
     }
 
-    const ttsOptions: SynthesizeOptions = {
-      engine,
-      voice: resolveVoice(engine, language),
-      signal: abortController.signal,
-    };
+    // A profile names its own endpoint, model and voice; a turn with none keeps
+    // the deployment's engine path exactly as it was, including the voice the
+    // engine and language resolve to.
+    const tts = ttsProvider.provider;
+    let ttsOptions: SynthesizeOptions;
+    if (tts !== undefined) {
+      ttsOptions = {
+        baseUrl: tts.baseUrl,
+        model: tts.model,
+        voice: tts.voice ?? config.audio.defaultVoice,
+        ...(tts.apiKey === undefined ? {} : { apiKey: tts.apiKey }),
+        signal: abortController.signal,
+      };
+    } else if (engine !== undefined) {
+      // The legacy path: a deployment that keeps a gateway and a default engine.
+      ttsOptions = { engine, voice: resolveVoice(engine, language), signal: abortController.signal };
+    } else {
+      // Nothing names a provider and the deployment configures no engine: this is
+      // a deployment with no synthesis service, and it says so rather than trying
+      // an address nobody chose.
+      sendSseEvent(res, "error", { message: "no text-to-speech provider is configured for this turn" });
+      res.end();
+      return;
+    }
 
     // One stream, one sink, for both emit sites: the read loop below and the
     // `finalize` tail after it. That is what keeps the chunk index unbroken

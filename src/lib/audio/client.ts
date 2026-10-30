@@ -10,7 +10,6 @@
 
 import { openAsBlob } from "node:fs";
 import config from "@/lib/config";
-import { applyGainToWav } from "./wav-utils";
 
 export interface TranscriptionResult {
   text: string;
@@ -18,10 +17,33 @@ export interface TranscriptionResult {
 }
 
 export interface SynthesizeOptions {
+  /**
+   * The engine the deployment's own gateway should route to, when the turn
+   * names no provider profile. A profile names its engine in `model` instead.
+   */
   engine?: "kokoro" | "piper" | "supertonic";
-  voice: string;
+  /** The profile's endpoint. Absent means the deployment's gateway. */
+  baseUrl?: string;
+  /** The profile's key, when it has one. Never logged. */
+  apiKey?: string;
+  /**
+   * The model the provider synthesizes with. The OpenAI contract names the
+   * engine here, so the deployment gateway receives its engine as `model`.
+   */
   model?: string;
+  voice: string;
   signal?: AbortSignal;
+}
+
+/**
+ * Where a provider profile lives, when a turn names one.
+ *
+ * Absent fields mean the deployment's own service: the audio.cpp URL and no
+ * key. A profile supplies its own endpoint, and a key only when it has one.
+ */
+export interface ProviderTarget {
+  baseUrl?: string;
+  apiKey?: string;
 }
 
 /**
@@ -40,6 +62,9 @@ export class AudioCppClient {
    * Check if the audio.cpp server is reachable.
    */
   async healthCheck(): Promise<boolean> {
+    // No address is a deployment without a transcription service, not a fault
+    // to report: there is nothing to check.
+    if (this.baseUrl === "") return false;
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
@@ -73,8 +98,19 @@ export class AudioCppClient {
   async transcribe(
     audioPath: string,
     model?: string,
-    language?: string
+    language?: string,
+    target?: ProviderTarget
   ): Promise<TranscriptionResult> {
+    const baseUrl = (target?.baseUrl ?? this.baseUrl).replace(/\/$/, "");
+    if (baseUrl === "") {
+      // Named rather than attempted: a relative URL would fail as a parse error
+      // that says nothing about which service the deployment never configured.
+      throw new Error("no transcription service is configured (AUDIOCPP_BASE_URL)");
+    }
+    const headers: Record<string, string> = {};
+    // A local service has no key; a profile that names one sends it, and only
+    // to that profile's endpoint.
+    if (target?.apiKey) headers.Authorization = `Bearer ${target.apiKey}`;
     const formData = new FormData();
     // Handed over as a Blob that reads the file as it is sent. Reading it here
     // would put the whole recording back in the heap — the one copy the upload
@@ -91,8 +127,9 @@ export class AudioCppClient {
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
-      const res = await fetch(`${this.baseUrl}/v1/audio/transcriptions`, {
+      const res = await fetch(`${baseUrl}/v1/audio/transcriptions`, {
         method: "POST",
+        headers,
         body: formData,
         signal: controller.signal,
       });
@@ -141,6 +178,9 @@ export class AudioGatewayClient {
    * Check if the audio gateway is reachable and which engines are healthy.
    */
   async healthCheck(): Promise<{ kokoro: boolean; piper: boolean; supertonic: boolean }> {
+    // No address is a deployment without a synthesis gateway: there is nothing
+    // to check, and nothing to report on every boot.
+    if (this.baseUrl === "") return { kokoro: false, piper: false, supertonic: false };
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
@@ -177,6 +217,7 @@ export class AudioGatewayClient {
    * misconfiguration.
    */
   async voiceCatalog(): Promise<string[] | null> {
+    if (this.baseUrl === "") return null;
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
@@ -202,25 +243,32 @@ export class AudioGatewayClient {
   }
 
   /**
-   * Text-to-speech: synthesize audio from text via the gateway.
+   * Text-to-speech through one OpenAI-shaped endpoint: the deployment's gateway
+   * when no profile is named, or the profile's own provider when one is.
    * @param text The text to synthesize.
-   * @param options Optional engine, voice, voice overrides, and abort signal.
    * @returns Audio buffer (WAV format).
    */
   async synthesize(text: string, options?: SynthesizeOptions): Promise<Buffer> {
-    // Resolved once, because the same value decides both what to ask for and how
-    // loud the answer is levelled — an engine read twice is an engine that can
-    // disagree with itself.
     const engine = options?.engine ?? config.audio.defaultEngine;
-    const payload: Record<string, string | undefined> = {
-      text,
-      engine,
-      voice: options?.voice ?? config.audio.defaultVoice,
-    };
-    if (options?.model) {
-      payload.model = options.model;
+    const baseUrl = (options?.baseUrl ?? this.baseUrl).replace(/\/$/, "");
+    if (baseUrl === "") {
+      throw new Error("no synthesis service is configured (AUDIO_GATEWAY_URL)");
     }
+    // The OpenAI contract names the engine in `model`, so a deployment turn asks
+    // the gateway for its engine there; a profile names its own model instead.
+    const model = options?.model ?? engine;
+    if (model === undefined) {
+      throw new Error("no text-to-speech model or engine is configured for this turn");
+    }
+    const payload = {
+      model,
+      input: text,
+      voice: options?.voice ?? config.audio.defaultVoice,
+      response_format: "wav",
+    };
     const body = JSON.stringify(payload);
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (options?.apiKey) headers.Authorization = `Bearer ${options.apiKey}`;
 
     const timeoutController = new AbortController();
     const timeout = setTimeout(() => timeoutController.abort(), this.timeoutMs);
@@ -233,9 +281,9 @@ export class AudioGatewayClient {
     const signal = AbortSignal.any(signals);
 
     try {
-      const res = await fetch(`${this.baseUrl}/v1/audio/speech`, {
+      const res = await fetch(`${baseUrl}/v1/audio/speech`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body,
         signal,
       });
@@ -250,41 +298,21 @@ export class AudioGatewayClient {
       const arrayBuffer = await res.arrayBuffer();
       const buffer = Buffer.from(arrayBuffer);
 
-      // Diagnostic: log what the gateway actually returned
-      const magic = buffer.slice(0, 16).toString("hex");
-      // Decode WAV fmt chunk if present
-      let wavInfo = "";
-      if (buffer.length >= 36 && buffer.toString("ascii", 0, 4) === "RIFF") {
-        const audioFormat = buffer.readUInt16LE(20);
-        const numChannels = buffer.readUInt16LE(22);
-        const sampleRate = buffer.readUInt32LE(24);
-        const bitsPerSample = buffer.readUInt16LE(34);
-        wavInfo = ` fmt=${audioFormat} ch=${numChannels} sr=${sampleRate} bps=${bitsPerSample}`;
-      }
-      console.log(
-        `[AudioGateway] synthesize returned ${buffer.length} bytes ` +
-          `content-type=${contentType} magic=${magic}${wavInfo}`
-      );
-
-      // Level the engines against each other here, at the one place the whole
-      // system's audio comes through — the client, the gadget bridge and the
-      // browser all speak by way of this call (design: per-engine volume).
-      const gain = config.audio.volume[engine];
-      const scaled = applyGainToWav(buffer, gain);
-
-      // Report clipping rather than let a volume set too high pass for a volume
-      // that worked: a clamped sample is distortion, and distortion nobody is
-      // told about is the failure this is meant to remove, not to add.
-      if (scaled.clippedSamples > 0) {
-        const share = ((100 * scaled.clippedSamples) / scaled.totalSamples).toFixed(2);
-        console.warn(
-          `[AudioGateway] volume ${gain} for ${engine} clipped ` +
-            `${scaled.clippedSamples}/${scaled.totalSamples} samples (${share}%); ` +
-            `lower ${engine.toUpperCase()}_VOLUME to stop distorting`
-        );
+      // The bridge can only read WAV, so an answer in another format is refused
+      // here rather than discovered downstream as audio nobody can play.
+      if (
+        buffer.length < 12 ||
+        buffer.toString("ascii", 0, 4) !== "RIFF" ||
+        buffer.toString("ascii", 8, 12) !== "WAVE"
+      ) {
+        throw new Error(`TTS provider answered ${contentType}, not WAV`);
       }
 
-      return scaled.buffer;
+      // The gateway levels the engines against each other: it is where the
+      // engine is known, and every caller's audio comes through it. A caller
+      // applying a volume of its own would be a second, uninformed opinion.
+      console.log(`[AudioGateway] synthesize returned ${buffer.length} bytes content-type=${contentType}`);
+      return buffer;
     } catch (err) {
       clearTimeout(timeout);
       throw err;

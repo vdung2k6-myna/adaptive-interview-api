@@ -1,12 +1,21 @@
-import { describe, it } from "node:test";
+import { before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { Server } from "node:http";
 import { readFile, readdir } from "node:fs/promises";
 import express from "express";
+import config from "@/lib/config";
 import { UPLOAD_TEMP_DIR } from "../lib/upload";
 import { turnTranscripts } from "../lib/turn-transcript";
 import { writeWavHeader } from "../lib/audio/wav-utils";
 import { createVoiceRouter, type VoiceRouteDeps, type SessionForTurn } from "./voice";
+
+// These tests drive the route with a synthesizer they supply; a deployment that
+// reaches this route names a default engine, which is what the legacy path reads.
+before(() => {
+  config.audio.defaultEngine = "supertonic";
+  config.audio.gatewayUrl = "http://gateway.test";
+  config.audio.sttUrl = "http://stt.test";
+});
 
 interface Harness {
   /** The text of every chunk the route asked to synthesize, in order — what the

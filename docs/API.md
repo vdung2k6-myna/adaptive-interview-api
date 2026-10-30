@@ -493,10 +493,11 @@ Loudness is a deployment setting too, and it is set per engine (`KOKORO_VOLUME`,
 `PIPER_VOLUME`, `SUPERTONIC_VOLUME`), because the engines do not agree: measured on
 one Vietnamese sentence, Kokoro and Piper return at full scale while Supertonic
 sits about 8 dB below it, so one shared level would only be a compromise between
-them. Each value is a linear multiplier applied to the audio the gateway returns —
-`1` leaves an engine as it is, `0.5` halves it, `1.2` boosts it and clamps whatever
-no longer fits, logging the share of samples that clipped so a value set too high
-is visible rather than merely audible.
+them. Each value is a linear multiplier applied by the audio gateway — `1` leaves an
+engine as it is, `0.5` halves it, `1.2` boosts it and clamps whatever no longer fits,
+logging the share of samples that clipped so a value set too high is visible rather
+than merely audible. The gateway applies it because it is where the engine is known
+and where every caller's audio passes; a provider profile names no level of its own.
 
 There is no per-request field for it: the level of an engine's voice is a property
 of the deployment, and a turn that could ask for its own would be a turn that

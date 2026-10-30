@@ -14,6 +14,7 @@ import voiceRoutes from "./routes/voice";
 import voiceAgentRoutes from "./routes/voice-agent";
 import personasRoutes from "./routes/personas";
 import musicRoutes from "./routes/music";
+import providersRoutes from "./routes/providers";
 import mcpRoutes from "./routes/mcp";
 
 import { audioMediaType } from "./lib/audio/storage";
@@ -124,6 +125,7 @@ export function createApp(): express.Express {
   app.use("/api/voice-agent", voiceAgentRoutes);
   app.use("/api/personas", personasRoutes);
   app.use("/api/music", musicRoutes);
+  app.use("/api/provider-profiles", providersRoutes);
 
   // Error handler
   app.use(errorHandler);

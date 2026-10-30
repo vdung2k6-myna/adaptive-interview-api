@@ -24,7 +24,7 @@ type Engine = "kokoro" | "piper" | "supertonic";
  */
 export function configuredSupertonicVoices(
   voices: { english: string; vietnamese: string },
-  options: { defaultEngine: Engine; defaultVoice: string }
+  options: { defaultEngine: Engine | undefined; defaultVoice: string }
 ): string[] {
   const configured = [voices.english, voices.vietnamese].map((name) =>
     (name ?? "").trim()

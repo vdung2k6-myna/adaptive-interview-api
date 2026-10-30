@@ -215,6 +215,10 @@ router.post("/start", async (req, res) => {
     const requestedEngine = (session.ttsProvider as "kokoro" | "piper") || "kokoro";
     const language = (session.language as "english" | "vietnamese") || "english";
     const engine = resolveEngineForLanguage(requestedEngine, language);
+    if (engine === undefined) {
+      res.status(503).json({ error: "no text-to-speech engine is configured for this session" });
+      return;
+    }
 
     const prompt = await buildPrompt(
       {
@@ -509,6 +513,10 @@ async function handleTurn(
 
     const requestedEngine = (session.ttsProvider as "kokoro" | "piper") || "kokoro";
     const engine = resolveEngineForLanguage(requestedEngine, language);
+    if (engine === undefined) {
+      res.status(503).json({ error: "no text-to-speech engine is configured for this session" });
+      return;
+    }
 
     const promptMessages: PromptMessage[] = existingMessages.map((m) => ({
       role: m.role as "interviewer" | "candidate",
@@ -798,6 +806,13 @@ async function handleStreamTurn(
       (session.ttsProvider as "kokoro" | "piper") || "kokoro",
       streamLanguage
     );
+    if (streamEngine === undefined) {
+      sendSseEvent(res, "error", {
+        message: "no text-to-speech engine is configured for this session",
+      });
+      res.end();
+      return;
+    }
 
     if (newTurn >= session.maxTurns) {
       await db
@@ -1224,6 +1239,10 @@ router.post("/speak", async (req, res) => {
     const resolvedLanguage: "english" | "vietnamese" =
       requestLanguage === "vietnamese" ? "vietnamese" : "english";
     const resolvedEngine = resolveEngineForLanguage(engine, resolvedLanguage);
+    if (resolvedEngine === undefined) {
+      res.status(503).json({ error: "no text-to-speech engine is configured" });
+      return;
+    }
 
     const result = await synthesizeLongText(text, {
       engine: resolvedEngine,
@@ -1415,6 +1434,11 @@ async function handleSpeakStream(
     const resolvedLanguage: "english" | "vietnamese" =
       requestLanguage === "vietnamese" ? "vietnamese" : "english";
     const resolvedEngine = resolveEngineForLanguage(engine, resolvedLanguage);
+    if (resolvedEngine === undefined) {
+      sendSseEvent(res, "error", { message: "no text-to-speech engine is configured" });
+      res.end();
+      return;
+    }
 
     const cleanText = stripMarkdown(text);
     const sentences = splitSentences(cleanText);

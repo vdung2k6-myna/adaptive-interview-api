@@ -123,13 +123,20 @@ describe("the bounds work under load is held to", () => {
 });
 
 describe("the audio defaults an unconfigured deployment runs on", () => {
-  it("names the engine and English voice the audio tier provisions", () => {
+  it("assumes no audio address and no engine", () => {
     for (const [name, config] of ENVIRONMENTS) {
+      assert.equal(config.audio.sttUrl, "", `${name}: ${envNote("AUDIOCPP_BASE_URL")}`);
+      assert.equal(config.audio.gatewayUrl, "", `${name}: ${envNote("AUDIO_GATEWAY_URL")}`);
       assert.equal(
         config.audio.defaultEngine,
-        "piper",
+        undefined,
         `${name}: ${envNote("DEFAULT_TTS_ENGINE")}`
       );
+    }
+  });
+
+  it("keeps the voices the engine path would ask for", () => {
+    for (const [name, config] of ENVIRONMENTS) {
       assert.equal(
         config.audio.defaultVoice,
         "bryce",

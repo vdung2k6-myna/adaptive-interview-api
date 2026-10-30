@@ -9,10 +9,21 @@ import type { KnowledgeChunk, KnowledgeSearchOutcome, SearchOptions } from "../l
 import { SentenceExtractor } from "../lib/audio/sentence-extractor";
 import type { SynthesizeOptions } from "../lib/audio";
 import { AUDIO_ROOT } from "../lib/audio/storage";
+import config from "@/lib/config";
 import { turnTranscripts } from "../lib/turn-transcript";
 import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// These turns use the legacy engine path and stubbed audio calls, so the
+// deployment they run against names both services and a default engine. The
+// "no audio service" suite below clears them to assert what an unconfigured
+// deployment does.
+before(() => {
+  config.audio.sttUrl = "http://stt.test";
+  config.audio.gatewayUrl = "http://gateway.test";
+  config.audio.defaultEngine = "supertonic";
+});
 
 interface SearchCall {
   query: string;
@@ -54,7 +65,11 @@ interface Harness {
   /** Every transcription the route asked for, with the arguments it passed. The
    * language has to reach the transcriber, and "the route knows the language" is
    * not the same claim as "the transcriber was told it". */
-  transcribeCalls: Array<{ language: string | undefined }>;
+  transcribeCalls: Array<{
+    language: string | undefined;
+    model?: string;
+    target?: { baseUrl?: string; apiKey?: string };
+  }>;
 }
 
 /** One turn's worth of history, which is what makes a turn *not* a session's
@@ -118,7 +133,11 @@ function harness(
   const events: string[] = [];
   const synthCalls: string[] = [];
   const synthOptions: SynthesizeOptions[] = [];
-  const transcribeCalls: Array<{ language: string | undefined }> = [];
+  const transcribeCalls: Array<{
+    language: string | undefined;
+    model?: string;
+    target?: { baseUrl?: string; apiKey?: string };
+  }> = [];
   const tokens = settings.stream ?? [];
   // Which model round the stub is answering, so one turn's rounds can be scripted apart.
   let modelRounds = 0;
@@ -144,9 +163,9 @@ function harness(
         }
         return await (typeof reply === "function" ? reply(call) : reply);
       },
-      transcribeAudio: async (_audioPath, _model, language) => {
+      transcribeAudio: async (_audioPath, model, language, target) => {
         events.push("transcribe");
-        transcribeCalls.push({ language });
+        transcribeCalls.push({ language, model, target });
         return { text: settings.transcription ?? "transcribed words", confidence: 0.9 };
       },
       generateChatResponseStream: (options) => {
@@ -1507,7 +1526,10 @@ describe("POST /api/voice-agent/stream — the spoken chunk contract", () => {
     });
   });
 
-  it("falls through to the language mapping when no engine is named", async () => {
+  it("uses the deployment's default engine when the turn names none", async () => {
+    // There is no language mapping any more: it baked this deployment's stack into
+    // the runtime. A turn that names no engine reads the deployment's configured
+    // default, and one language does not choose a different engine from another.
     const english = harness(
       { ok: true, chunks: [] },
       { stream: ["Hello there."], synthesize: (chunk) => Buffer.from(`wav:${chunk}`) }
@@ -1517,8 +1539,8 @@ describe("POST /api/voice-agent/stream — the spoken chunk contract", () => {
     });
     assert.equal(
       english.synthOptions[0]?.engine,
-      "piper",
-      "an English turn with no engine must be synthesized by Piper, whose voices this repository provisions"
+      "supertonic",
+      "an English turn with no engine uses the deployment's default"
     );
 
     const vietnamese = harness(
@@ -1530,8 +1552,8 @@ describe("POST /api/voice-agent/stream — the spoken chunk contract", () => {
     });
     assert.equal(
       vietnamese.synthOptions[0]?.engine,
-      "kokoro",
-      "a Vietnamese turn with no engine must keep the language mapping's Kokoro"
+      "supertonic",
+      "and a Vietnamese turn uses the same default"
     );
   });
 
@@ -2404,5 +2426,133 @@ describe("a turn answered from its windows", () => {
         "a gap is reported, not answered around"
       );
     });
+  });
+});
+
+describe("POST /api/voice-agent/stream — provider profiles", () => {
+  const originalCatalog = config.providers.catalog;
+  const originalDefaults = { ...config.providers.defaults };
+
+  after(() => {
+    config.providers.catalog = originalCatalog;
+    config.providers.defaults = originalDefaults;
+  });
+
+  it("sends the fields a bridge resolved to the transcription and synthesis clients", async () => {
+    const h = harness({ ok: true, chunks: [] }, { stream: ["Hello."] });
+
+    await withServer(h.deps, async (api) => {
+      await sendAudioTurn(api.stream, h, {
+        ttsBaseUrl: "https://tts.example/v1",
+        ttsModel: "tts-1",
+        ttsVoice: "alloy",
+        ttsApiKey: "sk-tts",
+        sttBaseUrl: "https://stt.example/v1",
+        sttModel: "whisper-1",
+        sttApiKey: "sk-stt",
+      });
+
+      assert.deepEqual(h.transcribeCalls[0], {
+        language: "en",
+        model: "whisper-1",
+        target: { baseUrl: "https://stt.example/v1", apiKey: "sk-stt" },
+      });
+      assert.equal(h.synthOptions[0]?.baseUrl, "https://tts.example/v1");
+      assert.equal(h.synthOptions[0]?.model, "tts-1");
+      assert.equal(h.synthOptions[0]?.voice, "alloy");
+      assert.equal(h.synthOptions[0]?.apiKey, "sk-tts");
+      assert.equal(h.synthOptions[0]?.engine, undefined, "a profile has no engine of its own");
+    });
+  });
+
+  it("resolves a profile id against the catalog", async () => {
+    config.providers.catalog = [
+      {
+        id: "vi-tts",
+        kind: "tts",
+        name: "TTS",
+        baseUrl: "https://tts.example/v1",
+        model: "tts-1",
+        voice: "alloy",
+        apiKey: "sk-tts",
+      },
+      {
+        id: "vi-stt",
+        kind: "stt",
+        name: "STT",
+        baseUrl: "https://stt.example/v1",
+        model: "whisper-1",
+      },
+    ];
+
+    const h = harness({ ok: true, chunks: [] }, { stream: ["Hello."] });
+
+    await withServer(h.deps, async (api) => {
+      await sendAudioTurn(api.stream, h, { ttsProfileId: "vi-tts", sttProfileId: "vi-stt" });
+
+      assert.equal(h.transcribeCalls[0]?.model, "whisper-1");
+      assert.equal(h.transcribeCalls[0]?.target?.baseUrl, "https://stt.example/v1");
+      assert.equal(h.transcribeCalls[0]?.target?.apiKey, undefined, "a profile with no key sends none");
+      assert.equal(h.synthOptions[0]?.baseUrl, "https://tts.example/v1");
+      assert.equal(h.synthOptions[0]?.voice, "alloy");
+      assert.equal(h.synthOptions[0]?.engine, undefined);
+    });
+  });
+
+  it("refuses an id that names no profile rather than falling to the default", async () => {
+    config.providers.catalog = [];
+    config.providers.defaults = { llm: null, stt: null, tts: null };
+
+    const h = harness({ ok: true, chunks: [] }, { stream: ["Hello."] });
+
+    await withServer(h.deps, async (api) => {
+      const events = parseSse(await sendAudioTurn(api.stream, h, { ttsProfileId: "missing" }));
+
+      const error = events.find((event) => event.event === "error");
+      assert.match(String(error?.data.message), /names no profile/);
+      assert.equal(h.transcribeCalls.length, 0, "nothing is transcribed for a refused turn");
+      assert.equal(h.synthCalls.length, 0, "and nothing is spoken");
+    });
+  });
+});
+
+describe("POST /api/voice-agent/stream — a deployment with no audio service", () => {
+  it("says so rather than reaching an address nobody chose", async () => {
+    const previous = { ...config.audio };
+    const h = harness({ ok: true, chunks: [] }, { stream: ["Hello."] });
+    try {
+      config.audio.gatewayUrl = "";
+      config.audio.defaultEngine = undefined;
+      config.providers.catalog = [];
+      config.providers.defaults = { llm: null, stt: null, tts: null };
+
+      await withServer(h.deps, async (api) => {
+        const events = parseSse(await sendTurn(api.stream, h, { text: "hello" }));
+        const error = events.find((event) => event.event === "error");
+        assert.match(String(error?.data.message), /no text-to-speech provider/);
+        assert.equal(h.synthCalls.length, 0, "nothing is spoken");
+      });
+    } finally {
+      Object.assign(config.audio, previous);
+    }
+  });
+
+  it("says so when a spoken turn has no transcriber", async () => {
+    const previous = { ...config.audio };
+    const h = harness();
+    try {
+      config.audio.sttUrl = "";
+      config.providers.catalog = [];
+      config.providers.defaults = { llm: null, stt: null, tts: null };
+
+      await withServer(h.deps, async (api) => {
+        const events = parseSse(await sendAudioTurn(api.stream, h, {}));
+        const error = events.find((event) => event.event === "error");
+        assert.match(String(error?.data.message), /no transcription provider/);
+        assert.equal(h.transcribeCalls.length, 0, "nothing is transcribed");
+      });
+    } finally {
+      Object.assign(config.audio, previous);
+    }
   });
 });

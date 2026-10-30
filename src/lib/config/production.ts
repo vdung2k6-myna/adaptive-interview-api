@@ -1,5 +1,10 @@
 import type { AppConfig } from "./index";
-import { parseGain, parseList, parsePositiveInt, parseUnitInterval } from "./env";
+import { parseList, parsePositiveInt, parseUnitInterval } from "./env";
+import { parseProviderCatalog, parseProviderDefaults } from "@/lib/providers";
+
+// Read once, so the defaults are checked against the catalog they actually
+// belong to rather than against a second parse that could disagree.
+const providerCatalog = parseProviderCatalog(process.env.PROVIDER_CATALOG, "PROVIDER_CATALOG");
 
 export const productionConfig: AppConfig = {
   env: "production",
@@ -43,12 +48,13 @@ export const productionConfig: AppConfig = {
     apiToken: process.env.API_AUTH_TOKEN || "",
   },
   audio: {
-    sttUrl: process.env.AUDIOCPP_BASE_URL || "http://localhost:8080",
-    gatewayUrl: process.env.AUDIO_GATEWAY_URL || "http://localhost:8082",
+    // Unset means the deployment runs no such service — never localhost by
+    // default, so a deployment that removes its audio tier reads as one without
+    // it rather than one that keeps failing to reach an address nobody chose.
+    sttUrl: (process.env.AUDIOCPP_BASE_URL ?? "").trim(),
+    gatewayUrl: (process.env.AUDIO_GATEWAY_URL ?? "").trim(),
     sttModel: process.env.AUDIOCPP_STT_MODEL || "stt",
-    // Piper is the tier's measured-fast engine (23x real-time, against
-    // supertonic's 3.2x) and the one whose voice this repository provisions.
-    defaultEngine: (process.env.DEFAULT_TTS_ENGINE as "kokoro" | "piper" | "supertonic") || "piper",
+    defaultEngine: (process.env.DEFAULT_TTS_ENGINE as "kokoro" | "piper" | "supertonic" | undefined) || undefined,
     defaultVoice: process.env.DEFAULT_VOICE || "bryce",
     timeoutMs: 60_000,
     // Four: enough that a reply's segments are spoken as they are produced, few
@@ -75,15 +81,10 @@ export const productionConfig: AppConfig = {
         vietnamese: process.env.SUPERTONIC_VOICE_VIETNAMESE || "F1",
       },
     },
-    // Same levels as development, and deliberately not a second opinion: the
-    // imbalance being corrected is a property of the engines, not of a
-    // deployment, so the numbers travel with the code until a deployment has a
-    // reason of its own. See the field in `AppConfig` for what was measured.
-    volume: {
-      kokoro: parseGain(process.env.KOKORO_VOLUME, 0.5),
-      piper: parseGain(process.env.PIPER_VOLUME, 0.7),
-      supertonic: parseGain(process.env.SUPERTONIC_VOLUME, 1.2),
-    },
+  },
+  providers: {
+    catalog: providerCatalog,
+    defaults: parseProviderDefaults(process.env, providerCatalog),
   },
   docEtl: {
     apiUrl: process.env.DOC_ETL_API_URL || "http://localhost:8005",
