@@ -114,6 +114,25 @@ class SynthesizeRequest(BaseModel):
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
+def _engine_error(engine: str, res: httpx.Response) -> HTTPException:
+    """The engine's own answer, as the same kind of error.
+
+    A voice an engine does not hold is the caller's mistake, not a broken
+    gateway: passing every engine error through as 502 reported "bad gateway" for
+    a wrong name. A front that treats 5xx as infrastructure then replaces the body
+    with its own page, so the list of voices that would have fixed the request
+    never reached the person who typed it.
+    """
+    detail: object
+    try:
+        body = res.json()
+        detail = body.get("detail") if isinstance(body, dict) and "detail" in body else body
+    except Exception:
+        detail = res.text or f"{engine} returned {res.status_code}"
+    status = res.status_code if 400 <= res.status_code < 500 else 502
+    return HTTPException(status_code=status, detail=detail)
+
+
 async def _check_service(url: str) -> bool:
     """Quick health check against a downstream service."""
     try:
@@ -233,8 +252,7 @@ async def _proxy_to_kokoro(req: SynthesizeRequest) -> bytes:
         raise HTTPException(status_code=504, detail="Kokoro TTS timed out")
 
     if res.status_code >= 400:
-        detail = res.text or f"Kokoro returned {res.status_code}"
-        raise HTTPException(status_code=502, detail=detail)
+        raise _engine_error("Kokoro", res)
 
     return res.content
 
@@ -261,8 +279,7 @@ async def _proxy_to_piper(req: SynthesizeRequest) -> bytes:
         raise HTTPException(status_code=504, detail="Piper TTS timed out")
 
     if res.status_code >= 400:
-        detail = res.text or f"Piper returned {res.status_code}"
-        raise HTTPException(status_code=502, detail=detail)
+        raise _engine_error("Piper", res)
 
     return res.content
 
@@ -293,8 +310,7 @@ async def _proxy_to_supertonic(req: SynthesizeRequest) -> bytes:
         raise HTTPException(status_code=504, detail="Supertonic TTS timed out")
 
     if res.status_code >= 400:
-        detail = res.text or f"Supertonic returned {res.status_code}"
-        raise HTTPException(status_code=502, detail=detail)
+        raise _engine_error("Supertonic", res)
 
     return res.content
 

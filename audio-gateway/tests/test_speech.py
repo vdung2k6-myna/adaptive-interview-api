@@ -5,6 +5,7 @@ the answer it gives is read back through the gateway.
 """
 
 import io
+import json
 import sys
 import wave
 from array import array
@@ -35,7 +36,32 @@ class RecordingClient:
         return FakeResponse(self.content)
 
 
-def use_client(monkeypatch, client: RecordingClient) -> None:
+class ErrorResponse:
+    def __init__(self, status_code: int, body: dict | str):
+        self.status_code = status_code
+        self._body = body
+        self.text = body if isinstance(body, str) else json.dumps(body)
+        self.content = self.text.encode()
+
+    def json(self):
+        if isinstance(self._body, str):
+            raise ValueError("not json")
+        return self._body
+
+
+class ErrorClient:
+    """A leaf engine that refuses — which is what a wrong voice name is."""
+
+    def __init__(self, response: ErrorResponse):
+        self.response = response
+        self.calls: list[tuple[str, dict | None]] = []
+
+    async def post(self, url, json=None, timeout=None):
+        self.calls.append((url, json))
+        return self.response
+
+
+def use_client(monkeypatch, client) -> None:
     async def fake_get_client():
         return client
 
@@ -108,6 +134,33 @@ def test_an_engine_named_by_model_reaches_its_service(monkeypatch):
 
     assert answer.status_code == 200
     assert client.calls[0][0] == f"{SUPERTONIC}/v1/audio/speech"
+
+
+def test_a_voice_the_engine_does_not_hold_stays_a_client_error(monkeypatch):
+    # The engine's 4xx is the caller's mistake, and its body names the voices that
+    # would have worked. Relaying it as 502 both lied about whose fault it was and
+    # let a front that masks 5xx throw the list away.
+    response = ErrorResponse(422, {"detail": "Voice 'af_heart' not found. Available: ['mai_linh']"})
+    use_client(monkeypatch, ErrorClient(response))
+
+    answer = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={"model": "kokoro", "input": "xin chào", "voice": "af_heart"},
+    )
+
+    assert answer.status_code == 422
+    assert "mai_linh" in answer.text
+
+
+def test_an_engine_failure_is_still_a_bad_gateway(monkeypatch):
+    use_client(monkeypatch, ErrorClient(ErrorResponse(500, {"detail": "boom"})))
+
+    answer = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={"model": "kokoro", "input": "xin chào", "voice": "vn"},
+    )
+
+    assert answer.status_code == 502
 
 
 def test_a_model_that_names_no_engine_is_refused(monkeypatch):
