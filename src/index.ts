@@ -5,9 +5,17 @@ import { unavailableConfiguredVoices } from "./lib/audio/voice-catalog";
 import { libraryComplaint } from "./lib/music";
 import config from "./lib/config";
 
-const PORT = process.env.PORT || 4000;
+// Read as a number because `listen` takes one when a host is named as well.
+const PORT = Number(process.env.PORT || 4000);
+/**
+ * The address the API binds. Defaults to every interface, which is what every
+ * deployment did before this setting existed; a deployment that puts the API
+ * behind a proxy, or on the same host as its only caller, names loopback here
+ * and the socket is then reachable from nowhere else.
+ */
+const HOST = process.env.HOST || "0.0.0.0";
 
-createApp().listen(PORT, () => {
+createApp().listen(PORT, HOST, () => {
   console.log(`Adaptive Interview API listening on port ${PORT}`);
   void reportUnavailableVoices();
   void reportMusicLibrary();
