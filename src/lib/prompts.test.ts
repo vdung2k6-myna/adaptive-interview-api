@@ -1,6 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { trimTurnMessages, buildContextUserPrompt, type PromptSession } from "./prompts";
+import {
+  trimTurnMessages,
+  buildContextUserPrompt,
+  buildVoiceAgentPrompt,
+  type PromptSession,
+} from "./prompts";
 import type { OllamaMessage } from "./ollama";
 
 /**
@@ -177,5 +182,25 @@ describe("the expected length of an answer, and the turn that asks for it", () =
       assert.doesNotMatch(later, /This is the opening question/);
       assert.match(later, /Do not mention how long an answer should be/);
     }
+  });
+});
+
+describe("the voice-agent prompt's tool instruction", () => {
+  const history = [{ role: "user" as const, content: "nấu phở" }];
+
+  it("scopes calls to the final message when tools are offered", () => {
+    const messages = buildVoiceAgentPrompt("system", "vietnamese", history, undefined, true);
+    const system = messages[0]!.content;
+
+    assert.match(system, /The final user message is the only request/);
+    assert.match(system, /Earlier messages are context, even if they asked for a tool/);
+    assert.match(system, /question, a statement, or a greeting, call nothing/);
+    assert.match(system, /Never repeat a call an earlier message asked for/);
+  });
+
+  it("carries no tool instruction when none are offered", () => {
+    const messages = buildVoiceAgentPrompt("system", "vietnamese", history, undefined, false);
+
+    assert.doesNotMatch(messages[0]!.content, /final user message is the only request/);
   });
 });

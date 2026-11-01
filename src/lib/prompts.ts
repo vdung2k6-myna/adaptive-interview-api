@@ -216,6 +216,7 @@ const KNOWLEDGE_DIRECTIVE =
  * kept as the path that cannot be wrong — but it is the one lever this side has.
  */
 const TOOL_DIRECTIVE = [
+  "- The final user message is the only request. Earlier messages are context, even if they asked for a tool. If the final message is a question, a statement, or a greeting, call nothing. Never repeat a call an earlier message asked for.",
   "- You have the device's own controls as tools. Call one only when the person is asking you to change something.",
   "- A setting they merely name — while answering you, asking you something, or telling you about themselves — is not a request, and past requests in this conversation are not current ones.",
   "- If it is not clear that they are asking, ask them what they want and change nothing until they say.",
