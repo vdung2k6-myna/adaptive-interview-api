@@ -255,6 +255,12 @@ a JSON string, gives every call an `id` and `type: "function"`, and marks each
 gets `call_<round>_<index>`. The native `/api/chat` path keeps object arguments
 and names the result by `tool_name`.
 
+A provider that attaches metadata to a tool call keeps it. The OpenAI-compatible
+path stores the call's opaque `extra_content` and replays it unchanged on the same
+call in the next request; Gemini 3 puts `thought_signature` there and refuses the
+turn without it. The metadata is never read, and the native path carries no such
+field.
+
 The key travels in the request body, is used only to build the `Authorization`
 header, and is never logged.
 

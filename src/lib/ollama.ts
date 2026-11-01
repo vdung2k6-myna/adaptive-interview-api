@@ -159,9 +159,14 @@ async function requestModel(
 
 /** One call a model asked for, as it reported it. `arguments` arrives already parsed — Ollama
  *  does that before the chunk reaches us — and is handed to the gadget as it stands. The `id`
- *  is the provider's, when it supplies one; the OpenAI dialect needs it to pair a result. */
+ *  is the provider's, when it supplies one; the OpenAI dialect needs it to pair a result.
+ *
+ *  `extra_content` is whatever opaque metadata the provider attached to the call. It is kept
+ *  and replayed unchanged, never read: Gemini 3 puts its `thought_signature` there and refuses
+ *  the next request without it, while a provider that attaches nothing is unaffected. */
 export interface OllamaToolCall {
   id?: string;
+  extra_content?: unknown;
   function: {
     name: string;
     arguments: Record<string, unknown>;
@@ -303,6 +308,10 @@ export interface GenerateStreamResult {
  * or a string where its schema expects an integer. Anything without a usable name is dropped —
  * a call to no tool is not a call.
  */
+function objectOrUndefined(value: unknown): unknown {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
+}
+
 function readToolCalls(message: { tool_calls?: unknown } | undefined): OllamaToolCall[] {
   const raw = message?.tool_calls;
   if (!Array.isArray(raw)) return [];
@@ -310,10 +319,22 @@ function readToolCalls(message: { tool_calls?: unknown } | undefined): OllamaToo
   const calls: OllamaToolCall[] = [];
   for (const entry of raw) {
     if (typeof entry !== "object" || entry === null) continue;
-    const { id, function: fn } = entry as { id?: unknown; function?: unknown };
+    const { id, function: fn, extra_content: callExtra } = entry as {
+      id?: unknown;
+      function?: unknown;
+      extra_content?: unknown;
+    };
     if (typeof fn !== "object" || fn === null) continue;
-    const { name, arguments: args } = fn as { name?: unknown; arguments?: unknown };
+    const { name, arguments: args, extra_content: fnExtra } = fn as {
+      name?: unknown;
+      arguments?: unknown;
+      extra_content?: unknown;
+    };
     if (typeof name !== "string" || name === "") continue;
+    // Gemini attaches the signature to the call; another provider may put it under the
+    // function. Either location is kept whole, and a non-object is dropped rather than
+    // replayed as a value the provider never meant.
+    const extra = objectOrUndefined(callExtra) ?? objectOrUndefined(fnExtra);
 
     let parsed: Record<string, unknown> = {};
     if (typeof args === "string") {
@@ -329,6 +350,7 @@ function readToolCalls(message: { tool_calls?: unknown } | undefined): OllamaToo
     }
     calls.push({
       ...(typeof id === "string" && id !== "" ? { id } : {}),
+      ...(extra === undefined ? {} : { extra_content: extra }),
       function: { name, arguments: parsed },
     });
   }
@@ -761,6 +783,7 @@ function openAiMessages(messages: OllamaMessage[]): unknown[] {
         tool_calls: message.tool_calls.map((call, callIndex) => ({
           id: call.id ?? `call_${messageIndex}_${callIndex}`,
           type: "function",
+          ...(call.extra_content === undefined ? {} : { extra_content: call.extra_content }),
           function: {
             name: call.function.name,
             arguments: JSON.stringify(call.function.arguments),
@@ -894,7 +917,10 @@ function generateOpenAiStream(
         // Tool calls arrive as deltas too: the name and the arguments of one call
         // are spread across chunks, so they are gathered by index and read once the
         // stream ends.
-        const pending = new Map<number, { id?: string; name: string; arguments: string }>();
+        const pending = new Map<
+          number,
+          { id?: string; name: string; arguments: string; extra_content?: unknown }
+        >();
         let buffer = "";
 
         const consume = (payload: string): boolean => {
@@ -906,7 +932,8 @@ function generateOpenAiStream(
                 tool_calls?: Array<{
                   index?: number;
                   id?: string;
-                  function?: { name?: string; arguments?: string };
+                  extra_content?: unknown;
+                  function?: { name?: string; arguments?: string; extra_content?: unknown };
                 }>;
               };
             }>;
@@ -930,6 +957,10 @@ function generateOpenAiStream(
             if (typeof call.id === "string" && call.id !== "") slot.id = call.id;
             if (typeof call.function?.name === "string") slot.name += call.function.name;
             if (typeof call.function?.arguments === "string") slot.arguments += call.function.arguments;
+            // Provider metadata is a whole value, not a delta: the last one seen wins.
+            const extra =
+              objectOrUndefined(call.extra_content) ?? objectOrUndefined(call.function?.extra_content);
+            if (extra !== undefined) slot.extra_content = extra;
             pending.set(index, slot);
           }
           if (event.usage !== undefined) {
@@ -966,6 +997,9 @@ function generateOpenAiStream(
           for (const call of readToolCalls({
             tool_calls: [...pending.values()].map((entry) => ({
               ...(entry.id === undefined ? {} : { id: entry.id }),
+              ...(entry.extra_content === undefined
+                ? {}
+                : { extra_content: entry.extra_content }),
               function: entry,
             })),
           })) {

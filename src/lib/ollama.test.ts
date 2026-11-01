@@ -178,6 +178,8 @@ describe("generateChatResponseStream token counts", () => {
           tool_calls: [
             {
               id: "call_abc",
+              // Provider metadata belongs to the OpenAI dialect; /api/chat must not see it.
+              extra_content: { google: { thought_signature: "sig-123" } },
               function: { name: "bridge.play_music", arguments: { q: "bolero" } },
             },
           ],

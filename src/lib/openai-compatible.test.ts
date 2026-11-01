@@ -169,6 +169,88 @@ describe("an OpenAI-compatible turn", () => {
     ]);
   });
 
+  // Google's OpenAI-compatible layer nests the signature at
+  // tool_calls[].extra_content.google.thought_signature, as one whole value in a single
+  // delta (provider docs, 2026-11-01). The fixture below encodes exactly that shape.
+  it("keeps provider metadata through a streamed call", async () => {
+    reset();
+    answer = {
+      status: 200,
+      contentType: "text/event-stream",
+      body:
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","extra_content":{"google":{"thought_signature":"sig-123"}},"function":{"name":"self.audio_speaker.set_volume","arguments":"{\\"volume\\":100}"}}]}}]}\n\n' +
+        "data: [DONE]\n\n",
+    };
+
+    const result = generateChatResponseStream({ messages, llm: llm() });
+    await result.stream.getReader().read();
+
+    assert.deepEqual(result.getToolCalls(), [
+      {
+        id: "call_abc",
+        extra_content: { google: { thought_signature: "sig-123" } },
+        function: { name: "self.audio_speaker.set_volume", arguments: { volume: 100 } },
+      },
+    ]);
+  });
+
+  it("drops provider metadata that is not an object", async () => {
+    reset();
+    answer = {
+      status: 200,
+      contentType: "text/event-stream",
+      body:
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"extra_content":"nope","function":{"name":"bridge.play_music","arguments":"{}"}}]}}]}\n\n' +
+        "data: [DONE]\n\n",
+    };
+
+    const result = generateChatResponseStream({ messages, llm: llm() });
+    await result.stream.getReader().read();
+
+    assert.deepEqual(result.getToolCalls(), [
+      { function: { name: "bridge.play_music", arguments: {} } },
+    ]);
+  });
+
+  it("replays provider metadata verbatim on the assistant call", async () => {
+    reset();
+    answer = { status: 200, contentType: "text/event-stream", body: "data: [DONE]\n\n" };
+    const replay: OllamaMessage[] = [
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            id: "call_abc",
+            extra_content: { google: { thought_signature: "sig-123" } },
+            function: { name: "self.audio_speaker.set_volume", arguments: { volume: 100 } },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: "done",
+        tool_name: "self.audio_speaker.set_volume",
+        tool_call_id: "call_abc",
+      },
+    ];
+
+    const result = generateChatResponseStream({ messages: replay, llm: llm() });
+    await result.stream.getReader().read();
+
+    const body = JSON.parse(seen[0]!.body) as {
+      messages: Array<{ tool_calls?: unknown }>;
+    };
+    assert.deepEqual(body.messages[0]?.tool_calls, [
+      {
+        id: "call_abc",
+        type: "function",
+        extra_content: { google: { thought_signature: "sig-123" } },
+        function: { name: "self.audio_speaker.set_volume", arguments: '{"volume":100}' },
+      },
+    ]);
+  });
+
   it("replays a tool call and its result in the OpenAI dialect", async () => {
     reset();
     answer = { status: 200, contentType: "text/event-stream", body: "data: [DONE]\n\n" };
