@@ -489,10 +489,39 @@ function nativeMessages(messages: OllamaMessage[]): unknown[] {
   });
 }
 
+/** A non-streaming answer: words, or a call the turn may make — a tool-enabled turn can be
+ *  answered either way, and the caller needs both. */
+export interface ChatResult {
+  text: string;
+  toolCalls: OllamaToolCall[];
+}
+
+export async function generateChatResponseFull(
+  options: OllamaGenerateOptions
+): Promise<ChatResult> {
+  if (options.llm !== undefined) return generateOpenAiResponse(options, options.llm);
+  return generateNativeResponse(options);
+}
+
+/**
+ * The text of a non-streaming answer, for a caller that offered no tools. A provider that
+ * answers with a call instead of words has no text to give such a caller, and says so.
+ */
 export async function generateChatResponse(
   options: OllamaGenerateOptions
 ): Promise<string> {
-  if (options.llm !== undefined) return generateOpenAiResponse(options, options.llm);
+  const result = await generateChatResponseFull(options);
+  if (result.text === "") {
+    throw options.llm !== undefined
+      ? new ModelProviderError("the model provider's answer contained no content", 502)
+      : new OllamaError("Ollama response contained no content.", 502);
+  }
+  return result.text;
+}
+
+async function generateNativeResponse(
+  options: OllamaGenerateOptions
+): Promise<ChatResult> {
   const baseUrl = process.env.OLLAMA_BASE_URL || config.ollama.baseUrl;
   const model = options.model || process.env.OLLAMA_MODEL || config.ollama.chatModel;
   const url = `${baseUrl}/api/chat`;
@@ -534,7 +563,7 @@ export async function generateChatResponse(
       }
 
       const raw = await res.text();
-      let data: { message?: { content?: string } } & TokenCounts;
+      let data: { message?: { content?: string; tool_calls?: unknown } } & TokenCounts;
       try {
         data = JSON.parse(raw);
       } catch {
@@ -545,13 +574,14 @@ export async function generateChatResponse(
       // still evaluated the prompt, and that cost is worth seeing next to the error.
       logTokenCounts(model, data);
 
-      const content = data.message?.content?.trim();
+      const content = data.message?.content?.trim() ?? "";
+      const toolCalls = readToolCalls(data.message);
 
-      if (!content) {
+      if (content === "" && toolCalls.length === 0) {
         throw new OllamaError("Ollama response contained no content.", 502);
       }
 
-      return content;
+      return { text: content, toolCalls };
     } finally {
       release();
     }
@@ -827,7 +857,7 @@ function providerError(url: string, status: number, body: string): ModelProvider
 async function generateOpenAiResponse(
   options: OllamaGenerateOptions,
   llm: LlmTarget
-): Promise<string> {
+): Promise<ChatResult> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), config.ollama.chatTimeoutMs);
 
@@ -858,9 +888,13 @@ async function generateOpenAiResponse(
         eval_count: data.usage?.completion_tokens,
       });
 
-      const content = data.choices?.[0]?.message?.content?.trim();
-      if (!content) throw new ModelProviderError("the model provider's answer contained no content", 502);
-      return content;
+      const message = data.choices?.[0]?.message;
+      const content = message?.content?.trim() ?? "";
+      const toolCalls = readToolCalls(message);
+      if (content === "" && toolCalls.length === 0) {
+        throw new ModelProviderError("the model provider's answer contained no content", 502);
+      }
+      return { text: content, toolCalls };
     } finally {
       release();
     }
@@ -921,6 +955,38 @@ function generateOpenAiStream(
           number,
           { id?: string; name: string; arguments: string; extra_content?: unknown }
         >();
+        // Calls are keyed by the provider's index when it sends one. Gemini omits it and
+        // sends each parallel call whole, so a new id — or a fresh name with no id on the
+        // last call — opens a slot instead of merging into index 0. A bare argument
+        // fragment continues the last call, which is how a split arguments string arrives.
+        const byId = new Map<string, number>();
+        let nextIndex = 0;
+        let lastIndex: number | null = null;
+
+        const slotFor = (call: {
+          index?: number;
+          id?: string;
+          function?: { name?: string };
+        }): number => {
+          if (typeof call.index === "number") {
+            if (typeof call.id === "string" && call.id !== "") byId.set(call.id, call.index);
+            return call.index;
+          }
+          if (typeof call.id === "string" && call.id !== "") {
+            const known = byId.get(call.id);
+            if (known !== undefined) return known;
+            const index = nextIndex++;
+            byId.set(call.id, index);
+            return index;
+          }
+          if (typeof call.function?.name === "string" && call.function.name !== "") {
+            const last = lastIndex === null ? undefined : pending.get(lastIndex);
+            if (lastIndex === null || last === undefined || last.name !== "") return nextIndex++;
+            return lastIndex;
+          }
+          return lastIndex ?? nextIndex++;
+        };
+
         let buffer = "";
 
         const consume = (payload: string): boolean => {
@@ -952,7 +1018,7 @@ function generateOpenAiStream(
             streamController.enqueue(content);
           }
           for (const call of delta?.tool_calls ?? []) {
-            const index = call.index ?? 0;
+            const index = slotFor(call);
             const slot = pending.get(index) ?? { name: "", arguments: "" };
             if (typeof call.id === "string" && call.id !== "") slot.id = call.id;
             if (typeof call.function?.name === "string") slot.name += call.function.name;
@@ -962,6 +1028,7 @@ function generateOpenAiStream(
               objectOrUndefined(call.extra_content) ?? objectOrUndefined(call.function?.extra_content);
             if (extra !== undefined) slot.extra_content = extra;
             pending.set(index, slot);
+            lastIndex = index;
           }
           if (event.usage !== undefined) {
             logTokenCounts(llm.model, {
@@ -995,7 +1062,9 @@ function generateOpenAiStream(
 
         if (pending.size > 0) {
           for (const call of readToolCalls({
-            tool_calls: [...pending.values()].map((entry) => ({
+            tool_calls: [...pending.entries()]
+              .sort(([left], [right]) => left - right)
+              .map(([, entry]) => ({
               ...(entry.id === undefined ? {} : { id: entry.id }),
               ...(entry.extra_content === undefined
                 ? {}

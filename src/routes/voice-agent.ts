@@ -9,6 +9,7 @@ import {
 import { buildVoiceAgentPrompt, trimVoiceAgentHistory, type VoiceAgentMessage } from "@/lib/prompts";
 import {
   generateChatResponse,
+  generateChatResponseFull,
   generateChatResponseStream,
   type LlmTarget,
   parseGadgetTools,
@@ -77,6 +78,8 @@ export interface VoiceAgentDeps {
   transcribeAudio: typeof transcribeAudio;
   generateChatResponseStream: typeof generateChatResponseStream;
   generateChatResponse: typeof generateChatResponse;
+  /** The non-streaming answer as words or a call, for a fallback on a turn that offered tools. */
+  generateChatResponseFull: typeof generateChatResponseFull;
   synthesizeSpeechWithFallback: typeof synthesizeSpeechWithFallback;
   /**
    * Where this deployment's music library is, or empty for one that has none.
@@ -95,6 +98,7 @@ export function createVoiceAgentRouter(overrides: Partial<VoiceAgentDeps> = {}):
     transcribeAudio,
     generateChatResponseStream,
     generateChatResponse,
+    generateChatResponseFull,
     synthesizeSpeechWithFallback,
     libraryDir: config.music.libraryDir,
     ...overrides,
@@ -1044,15 +1048,30 @@ async function handleStream(
         // yielded nothing — and *not* when the emptiness is a tool call, which is a different
         // thing from a model that failed to speak: the fallback would put the same question to
         // the same model and be given the same call, and the turn would spend a second request
-        // learning nothing.
+        // learning nothing. On a turn that offered tools, the answer may still be a call, so
+        // the fallback asks with them and keeps both the words and the calls it gets back.
         if (calls.length === 0 && (streamEmpty || !finalText.trim())) {
           console.log("[VoiceAgent] Streaming yielded no text; falling back to non-streaming generateChatResponse");
-          finalText = await deps.generateChatResponse({
-            messages: prompt,
-            temperature: 0.7,
-            repeat_penalty: 1.2,
-            ...(llm ? { llm } : {}),
-          });
+          if (mayCall) {
+            const fallback = await deps.generateChatResponseFull({
+              messages: prompt,
+              temperature: 0.7,
+              repeat_penalty: 1.2,
+              tools,
+              ...(llm ? { llm } : {}),
+            });
+            finalText = fallback.text;
+            fallback.toolCalls.forEach((call, index) => {
+              calls.push({ ...call, id: call.id ?? `call_${rounds}_${index}` });
+            });
+          } else {
+            finalText = await deps.generateChatResponse({
+              messages: prompt,
+              temperature: 0.7,
+              repeat_penalty: 1.2,
+              ...(llm ? { llm } : {}),
+            });
+          }
         }
 
         if (calls.length === 0) break;

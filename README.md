@@ -261,6 +261,14 @@ call in the next request; Gemini 3 puts `thought_signature` there and refuses th
 turn without it. The metadata is never read, and the native path carries no such
 field.
 
+A provider that omits `tool_calls[].index` while streaming — Gemini does — is read
+by call id and name instead: a new id opens a call, a repeated id continues it, a
+fresh name on a call that already has one opens the next, and a bare argument
+fragment continues the last. Completed calls are replayed in index order. When a
+stream yields nothing, the non-streaming fallback asks with the same tool list and
+keeps a call the answer carries; a turn that offered no tools keeps the text-only
+fallback.
+
 The key travels in the request body, is used only to build the `Authorization`
 header, and is never logged.
 

@@ -189,6 +189,10 @@ function harness(
         nonStreaming.push(options.messages.map((m) => m.content).join("\n---\n"));
         return "";
       },
+      generateChatResponseFull: async (options) => {
+        nonStreaming.push(options.messages.map((m) => m.content).join("\n---\n"));
+        return { text: "", toolCalls: [] };
+      },
       synthesizeSpeechWithFallback: async (chunk, options) => {
         const call = synthCalls.length;
         synthCalls.push(chunk);

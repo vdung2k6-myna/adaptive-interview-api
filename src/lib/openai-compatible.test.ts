@@ -6,6 +6,7 @@ import type { AddressInfo } from "node:net";
 import { OllamaError } from "./errors";
 import {
   generateChatResponse,
+  generateChatResponseFull,
   generateChatResponseStream,
   type LlmTarget,
   type OllamaMessage,
@@ -210,6 +211,93 @@ describe("an OpenAI-compatible turn", () => {
     assert.deepEqual(result.getToolCalls(), [
       { function: { name: "bridge.play_music", arguments: {} } },
     ]);
+  });
+
+  it("separates parallel calls when the provider omits the index", async () => {
+    reset();
+    answer = {
+      status: 200,
+      contentType: "text/event-stream",
+      body:
+        'data: {"choices":[{"delta":{"tool_calls":[{"id":"call_a","function":{"name":"self.audio_speaker.set_volume","arguments":"{\\"volume\\":100}"}}]}}]}\n\n' +
+        'data: {"choices":[{"delta":{"tool_calls":[{"id":"call_b","function":{"name":"self.music.action","arguments":"{}"}}]}}]}\n\n' +
+        "data: [DONE]\n\n",
+    };
+
+    const result = generateChatResponseStream({ messages, llm: llm() });
+    await result.stream.getReader().read();
+
+    assert.deepEqual(result.getToolCalls(), [
+      {
+        id: "call_a",
+        function: { name: "self.audio_speaker.set_volume", arguments: { volume: 100 } },
+      },
+      { id: "call_b", function: { name: "self.music.action", arguments: {} } },
+    ]);
+  });
+
+  it("continues a call whose argument fragments carry no id or index", async () => {
+    reset();
+    answer = {
+      status: 200,
+      contentType: "text/event-stream",
+      body:
+        'data: {"choices":[{"delta":{"tool_calls":[{"id":"call_a","function":{"name":"bridge.play_music","arguments":"{\\"q\\""}}]}}]}\n\n' +
+        'data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":":\\"bolero\\"}"}}]}}]}\n\n' +
+        "data: [DONE]\n\n",
+    };
+
+    const result = generateChatResponseStream({ messages, llm: llm() });
+    await result.stream.getReader().read();
+
+    assert.deepEqual(result.getToolCalls(), [
+      { id: "call_a", function: { name: "bridge.play_music", arguments: { q: "bolero" } } },
+    ]);
+  });
+
+  it("returns a non-streaming call instead of failing on empty content", async () => {
+    reset();
+    answer = {
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: null,
+              tool_calls: [
+                {
+                  id: "call_a",
+                  type: "function",
+                  extra_content: { google: { thought_signature: "sig-123" } },
+                  function: {
+                    name: "self.audio_speaker.set_volume",
+                    arguments: '{"volume":100}',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      }),
+    };
+
+    const result = await generateChatResponseFull({ messages, llm: llm() });
+    assert.equal(result.text, "");
+    assert.deepEqual(result.toolCalls, [
+      {
+        id: "call_a",
+        extra_content: { google: { thought_signature: "sig-123" } },
+        function: { name: "self.audio_speaker.set_volume", arguments: { volume: 100 } },
+      },
+    ]);
+
+    // A caller that offered no tools still gets the old failure, not a silent empty string.
+    await assert.rejects(
+      () => generateChatResponse({ messages, llm: llm() }),
+      /contained no content/
+    );
   });
 
   it("replays provider metadata verbatim on the assistant call", async () => {
