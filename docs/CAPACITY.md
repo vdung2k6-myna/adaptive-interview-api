@@ -278,6 +278,11 @@ turns are refused and spend their retry budget waiting. Nothing fails — that i
 is for — but the first word arrives later than it should. Shorter agent prompts generate
 faster, which pushes the figure down; the estimate should be checked against the account.
 
+The runtime bounds transcription at `AUDIO_TRANSCRIPTION_CONCURRENCY` (default 4, the count
+this cadence needs). A burst waits there in arrival order; a turn that ends while queued sends
+nothing. The bound is per process, so an API replicated behind a load balancer would need it
+divided across instances — and the API cannot be replicated as it stands.
+
 **The bridge is a tier the interview path does not have.** For gadget users it holds one
 device socket each — 24 kHz audio, VAD, Opus, one upload per turn — in a single Node service on
 this machine. It has never been run above one device. Measure it with simulated devices before

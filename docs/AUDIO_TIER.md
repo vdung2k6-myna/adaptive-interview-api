@@ -136,6 +136,13 @@ The proxy balances across instances with least-connections. Whether two
 instances fit on one card is a VRAM and compute-contention question — measure
 it on the target card before choosing a count.
 
+The runtime bounds how many transcriptions it sends at once
+(`AUDIO_TRANSCRIPTION_CONCURRENCY`, default 4). Set it to the number of audiocpp
+instances behind the proxy: a burst then waits in the runtime, in arrival order and
+cancellable with its turn, instead of opening one request per turn and letting each
+burn its 60 s timeout inside the engine's own queue. A turn that ends while queued
+sends no request at all.
+
 The TTS engines and gateway can be deployed as a second compose project on a
 CPU host; point `AUDIO_GATEWAY_URL` at it. The service definitions carry no
 shared host-local path, so the move changes addresses, not code.

@@ -608,7 +608,8 @@ async function handleStream(
         audioFile.path,
         stt?.model,
         resolveSttLanguage(language),
-        stt === undefined ? undefined : { baseUrl: stt.baseUrl, apiKey: stt.apiKey }
+        stt === undefined ? undefined : { baseUrl: stt.baseUrl, apiKey: stt.apiKey },
+        abortController.signal
       );
       userText = sttResult.text;
     } else if (textInput) {

@@ -13,6 +13,7 @@ import evaluationsRoutes from "./routes/evaluations";
 import voiceRoutes from "./routes/voice";
 import voiceAgentRoutes from "./routes/voice-agent";
 import personasRoutes from "./routes/personas";
+import metricsRoutes from "./routes/metrics";
 import musicRoutes from "./routes/music";
 import providersRoutes from "./routes/providers";
 import mcpRoutes from "./routes/mcp";
@@ -115,6 +116,7 @@ export function createApp(): express.Express {
   app.use("/api", apiAuthMiddleware);
 
   // Routes
+  app.use("/api/metrics", metricsRoutes);
   app.use("/api/candidates", candidatesRoutes);
   app.use("/api/positions", positionsRoutes);
   app.use("/api/sessions", sessionsRoutes);

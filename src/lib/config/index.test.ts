@@ -120,6 +120,16 @@ describe("the bounds work under load is held to", () => {
       );
     }
   });
+
+  it("bounds transcriptions so a burst waits at the runtime", () => {
+    for (const [name, config] of ENVIRONMENTS) {
+      assert.equal(
+        config.audio.transcriptionConcurrency,
+        4,
+        `${name}: ${envNote("AUDIO_TRANSCRIPTION_CONCURRENCY")}`
+      );
+    }
+  });
 });
 
 describe("the audio defaults an unconfigured deployment runs on", () => {

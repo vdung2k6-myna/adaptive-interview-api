@@ -10,6 +10,11 @@ import { createSemaphore, type ReleaseSlot } from "./semaphore";
  */
 const modelSlots = createSemaphore(config.ollama.maxConcurrentRequests);
 
+/** How many model requests are in flight and waiting, for the metrics route. */
+export function modelQueueStats(): { inFlight: number; waiting: number } {
+  return { inFlight: modelSlots.inFlight(), waiting: modelSlots.waiting() };
+}
+
 /** Backoff starts here and is capped here; the whole sequence is bounded by the
  *  retry deadline, so this cap only stops the jitter from spending it in one go. */
 const RETRY_BASE_DELAY_MS = 250;

@@ -99,7 +99,8 @@ export class AudioCppClient {
     audioPath: string,
     model?: string,
     language?: string,
-    target?: ProviderTarget
+    target?: ProviderTarget,
+    signal?: AbortSignal
   ): Promise<TranscriptionResult> {
     const baseUrl = (target?.baseUrl ?? this.baseUrl).replace(/\/$/, "");
     if (baseUrl === "") {
@@ -125,13 +126,17 @@ export class AudioCppClient {
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    // The caller's turn may end while this request is queued or in flight; its signal
+    // is combined with the request's own timeout rather than replacing it.
+    const requestSignal =
+      signal === undefined ? controller.signal : AbortSignal.any([controller.signal, signal]);
 
     try {
       const res = await fetch(`${baseUrl}/v1/audio/transcriptions`, {
         method: "POST",
         headers,
         body: formData,
-        signal: controller.signal,
+        signal: requestSignal,
       });
       clearTimeout(timeout);
 

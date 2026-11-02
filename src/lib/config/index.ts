@@ -83,6 +83,14 @@ export interface AppConfig {
      */
     synthesisConcurrency: number;
     /**
+     * How many transcription requests this process may have in flight at once.
+     *
+     * Set to the number of STT instances the deployment runs. A burst then waits
+     * here, in arrival order, instead of opening a request per turn and letting
+     * each one burn its own timeout behind the engine's queue.
+     */
+    transcriptionConcurrency: number;
+    /**
      * How long a streamed turn's per-segment files stay on disk after they are
      * written. It only has to outlast a client's fetch of a segment it has just
      * been told about — seconds — so the value is margin against a slow fetch,

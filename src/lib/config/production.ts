@@ -61,6 +61,7 @@ export const productionConfig: AppConfig = {
     // enough that one long reply cannot occupy the gateway. The gateway was
     // measured at 23x real-time and serializing (`docs/CAPACITY.md`).
     synthesisConcurrency: parsePositiveInt(process.env.AUDIO_SYNTHESIS_CONCURRENCY, 4),
+    transcriptionConcurrency: parsePositiveInt(process.env.AUDIO_TRANSCRIPTION_CONCURRENCY, 4),
     // 5 minutes — half development's, because what multiplies here is disk:
     // window times turns in flight. Still two orders of magnitude more than a
     // segment needs to survive being fetched, and a window set too short fails
