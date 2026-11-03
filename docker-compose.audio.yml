@@ -67,6 +67,24 @@ services:
     networks:
       - audio
 
+  tts-proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    # No depends_on for the engines, for the gateway's reason: the proxy must start
+    # and serve whichever engines exist, and report the rest as unhealthy upstreams.
+    volumes:
+      - ./tts-proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+    healthcheck:
+      # The liveness listener, not an engine's: an engine being down is a degraded
+      # tier, not a reason to have compose restart the proxy.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - audio
+
   gateway:
     build:
       context: ./audio-gateway
@@ -75,9 +93,11 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: "8082"
-      KOKORO_URL: http://kokoro:8081
-      PIPER_URL: http://piper:8083
-      SUPERTONIC_URL: http://supertonic:8084
+      # Each engine address is the proxy listener, so a replica count is a compose
+      # scale on that engine and the gateway never learns about it.
+      KOKORO_URL: http://tts-proxy:8091
+      PIPER_URL: http://tts-proxy:8093
+      SUPERTONIC_URL: http://tts-proxy:8094
     ports:
       - "${AUDIO_BIND_ADDR:-127.0.0.1}:8082:8082"
     healthcheck:

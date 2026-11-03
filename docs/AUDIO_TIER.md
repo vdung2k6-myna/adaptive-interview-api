@@ -149,8 +149,30 @@ hold at once: the gateway serves one request at a time, so a larger bound only
 lengthens the queue it times out from. The queue waits at the runtime, in arrival
 order and cancellable with its turn, and both counts are reported as `tts` on
 `GET /api/metrics`. The reference deployment runs one gateway and one instance of
-each engine; adding capacity is a deployment change behind `AUDIO_GATEWAY_URL`, not
-a runtime change.
+each engine; adding capacity is a replica count behind `tts-proxy`, not a runtime
+change.
+
+### Reply synthesis
+
+The gateway holds one address per engine, and each address is a `tts-proxy`
+listener, so an engine replica is added the same way as STT:
+
+```bash
+docker compose -f docker-compose.audio.yml up -d --scale piper=2
+docker compose -f docker-compose.audio.yml restart tts-proxy
+```
+
+The restart is required when the replica is created after the proxy started:
+Caddy resolves each engine's name once at startup, so a new replica is not in its
+upstream list until the proxy reloads. Starting the tier with `--scale` already in
+place needs no restart. `least_conn` spreads requests across the replicas, and a
+replica whose health check fails leaves rotation — six requests issued while one
+replica was stopped all succeeded on the other.
+
+Measured on this 16-core host: one piper replica returns an 8.5 s sentence in
+~366 ms standalone (~23x real-time); sharing the host during the 100-device soak it
+was ~1.3 s per reply segment, so two replicas roughly halve that wall. The replica
+count that completes the cadence is recorded in [CAPACITY.md](CAPACITY.md).
 
 The TTS engines and gateway can be deployed as a second compose project on a
 CPU host; point `AUDIO_GATEWAY_URL` at it. The service definitions carry no

@@ -227,14 +227,21 @@ synthesis gained a process-wide admission.
 | transcription bound only | STT, local model | 18/100 | 72.1 / 132.5 s | 82 model timeouts (model on CPU) |
 | transcription bound only | STT, cloud model | 39/100 | 35.8 / 66.6 s | 61 gateway 504s |
 | both bounds | STT + TTS, cloud model | 35/100 | 37.3 / 151.3 s | 65 device timeouts while the ordered TTS queue drained |
+| both bounds + piper, 2 replicas | STT + TTS, cloud model, piper | **100/100** | **12.1 / 22.1 s** | — |
 
-The synthesis admission removed the gateway's refusals: in the last run the gateway
-answered 0 x 504 and 128 x 200 and never carried more than 4 requests, and the API
-logged no STT, model or gateway failure. Every turn was transcribed and answered.
-The 65 failures are the device timeout: one serialized gateway produces roughly 1.3 s
-per synthesis here, so ~128 syntheses take ~166 s — longer than a device waits.
+The synthesis admission removed the gateway's refusals: in the first bound run the
+gateway answered 0 x 504 and 128 x 200 and never carried more than 4 requests, and the
+API logged no STT, model or gateway failure. Every turn was transcribed and answered.
+The 65 failures there were the device timeout: one serialized gateway produces roughly
+1.3 s per synthesis, so ~128 syntheses take ~166 s — longer than a device waits.
 **Queueing converts refusals into an ordered wait; it does not add throughput.**
-Serving 100 turns at this cadence needs more audio-tier capacity, not a larger bound.
+
+The runs also exposed an engine choice. The deployment's default TTS provider named
+supertonic (~3.2x real-time, serialized), not piper (~23x), so every turn used the slow
+engine and scaling piper changed nothing. With the default on piper and two piper
+replicas behind `tts-proxy`, the same soak answers **100/100 in 59.9 s**, first audio
+p50 12.1 s / p95 22.1 s, the synthesis queue peaking at 9 waiting, no gateway 5xx and no
+API error. Replicas: two on this 16-core host; one on the pilot's 2-vCPU audio host.
 
 ---
 
