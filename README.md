@@ -27,6 +27,7 @@ Express Server (:4000)
 ├── /api/evaluations     → AI scoring + calibration
 ├── /api/voice           → Voice interview pipeline
 ├── /api/voice-agent     → Ephemeral voice agent chat (prefetch + material replies)
+├── /api/metrics         → Queue depth for the model, transcription and synthesis (counts only)
 ├── /api/personas        → Persona catalog (read-only, seeded)
 ├── /api/music           → The music library the deployment holds (read-only)
 ├── /api/mcp             → MCP analytics SSE
@@ -102,6 +103,7 @@ curl http://localhost:4000/health
 | `AUDIOCPP_BASE_URL` | No | audio.cpp STT server URL. Unset means the deployment runs no transcription service; a turn then uses a profile or fails naming the kind |
 | `AUDIO_GATEWAY_URL` | No | Audio Gateway TTS server URL. Unset means the deployment runs no synthesis service; nothing reaches localhost on its behalf |
 | `AUDIO_SYNTHESIS_CONCURRENCY` | No | Syntheses one turn may have in flight (default: `4`). The gateway serves one request at a time, so an unbounded fan-out from one long reply would put every other turn's audio behind its backlog. See [CAPACITY.md](docs/CAPACITY.md) |
+| `AUDIO_SYNTHESIS_ADMISSION` | No | Syntheses every turn in this process shares at once (default: `4`). A burst of turns waits here, in arrival order, instead of opening a request each against a serialized gateway. Reported as `tts` on `/api/metrics`. See [CAPACITY.md](docs/CAPACITY.md) |
 | `TRANSCRIPT_BUFFER_RETENTION_MS` | No | How long a turn's windowed transcript and audio are held before the turn must claim them (default: `900000`, 15 minutes). Long enough to outlast the longest answer the transport accepts; short enough that a turn nobody submitted is reclaimed |
 | `DEFAULT_TTS_ENGINE` | No | The legacy engine path's fallback: `kokoro`, `piper`, or `supertonic`. Unset means no engine, and only a turn that names one is synthesized |
 | `DEFAULT_VOICE` | No | Voice ID used when the engine- and language-specific voice is unset (default: `bryce`) |

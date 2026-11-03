@@ -1,10 +1,14 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import type { Server } from "node:http";
+import { once } from "node:events";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import express from "express";
 
 import { createMetricsRouter } from "./metrics";
 import { apiAuthMiddleware } from "../middleware/auth";
+import { AudioGatewayClient, synthesisQueueStats } from "../lib/audio/client";
+import config from "@/lib/config";
 
 /** Armed deliberately: an unset token disables authentication, which would make
  *  the refusal below pass for the wrong reason. */
@@ -18,6 +22,7 @@ interface QueueCounts {
 interface MetricsBody {
   ollama: QueueCounts;
   stt: QueueCounts;
+  tts: QueueCounts;
 }
 
 async function withServer(
@@ -58,14 +63,14 @@ describe("GET /api/metrics", () => {
     });
   });
 
-  it("reports both queues as counts to an authorised caller", async () => {
+  it("reports every queue as counts to an authorised caller", async () => {
     await withServer(async (url, authorized) => {
       const res = await authorized();
       assert.equal(res.status, 200);
       const body = (await res.json()) as MetricsBody;
 
-      assert.deepEqual(Object.keys(body).sort(), ["ollama", "stt"]);
-      for (const queue of [body.ollama, body.stt]) {
+      assert.deepEqual(Object.keys(body).sort(), ["ollama", "stt", "tts"]);
+      for (const queue of [body.ollama, body.stt, body.tts]) {
         assert.deepEqual(Object.keys(queue).sort(), ["inFlight", "waiting"]);
         assert.equal(Number.isInteger(queue.inFlight), true);
         assert.equal(Number.isInteger(queue.waiting), true);
@@ -73,4 +78,51 @@ describe("GET /api/metrics", () => {
       }
     });
   });
+
+  it("reports the synthesis queue while replies are being spoken", async () => {
+    await withServer(async (url, authorized) => {
+      // A gateway that holds every request open, so each occupies an admission
+      // slot for as long as the test needs it to.
+      const gateway = createServer((_req, _res) => {});
+      gateway.listen(0, "127.0.0.1");
+      await once(gateway, "listening");
+      const baseUrl = `http://127.0.0.1:${(gateway.address() as AddressInfo).port}`;
+
+      const bound = config.audio.synthesisAdmission;
+      const controllers: AbortController[] = [];
+      try {
+        for (let index = 0; index < bound; index++) {
+          const controller = new AbortController();
+          controllers.push(controller);
+          new AudioGatewayClient()
+            .synthesize("hello", {
+              baseUrl,
+              engine: "kokoro",
+              voice: "example_voice",
+              signal: controller.signal,
+            })
+            .catch(() => {});
+        }
+        await waitFor(() => synthesisQueueStats().inFlight === bound, "the bound to be in flight");
+
+        const res = await authorized();
+        const body = (await res.json()) as MetricsBody;
+        assert.equal(body.tts.inFlight, bound, "the report shows the syntheses in flight");
+        assert.equal(body.tts.waiting, 0, "nothing is queued at the bound itself");
+      } finally {
+        for (const controller of controllers) controller.abort();
+        gateway.closeAllConnections();
+        await new Promise<void>((resolve) => gateway.close(() => resolve()));
+        await waitFor(() => synthesisQueueStats().inFlight === 0, "the slots to be released");
+      }
+    });
+  });
 });
+
+async function waitFor(condition: () => boolean, what: string, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}

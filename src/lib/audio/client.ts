@@ -10,6 +10,7 @@
 
 import { openAsBlob } from "node:fs";
 import config from "@/lib/config";
+import { createSemaphore } from "@/lib/semaphore";
 
 export interface TranscriptionResult {
   text: string;
@@ -44,6 +45,22 @@ export interface SynthesizeOptions {
 export interface ProviderTarget {
   baseUrl?: string;
   apiKey?: string;
+}
+
+/**
+ * The synthesis admission bound, shared by every turn in this process.
+ *
+ * A turn already bounds its own fan-out (`config.audio.synthesisConcurrency`), but
+ * a burst of turns still opened one request each against a gateway that serves them
+ * one at a time. Under 100 turns the gateway answered 504 for the ones behind its
+ * queue. This bound is the process's, so the queue sits where it can be observed and
+ * cancelled rather than inside the gateway.
+ */
+const synthesisSlots = createSemaphore(config.audio.synthesisAdmission);
+
+/** How many syntheses are in flight and waiting, for the metrics route. */
+export function synthesisQueueStats(): { inFlight: number; waiting: number } {
+  return { inFlight: synthesisSlots.inFlight(), waiting: synthesisSlots.waiting() };
 }
 
 /**
@@ -174,9 +191,12 @@ export class AudioGatewayClient {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
 
-  constructor() {
+  constructor(options?: { timeoutMs?: number }) {
     this.baseUrl = config.audio.gatewayUrl.replace(/\/$/, "");
-    this.timeoutMs = config.audio.timeoutMs;
+    // The deployment's 60 s unless a test names its own: the admitted request's
+    // timeout is what a test has to observe, and waiting a real minute for it
+    // would make the test a soak.
+    this.timeoutMs = options?.timeoutMs ?? config.audio.timeoutMs;
   }
 
   /**
@@ -275,52 +295,60 @@ export class AudioGatewayClient {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (options?.apiKey) headers.Authorization = `Bearer ${options.apiKey}`;
 
-    const timeoutController = new AbortController();
-    const timeout = setTimeout(() => timeoutController.abort(), this.timeoutMs);
-
-    // Combine the per-request timeout with the caller-provided disconnect signal.
-    const signals: AbortSignal[] = [timeoutController.signal];
-    if (options?.signal) {
-      signals.push(options.signal);
-    }
-    const signal = AbortSignal.any(signals);
-
+    // Wait for a slot before the request is built, so its timeout starts when it
+    // is sent rather than while it waits for its turn at the bound, and a turn
+    // that ends while queued leaves the queue without sending anything.
+    const release = await synthesisSlots.acquire(options?.signal);
     try {
-      const res = await fetch(`${baseUrl}/v1/audio/speech`, {
-        method: "POST",
-        headers,
-        body,
-        signal,
-      });
-      clearTimeout(timeout);
+      const timeoutController = new AbortController();
+      const timeout = setTimeout(() => timeoutController.abort(), this.timeoutMs);
 
-      if (!res.ok) {
-        const text = await res.text().catch(() => "Unknown error");
-        throw new Error(`TTS failed (${res.status}): ${text}`);
+      // Combine the per-request timeout with the caller-provided disconnect signal.
+      const signals: AbortSignal[] = [timeoutController.signal];
+      if (options?.signal) {
+        signals.push(options.signal);
       }
+      const signal = AbortSignal.any(signals);
 
-      const contentType = res.headers.get("content-type") || "unknown";
-      const arrayBuffer = await res.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
+      try {
+        const res = await fetch(`${baseUrl}/v1/audio/speech`, {
+          method: "POST",
+          headers,
+          body,
+          signal,
+        });
+        clearTimeout(timeout);
 
-      // The bridge can only read WAV, so an answer in another format is refused
-      // here rather than discovered downstream as audio nobody can play.
-      if (
-        buffer.length < 12 ||
-        buffer.toString("ascii", 0, 4) !== "RIFF" ||
-        buffer.toString("ascii", 8, 12) !== "WAVE"
-      ) {
-        throw new Error(`TTS provider answered ${contentType}, not WAV`);
+        if (!res.ok) {
+          const text = await res.text().catch(() => "Unknown error");
+          throw new Error(`TTS failed (${res.status}): ${text}`);
+        }
+
+        const contentType = res.headers.get("content-type") || "unknown";
+        const arrayBuffer = await res.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+
+        // The bridge can only read WAV, so an answer in another format is refused
+        // here rather than discovered downstream as audio nobody can play.
+        if (
+          buffer.length < 12 ||
+          buffer.toString("ascii", 0, 4) !== "RIFF" ||
+          buffer.toString("ascii", 8, 12) !== "WAVE"
+        ) {
+          throw new Error(`TTS provider answered ${contentType}, not WAV`);
+        }
+
+        // The gateway levels the engines against each other: it is where the
+        // engine is known, and every caller's audio comes through it. A caller
+        // applying a volume of its own would be a second, uninformed opinion.
+        console.log(`[AudioGateway] synthesize returned ${buffer.length} bytes content-type=${contentType}`);
+        return buffer;
+      } catch (err) {
+        clearTimeout(timeout);
+        throw err;
       }
-
-      // The gateway levels the engines against each other: it is where the
-      // engine is known, and every caller's audio comes through it. A caller
-      // applying a volume of its own would be a second, uninformed opinion.
-      console.log(`[AudioGateway] synthesize returned ${buffer.length} bytes content-type=${contentType}`);
-      return buffer;
-    } catch (err) {
-      clearTimeout(timeout);
-      throw err;
+    } finally {
+      release();
     }
   }
 }

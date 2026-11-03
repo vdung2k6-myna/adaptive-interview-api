@@ -62,6 +62,10 @@ export const developmentConfig: AppConfig = {
     // measured at 23x real-time and serializing (`docs/CAPACITY.md`).
     synthesisConcurrency: parsePositiveInt(process.env.AUDIO_SYNTHESIS_CONCURRENCY, 4),
     transcriptionConcurrency: parsePositiveInt(process.env.AUDIO_TRANSCRIPTION_CONCURRENCY, 4),
+    // The process-wide counterpart: how many turns may reach the gateway at
+    // once. The gateway serializes, so more than this only lengthens the queue
+    // it times out from (`docs/CAPACITY.md`).
+    synthesisAdmission: parsePositiveInt(process.env.AUDIO_SYNTHESIS_ADMISSION, 4),
     // 10 minutes — the generous end of "a few minutes". Disk here is one
     // developer's, and the case a tight window would break is exactly the one
     // that happens on a dev machine: a tab left open across a restart, still

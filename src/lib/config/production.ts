@@ -62,6 +62,10 @@ export const productionConfig: AppConfig = {
     // measured at 23x real-time and serializing (`docs/CAPACITY.md`).
     synthesisConcurrency: parsePositiveInt(process.env.AUDIO_SYNTHESIS_CONCURRENCY, 4),
     transcriptionConcurrency: parsePositiveInt(process.env.AUDIO_TRANSCRIPTION_CONCURRENCY, 4),
+    // The process-wide counterpart: how many turns may reach the gateway at
+    // once. The gateway serializes, so more than this only lengthens the queue
+    // it times out from (`docs/CAPACITY.md`).
+    synthesisAdmission: parsePositiveInt(process.env.AUDIO_SYNTHESIS_ADMISSION, 4),
     // 5 minutes — half development's, because what multiplies here is disk:
     // window times turns in flight. Still two orders of magnitude more than a
     // segment needs to survive being fetched, and a window set too short fails

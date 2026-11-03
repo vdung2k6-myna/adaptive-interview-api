@@ -143,6 +143,15 @@ cancellable with its turn, instead of opening one request per turn and letting e
 burn its 60 s timeout inside the engine's own queue. A turn that ends while queued
 sends no request at all.
 
+The runtime bounds reply synthesis the same way (`AUDIO_SYNTHESIS_ADMISSION`,
+default 4, shared by every turn in the process). Set it to what the gateway can
+hold at once: the gateway serves one request at a time, so a larger bound only
+lengthens the queue it times out from. The queue waits at the runtime, in arrival
+order and cancellable with its turn, and both counts are reported as `tts` on
+`GET /api/metrics`. The reference deployment runs one gateway and one instance of
+each engine; adding capacity is a deployment change behind `AUDIO_GATEWAY_URL`, not
+a runtime change.
+
 The TTS engines and gateway can be deployed as a second compose project on a
 CPU host; point `AUDIO_GATEWAY_URL` at it. The service definitions carry no
 shared host-local path, so the move changes addresses, not code.

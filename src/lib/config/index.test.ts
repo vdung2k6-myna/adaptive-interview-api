@@ -130,6 +130,22 @@ describe("the bounds work under load is held to", () => {
       );
     }
   });
+
+  it("bounds the syntheses every turn shares so a burst waits at the runtime", () => {
+    for (const [name, config] of ENVIRONMENTS) {
+      assert.equal(
+        config.audio.synthesisAdmission,
+        4,
+        `${name}: ${envNote("AUDIO_SYNTHESIS_ADMISSION")}`
+      );
+    }
+  });
+
+  it("refuses a synthesis admission that is not positive", () => {
+    assert.equal(parsePositiveInt("0", 4), 4, "zero falls back rather than admitting nothing");
+    assert.equal(parsePositiveInt("-2", 4), 4, "a negative bound falls back");
+    assert.equal(parsePositiveInt("2", 4), 2, "an explicit bound overrides the default");
+  });
 });
 
 describe("the audio defaults an unconfigured deployment runs on", () => {

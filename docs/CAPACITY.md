@@ -54,8 +54,13 @@ One 8.5 s sentence (33 words):
 | 8 | 2.76 s | 366 ... 2761 |
 
 **~23.3x real-time, also serialized.** Per turn the cost is small — about 18
-chunks is 3 s of service occupancy — but the fan-out is not capped by the API, so
-a reply boundary releases every pending chunk at once.
+chunks is 3 s of service occupancy. Two bounds keep that serialization from
+becoming a wall: each turn caps its own fan-out at `AUDIO_SYNTHESIS_CONCURRENCY`,
+and the process admits at most `AUDIO_SYNTHESIS_ADMISSION` (default 4) syntheses
+across every turn. Before the second bound existed, a burst opened one request per
+turn and the gateway answered 504 for the ones behind its queue. The reference
+deployment runs one gateway process and one instance of each engine (kokoro,
+piper, supertonic), each serving one request at a time.
 
 ### LLM — Ollama cloud model
 
@@ -210,6 +215,27 @@ completed in both tables — the retry turns a refusal into a wait instead of a 
 tails at 16 and 24 tracks the model's queue, which is what `OLLAMA_MAX_CONCURRENT_REQUESTS`
 and the retry budget bound; raising them moves the queue upstream to the account's own 429.
 
+### The 100-turn cadence soak (2026-11-03)
+
+`gadget-bridge-audio-soak` at 100 devices, one turn each, 25 s cadence, on this host.
+Each run found the next wall; the last is the reference deployment shape after reply
+synthesis gained a process-wide admission.
+
+| run | bounds / model | answered | first audio p50 / p95 | what failed |
+| --- | --- | --- | --- | --- |
+| before the changes | none, local model | 23/100 | 109.6 / 172.9 s | STT timeouts while queued |
+| transcription bound only | STT, local model | 18/100 | 72.1 / 132.5 s | 82 model timeouts (model on CPU) |
+| transcription bound only | STT, cloud model | 39/100 | 35.8 / 66.6 s | 61 gateway 504s |
+| both bounds | STT + TTS, cloud model | 35/100 | 37.3 / 151.3 s | 65 device timeouts while the ordered TTS queue drained |
+
+The synthesis admission removed the gateway's refusals: in the last run the gateway
+answered 0 x 504 and 128 x 200 and never carried more than 4 requests, and the API
+logged no STT, model or gateway failure. Every turn was transcribed and answered.
+The 65 failures are the device timeout: one serialized gateway produces roughly 1.3 s
+per synthesis here, so ~128 syntheses take ~166 s — longer than a device waits.
+**Queueing converts refusals into an ordered wait; it does not add throughput.**
+Serving 100 turns at this cadence needs more audio-tier capacity, not a larger bound.
+
 ---
 
 ## What a workload costs
@@ -282,6 +308,13 @@ The runtime bounds transcription at `AUDIO_TRANSCRIPTION_CONCURRENCY` (default 4
 this cadence needs). A burst waits there in arrival order; a turn that ends while queued sends
 nothing. The bound is per process, so an API replicated behind a load balancer would need it
 divided across instances — and the API cannot be replicated as it stands.
+
+Reply synthesis has its own process-wide bound, `AUDIO_SYNTHESIS_ADMISSION` (default 4). The
+gateway serves one request at a time at ~366 ms per 8.5 s sentence (~23x real-time), so four in
+flight keeps its own queue to about a second of work; the queue for everything beyond waits at
+the runtime, ordered and cancellable with its turn. Both counts are reported as `tts` on
+`GET /api/metrics`. Adding audio-tier capacity is a deployment change behind
+`AUDIO_GATEWAY_URL`; the runtime reaches it without a code change.
 
 **The bridge is a tier the interview path does not have.** For gadget users it holds one
 device socket each — 24 kHz audio, VAD, Opus, one upload per turn — in a single Node service on

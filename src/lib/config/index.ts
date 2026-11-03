@@ -91,6 +91,16 @@ export interface AppConfig {
      */
     transcriptionConcurrency: number;
     /**
+     * How many reply syntheses this process may have in flight at once, across
+     * every turn.
+     *
+     * Set to the number of syntheses the gateway is asked to hold at once. A
+     * burst of turns then waits here, in arrival order, instead of opening a
+     * request per turn and letting the gateway time out the ones behind its own
+     * serial queue.
+     */
+    synthesisAdmission: number;
+    /**
      * How long a streamed turn's per-segment files stay on disk after they are
      * written. It only has to outlast a client's fetch of a segment it has just
      * been told about — seconds — so the value is margin against a slow fetch,
