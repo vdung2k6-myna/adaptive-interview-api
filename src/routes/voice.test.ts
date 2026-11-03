@@ -1,6 +1,6 @@
 import { afterEach, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import type { Server } from "node:http";
+import { createServer, type Server } from "node:http";
 import { readFile, readdir } from "node:fs/promises";
 import express from "express";
 import config from "@/lib/config";
@@ -830,3 +830,75 @@ function windowFormFor(
   form.append("language", "english");
   return form;
 }
+
+describe("POST /api/voice/speak — the provider a turn names", () => {
+  /** A minimal 16 kHz mono WAV, which is all the route hands back. */
+  function wav(): Buffer {
+    const samples = Buffer.alloc(320);
+    const header = Buffer.alloc(44);
+    header.write("RIFF", 0);
+    header.writeUInt32LE(36 + samples.length, 4);
+    header.write("WAVE", 8);
+    header.write("fmt ", 12);
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20);
+    header.writeUInt16LE(1, 22);
+    header.writeUInt32LE(16000, 24);
+    header.writeUInt32LE(32000, 28);
+    header.writeUInt16LE(2, 32);
+    header.writeUInt16LE(16, 34);
+    header.write("data", 36);
+    header.writeUInt32LE(samples.length, 40);
+    return Buffer.concat([header, samples]);
+  }
+
+  it("speaks with the provider it is handed and refuses a half one", async () => {
+    const audio = wav();
+    const paths: string[] = [];
+    const stub = createServer((req, res) => {
+      paths.push(req.url ?? "");
+      res.writeHead(200, { "content-type": "audio/wav" });
+      res.end(audio);
+    });
+    await new Promise<void>((resolve) => stub.listen(0, "127.0.0.1", () => resolve()));
+    const stubAddress = stub.address();
+    assert.ok(stubAddress !== null && typeof stubAddress === "object");
+    const provider = `http://127.0.0.1:${stubAddress.port}`;
+
+    const app = express();
+    app.use(express.json());
+    app.use("/api/voice", createVoiceRouter({}));
+    const server = await new Promise<Server>((resolve) => {
+      const bound = app.listen(0, "127.0.0.1", () => resolve(bound));
+    });
+    const port = (server.address() as { port: number }).port;
+    const speak = (body: unknown): Promise<Response> =>
+      fetch(`http://127.0.0.1:${port}/api/voice/speak`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+    try {
+      const ok = await speak({
+        text: "xin chao",
+        language: "vietnamese",
+        ttsBaseUrl: provider,
+        ttsModel: "piper",
+        ttsVoice: "v",
+      });
+      assert.equal(ok.status, 200);
+      assert.ok(paths.includes("/v1/audio/speech"), `the provider was called: ${paths.join(", ")}`);
+      assert.equal((await ok.arrayBuffer()).byteLength, audio.length);
+
+      const half = await speak({ text: "xin chao", ttsBaseUrl: provider });
+      assert.equal(half.status, 400);
+      assert.match(await half.text(), /ttsModel is required with ttsBaseUrl/);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      stub.closeAllConnections();
+      await new Promise<void>((resolve) => stub.close(() => resolve()));
+    }
+  });
+});

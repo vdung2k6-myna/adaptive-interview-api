@@ -1213,11 +1213,25 @@ router.post("/speak", async (req, res) => {
   res.on("close", onDisconnect);
 
   try {
-    const { text, voice, ttsProfileId, language: requestLanguage } = req.body as {
+    const {
+      text,
+      voice,
+      ttsProfileId,
+      language: requestLanguage,
+      ttsBaseUrl,
+      ttsModel,
+      ttsVoice,
+      ttsApiKey,
+    } = req.body as {
       text?: string;
       voice?: string;
       ttsProfileId?: string;
       language?: string;
+      /** An explicit provider, used instead of resolving the catalog. */
+      ttsBaseUrl?: string;
+      ttsModel?: string;
+      ttsVoice?: string;
+      ttsApiKey?: string;
     };
 
     if (!text || typeof text !== "string") {
@@ -1227,14 +1241,36 @@ router.post("/speak", async (req, res) => {
 
     const resolvedLanguage: "english" | "vietnamese" =
       requestLanguage === "vietnamese" ? "vietnamese" : "english";
-    const sessionVoice = resolveSessionVoice({ ttsProfileId }, resolvedLanguage);
-    if ("error" in sessionVoice) {
-      res.status(503).json({ error: sessionVoice.error });
-      return;
+
+    // A caller outside a session (the bridge's spoken calibration) holds the provider
+    // fields a turn is sent with and not the console's profile row id. Naming them is
+    // the same voice the gadget speaks with; naming a base URL without a model is a
+    // refusal rather than a silent fall back to another voice.
+    const explicitBase = (ttsBaseUrl ?? "").trim();
+    const explicitModel = (ttsModel ?? "").trim();
+    let options: SynthesizeOptions;
+    if (explicitBase !== "") {
+      if (explicitModel === "") {
+        res.status(400).json({ error: "ttsModel is required with ttsBaseUrl" });
+        return;
+      }
+      options = {
+        baseUrl: explicitBase,
+        model: explicitModel,
+        voice: (ttsVoice ?? "").trim() || config.audio.defaultVoice,
+        ...(ttsApiKey ? { apiKey: ttsApiKey } : {}),
+      };
+    } else {
+      const sessionVoice = resolveSessionVoice({ ttsProfileId }, resolvedLanguage);
+      if ("error" in sessionVoice) {
+        res.status(503).json({ error: sessionVoice.error });
+        return;
+      }
+      options = sessionVoice.options;
     }
 
     const result = await synthesizeLongText(text, {
-      ...sessionVoice.options,
+      ...options,
       ...(voice ? { voice } : {}),
       signal: abortController.signal,
     });
