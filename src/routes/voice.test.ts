@@ -1,9 +1,10 @@
-import { before, describe, it } from "node:test";
+import { afterEach, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { Server } from "node:http";
 import { readFile, readdir } from "node:fs/promises";
 import express from "express";
 import config from "@/lib/config";
+import type { SynthesizeOptions } from "@/lib/audio";
 import { UPLOAD_TEMP_DIR } from "../lib/upload";
 import { turnTranscripts } from "../lib/turn-transcript";
 import { writeWavHeader } from "../lib/audio/wav-utils";
@@ -21,6 +22,9 @@ interface Harness {
   /** The text of every chunk the route asked to synthesize, in order — what the
    * route actually spoke, which is not the same claim as what it emitted. */
   calls: string[];
+  /** The options each chunk was synthesized with, so a test can see which
+   * provider the route chose rather than only that it spoke. */
+  options: SynthesizeOptions[];
   /** Everything the route logged while serving, so a test can tell a silently
    * dropped chunk from a reported one. */
   logs: string[];
@@ -44,15 +48,18 @@ function harness(
   reply: (chunk: string, call: number) => Buffer | Promise<Buffer>
 ): Harnessed {
   const calls: string[] = [];
+  const options: SynthesizeOptions[] = [];
   const logs: string[] = [];
 
   return {
     calls,
+    options,
     logs,
     deps: {
-      synthesizeSpeechWithFallback: async (chunk) => {
+      synthesizeSpeechWithFallback: async (chunk, opts) => {
         const call = calls.length;
         calls.push(chunk);
+        options.push(opts);
         return await reply(chunk, call);
       },
     },
@@ -742,6 +749,69 @@ describe("POST /api/voice/window — a window sent twice", () => {
       });
       assert.equal(response.status, 400);
     });
+  });
+});
+
+describe("POST /api/voice/speak-stream — the voice it speaks in", () => {
+  const ORIGINAL_CATALOG = config.providers.catalog;
+  const ORIGINAL_DEFAULTS = config.providers.defaults;
+
+  afterEach(() => {
+    config.providers.catalog = ORIGINAL_CATALOG;
+    config.providers.defaults = ORIGINAL_DEFAULTS;
+  });
+
+  async function speak(api: Endpoints, body: Record<string, unknown>): Promise<void> {
+    const res = await fetch(api.speak, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    assert.equal(res.status, 200);
+    await res.text();
+  }
+
+  it("speaks through the profile the caller names", async () => {
+    config.providers.catalog = [
+      {
+        id: "hosted",
+        kind: "tts",
+        name: "Hosted",
+        baseUrl: "http://tts.example",
+        model: "hosted-model",
+        voice: "v1",
+      },
+    ];
+    config.providers.defaults = { llm: null, stt: null, tts: null };
+    const h = harness(() => Buffer.from("RIFF-test"));
+    await withServer(h.deps, (api) =>
+      speak(api, { text: "Hello there.", ttsProfileId: "hosted" })
+    );
+    assert.equal(h.options[0]?.baseUrl, "http://tts.example");
+    assert.equal(h.options[0]?.model, "hosted-model");
+    assert.equal(h.options[0]?.voice, "v1");
+  });
+
+  it("answers a caller that names nothing from the deployment default", async () => {
+    config.providers.catalog = [];
+    config.providers.defaults = { llm: null, stt: null, tts: null };
+    const h = harness(() => Buffer.from("RIFF-test"));
+    await withServer(h.deps, (api) => speak(api, { text: "Hello there." }));
+    assert.equal(h.options[0]?.engine, "supertonic");
+  });
+
+  it("ignores a legacy caller's engine field", async () => {
+    config.providers.catalog = [];
+    config.providers.defaults = { llm: null, stt: null, tts: null };
+    const h = harness(() => Buffer.from("RIFF-test"));
+    await withServer(h.deps, (api) =>
+      speak(api, { text: "Hello there.", engine: "kokoro" })
+    );
+    assert.equal(
+      h.options[0]?.engine,
+      "supertonic",
+      "the deployment default answers, not the engine the caller named"
+    );
   });
 });
 

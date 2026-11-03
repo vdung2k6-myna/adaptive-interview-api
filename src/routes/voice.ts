@@ -14,6 +14,7 @@ import {
   turnTranscripts,
   type TurnTranscriptStore,
 } from "@/lib/turn-transcript";
+import { resolveSessionVoice } from "@/lib/audio/session-voice";
 import {
   transcribeAudio,
   saveAudio,
@@ -212,11 +213,10 @@ router.post("/start", async (req, res) => {
       return;
     }
 
-    const requestedEngine = (session.ttsProvider as "kokoro" | "piper") || "kokoro";
     const language = (session.language as "english" | "vietnamese") || "english";
-    const engine = resolveEngineForLanguage(requestedEngine, language);
-    if (engine === undefined) {
-      res.status(503).json({ error: "no text-to-speech engine is configured for this session" });
+    const sessionVoice = resolveSessionVoice(session, language);
+    if ("error" in sessionVoice) {
+      res.status(503).json({ error: sessionVoice.error });
       return;
     }
 
@@ -263,8 +263,7 @@ router.post("/start", async (req, res) => {
     let audioUrl: string | undefined;
     try {
       const result = await synthesizeLongText(questionText, {
-        engine,
-        voice: resolveVoice(engine, language),
+        ...sessionVoice.options,
         sessionId,
         prefix: "interviewer",
         signal: abortController.signal,
@@ -511,10 +510,9 @@ async function handleTurn(
       .where(eq(messages.sessionId, sessionId))
       .orderBy(messages.createdAt);
 
-    const requestedEngine = (session.ttsProvider as "kokoro" | "piper") || "kokoro";
-    const engine = resolveEngineForLanguage(requestedEngine, language);
-    if (engine === undefined) {
-      res.status(503).json({ error: "no text-to-speech engine is configured for this session" });
+    const sessionVoice = resolveSessionVoice(session, language);
+    if ("error" in sessionVoice) {
+      res.status(503).json({ error: sessionVoice.error });
       return;
     }
 
@@ -560,8 +558,7 @@ async function handleTurn(
       let interviewerAudioUrl: string | undefined;
       try {
         const result = await synthesizeLongText(completionText, {
-          engine,
-          voice: resolveVoice(engine, language),
+          ...sessionVoice.options,
           sessionId,
           prefix: "interviewer",
           signal: abortController.signal,
@@ -632,8 +629,7 @@ async function handleTurn(
     let interviewerAudioUrl: string | undefined;
     try {
       const result = await synthesizeLongText(questionText, {
-        engine,
-        voice: resolveVoice(engine, language),
+        ...sessionVoice.options,
         sessionId,
         prefix: "interviewer",
         signal: abortController.signal,
@@ -802,14 +798,9 @@ async function handleStreamTurn(
     });
 
     const newTurn = session.currentTurn + 1;
-    const streamEngine = resolveEngineForLanguage(
-      (session.ttsProvider as "kokoro" | "piper") || "kokoro",
-      streamLanguage
-    );
-    if (streamEngine === undefined) {
-      sendSseEvent(res, "error", {
-        message: "no text-to-speech engine is configured for this session",
-      });
+    const sessionVoice = resolveSessionVoice(session, streamLanguage);
+    if ("error" in sessionVoice) {
+      sendSseEvent(res, "error", { message: sessionVoice.error });
       res.end();
       return;
     }
@@ -827,8 +818,7 @@ async function handleStreamTurn(
       let interviewerAudioUrl: string | undefined;
       try {
         const ttsOptions: SynthesizeOptions = {
-          engine: streamEngine,
-          voice: resolveVoice(streamEngine, streamLanguage),
+          ...sessionVoice.options,
           signal: abortController.signal,
         };
         const ttsBuffer = await synthesizeSpeechWithFallback(completionText, ttsOptions, 0, abortController.signal);
@@ -929,8 +919,7 @@ async function handleStreamTurn(
     );
 
     const ttsOptions: SynthesizeOptions = {
-      engine: streamEngine,
-      voice: resolveVoice(streamEngine, streamLanguage),
+      ...sessionVoice.options,
       signal: abortController.signal,
     };
 
@@ -1224,10 +1213,10 @@ router.post("/speak", async (req, res) => {
   res.on("close", onDisconnect);
 
   try {
-    const { text, voice, engine, language: requestLanguage } = req.body as {
+    const { text, voice, ttsProfileId, language: requestLanguage } = req.body as {
       text?: string;
       voice?: string;
-      engine?: "kokoro" | "piper";
+      ttsProfileId?: string;
       language?: string;
     };
 
@@ -1238,15 +1227,15 @@ router.post("/speak", async (req, res) => {
 
     const resolvedLanguage: "english" | "vietnamese" =
       requestLanguage === "vietnamese" ? "vietnamese" : "english";
-    const resolvedEngine = resolveEngineForLanguage(engine, resolvedLanguage);
-    if (resolvedEngine === undefined) {
-      res.status(503).json({ error: "no text-to-speech engine is configured" });
+    const sessionVoice = resolveSessionVoice({ ttsProfileId }, resolvedLanguage);
+    if ("error" in sessionVoice) {
+      res.status(503).json({ error: sessionVoice.error });
       return;
     }
 
     const result = await synthesizeLongText(text, {
-      engine: resolvedEngine,
-      voice: voice || resolveVoice(resolvedEngine, resolvedLanguage),
+      ...sessionVoice.options,
+      ...(voice ? { voice } : {}),
       signal: abortController.signal,
     });
 
@@ -1419,9 +1408,9 @@ async function handleSpeakStream(
   res.on("close", onDisconnect);
 
   try {
-    const { text, engine, language: requestLanguage } = req.body as {
+    const { text, ttsProfileId, language: requestLanguage } = req.body as {
       text?: string;
-      engine?: "kokoro" | "piper";
+      ttsProfileId?: string;
       language?: string;
     };
 
@@ -1433,9 +1422,9 @@ async function handleSpeakStream(
 
     const resolvedLanguage: "english" | "vietnamese" =
       requestLanguage === "vietnamese" ? "vietnamese" : "english";
-    const resolvedEngine = resolveEngineForLanguage(engine, resolvedLanguage);
-    if (resolvedEngine === undefined) {
-      sendSseEvent(res, "error", { message: "no text-to-speech engine is configured" });
+    const sessionVoice = resolveSessionVoice({ ttsProfileId }, resolvedLanguage);
+    if ("error" in sessionVoice) {
+      sendSseEvent(res, "error", { message: sessionVoice.error });
       res.end();
       return;
     }
@@ -1450,8 +1439,7 @@ async function handleSpeakStream(
     }
 
     const ttsOptions: SynthesizeOptions = {
-      engine: resolvedEngine,
-      voice: resolveVoice(resolvedEngine, resolvedLanguage),
+      ...sessionVoice.options,
       signal: abortController.signal,
     };
     // The chunk pipeline is the shared core (D1): it owns the index, the

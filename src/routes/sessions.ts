@@ -141,7 +141,7 @@ function normalizeLanguage(language: unknown): InterviewLanguage {
 
 router.post("/", async (req, res) => {
   try {
-    const { positionId, candidateId, mode, ttsProvider, language } = req.body;
+    const { positionId, candidateId, mode, ttsProfileId, language } = req.body;
     if (!positionId || !candidateId) {
       res.status(400).json({ error: "positionId and candidateId are required" });
       return;
@@ -155,7 +155,10 @@ router.post("/", async (req, res) => {
         positionId,
         candidateId,
         mode: mode || "text",
-        ttsProvider: ttsProvider || "kokoro",
+        ttsProfileId:
+          typeof ttsProfileId === "string" && ttsProfileId.trim() !== ""
+            ? ttsProfileId.trim()
+            : null,
         language: normalizedLanguage,
       })
       .returning();

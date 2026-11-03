@@ -25,7 +25,10 @@ export const interviewSessions = pgTable("interview_sessions", {
   candidateId: uuid("candidate_id").references(() => candidates.id).notNull(),
   status: text("status").notNull().default("created"),
   mode: text("mode").notNull().default("text"),
-  ttsProvider: text("tts_provider").notNull().default("kokoro"),
+  // Legacy: the engine a session written before provider profiles spoke through.
+  // Nullable and no longer written; a session now stores the profile it names.
+  ttsProvider: text("tts_provider"),
+  ttsProfileId: text("tts_profile_id"),
   language: text("language").notNull().default("english"),
   maxTurns: integer("max_turns").notNull().default(8),
   currentTurn: integer("current_turn").notNull().default(0),
