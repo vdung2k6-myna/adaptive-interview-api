@@ -12,6 +12,7 @@ import messagesRoutes from "./routes/messages";
 import evaluationsRoutes from "./routes/evaluations";
 import voiceRoutes from "./routes/voice";
 import voiceAgentRoutes from "./routes/voice-agent";
+import voiceConversionRoutes from "./routes/voice-conversion";
 import personasRoutes from "./routes/personas";
 import metricsRoutes from "./routes/metrics";
 import musicRoutes from "./routes/music";
@@ -149,6 +150,7 @@ export function createApp(): express.Express {
   app.use("/api/evaluations", evaluationsRoutes);
   app.use("/api/voice", voiceRoutes);
   app.use("/api/voice-agent", voiceAgentRoutes);
+  app.use("/api/voice-conversion", voiceConversionRoutes);
   app.use("/api/personas", personasRoutes);
   app.use("/api/music", musicRoutes);
   app.use("/api/provider-profiles", providersRoutes);
