@@ -101,6 +101,57 @@ export interface AppConfig {
      */
     synthesisAdmission: number;
     /**
+     * The voice-conversion service every synthesized reply is passed through, or
+     * absent when the deployment names none.
+     *
+     * A reply is converted after it is synthesized and before it is delivered,
+     * whichever endpoint produced it — the deployment gateway or a TTS profile's
+     * own provider. One service converts to one active model, so enabling this
+     * makes the audible voice uniform across engines and profiles; the engine or
+     * profile still selects the voice that is converted.
+     */
+    ovc: {
+      /** Empty when the deployment names no conversion service. */
+      url: string;
+      /** The model the service must report active; empty when no URL is set. */
+      model: string;
+      /** Bounds the conversion call, so an unreachable service is not waited on forever. */
+      timeoutMs: number;
+      /**
+       * Bounds the startup activation, which is a different job from a
+       * conversion: it loads the model and warms it up, which upstream calls
+       * "seconds to a minute of pure CPU work". A conversion timeout would cut
+       * that short on the first boot of a cold host.
+       */
+      activationTimeoutMs: number;
+      /**
+       * Whether a failed conversion fails the synthesis.
+       *
+       * True by default when a URL is set: a deployment that enabled conversion
+       * asked for a voice, and a missing voice is an error rather than a silent
+       * fallback. False delivers the unconverted audio and reports it, so the
+       * layer degrades to no conversion rather than to a failed turn.
+       */
+      required: boolean;
+      /**
+       * Shaping applied to voice-agent turns only.
+       *
+       * The voice agent is an ephemeral conversational surface where a shaped
+       * voice is wanted; interview sessions and the transcript-replay route keep
+       * the service's defaults. Zero shifts and an empty F0 method mean no
+       * shaping, which is the default and leaves the conversion request exactly
+       * as it was.
+       */
+      voiceAgent: {
+        /** Pitch shift in semitones, bounded to ±24 by the service. */
+        pitchShift: number;
+        /** Formant shift in semitones, bounded to ±24 by the service. */
+        formantShift: number;
+        /** An offline F0 method the service advertises; empty means its default. */
+        f0Method: string;
+      };
+    };
+    /**
      * How long a streamed turn's per-segment files stay on disk after they are
      * written. It only has to outlast a client's fetch of a segment it has just
      * been told about — seconds — so the value is margin against a slow fetch,

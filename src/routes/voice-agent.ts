@@ -36,6 +36,9 @@ import {
   hasUnclosedCodeFence,
   SentenceExtractor,
   SentenceStream,
+  voiceConversion,
+  parseVoiceConversionConfig,
+  effectiveVoiceConversion,
   type SynthesizeOptions,
 } from "@/lib/audio";
 
@@ -545,6 +548,21 @@ async function handleStream(
       return;
     }
 
+    // A turn may carry its agent's conversion config, including an explicit
+    // no-voice-changer opt-out. Parsed before transcription so a malformed value
+    // fails now rather than after the reply has been generated and spoken.
+    const parsedConversion = parseVoiceConversionConfig(
+      req.body.ovc,
+      voiceConversion.advertisedF0Methods.length > 0
+        ? voiceConversion.advertisedF0Methods
+        : undefined
+    );
+    if (!parsedConversion.ok) {
+      sendSseEvent(res, "error", { message: parsedConversion.error });
+      res.end();
+      return;
+    }
+
     // The enabled topics scope every search this session issues, and they are
     // known before transcription: resolving them here is what lets the session's
     // topic-scoped search start *concurrently* with it rather than after it. The
@@ -780,6 +798,18 @@ async function handleStream(
       sendSseEvent(res, "error", { message: "no text-to-speech provider is configured for this turn" });
       res.end();
       return;
+    }
+
+    // The turn's own config wins over the deployment's voice-agent shaping; an
+    // explicit opt-out travels as `false`, so the conversion stage makes no
+    // request. Absent keeps the deployment behaviour. The interview and
+    // transcript-replay routes never build this.
+    const conversion = effectiveVoiceConversion(
+      parsedConversion.value,
+      config.audio.ovc.voiceAgent
+    );
+    if (conversion !== undefined) {
+      ttsOptions.conversion = conversion;
     }
 
     // One stream, one sink, for both emit sites: the read loop below and the

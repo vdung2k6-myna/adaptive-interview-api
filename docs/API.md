@@ -777,6 +777,18 @@ The endpoint accepts either an audio recording (voice input) or a `text` field (
 | `prefetchId` | `string` | No | A prefetch (`POST /api/voice-agent/prefetch`) whose located chunks this turn should reuse instead of searching again. |
 | `speak` | `"0"` | No | Set to `"0"` to skip TTS synthesis: `sentence` events still arrive with `audioData: null`. |
 | `tools` | `JSON string` | No | What the caller's own device can be asked to do, as `[{ name, description, inputSchema }]`. A bridge relaying a gadget's catalogue sends it; the platform adds its music tools beside them where a library is configured. Absent, or anything that does not parse as an array of named entries, asks the turn with no tools — which is every browser turn. |
+| `ovc` | `JSON string` \| object | No | The agent's voice-conversion config. `{"enabled":false}` skips conversion entirely; an object shapes it; absent inherits the deployment's voice-agent shaping. See **Per-turn voice conversion** below. |
+
+**Per-turn voice conversion:**
+
+A turn may name how its reply is converted. `ovc` accepts `{"enabled": false}` to opt out — the
+TTS provider's audio is delivered and no conversion request is made, even when the deployment
+configures a service. Otherwise it is an object with any of `pitchShift`, `formantShift`,
+`f0Method`, `indexRate`, `protect`, `rmsMixRate`, `filterRadius`, `crepeHopLength` and
+`effects`; an option it omits inherits the deployment's value. Values are clamped to the
+service's ranges, and `f0Method` is checked against the active model's advertised set. A
+malformed value or an unadvertised method fails the turn naming the field. Zero shifts are not
+an opt-out: they still convert.
 
 **Response:** `text/event-stream`
 

@@ -243,6 +243,58 @@ replicas behind `tts-proxy`, the same soak answers **100/100 in 59.9 s**, first 
 p50 12.1 s / p95 22.1 s, the synthesis queue peaking at 9 waiting, no gateway 5xx and no
 API error. Replicas: two on this 16-core host; one on the pilot's 2-vCPU audio host.
 
+### Voice conversion (2026-11-05)
+
+Measured with OpenVoiceChanger's RVC engine on this host — Ryzen 7 4800H (16 threads), 61 GB
+RAM, CPU-only container, `vctk-p225` (32 kHz) active — with the training run paused and the
+TTS tier up, so the numbers describe the app host rather than a concurrent build. Each
+conversion is one complete WAV through `POST /api/convert/`; the sample is 2.925 s.
+
+| concurrency | conversions | p50 | p95 | speech seconds per wall second |
+| --- | --- | --- | --- | --- |
+| 1 | 12 | 2.48 s | 2.72 s | 1.17 |
+| 4 | 48 | 7.40 s | 14.80 s | 1.20 |
+| 8 | 96 | 12.11 s | 47.96 s | 1.22 |
+
+End-to-end first audio through `POST /api/voice/speak-stream` (profile `kokoro-vi`,
+conversion on, four sentences; the clock stops when the first `sentence` event arrives):
+
+| concurrency | turns | first audio p50 | first audio p95 |
+| --- | --- | --- | --- |
+| 1 | 6 | 2.45 s | 2.62 s |
+| 4 | 24 | 6.70 s | 17.49 s |
+| 8 | 48 | 13.20 s | 19.37 s |
+
+**One CPU conversion service cannot carry the 100-user rate.** Throughput plateaus at
+~1.2 seconds of speech per wall second at every concurrency — the service saturates around
+four cores (~411 % CPU) and additional requests only lengthen the queue, driving p95 to
+48 s at 8. The workload section below assumes ~32–50 s of synthesized speech per second at
+100 users, so this host is **roughly 25–40× short** with one instance. The design's
+decision stands: keep `OVC_URL` unset (off) unless conversion is provisioned as several
+replicas behind a proxy or on a GPU host, and do not enable it for concurrent load on this
+machine. Conversion also gates first audio: even one active turn pays ~2.4 s for a short
+first sentence.
+
+### Voice-agent shaping (2026-11-05)
+
+The voice agent's shaping (`VOICE_AGENT_OVC_PITCH_SHIFT=12`,
+`VOICE_AGENT_OVC_FORMANT_SHIFT=10`, `VOICE_AGENT_OVC_F0_METHOD=rmvpe`) was measured on the same
+host and CPU-only instance, `vctk-p225` active. A reply is converted one complete sentence at
+a time through `POST /api/convert/` — the offline path with full-file context, not the realtime
+socket.
+
+| segment | audio | conversion |
+| --- | --- | --- |
+| short ("Hello there.") | 1.1 s | 2.23 s |
+| medium | 4.1 s | 3.80 s |
+| long | 12.1 s | 8.83 s |
+
+The slowest segment is **8.8 s against the default `OVC_TIMEOUT_MS` of 30 s**, so a segment has
+roughly 3× headroom before the timeout. `rmvpe` with these shifts converted the long segment at
+~1.4× realtime. First audio is gated by both synthesis and conversion: a turn pays roughly the
+short-segment figure (2.2 s) before its first sound. A deployment that shortens the timeout, or
+that routinely speaks longer sentences, should re-measure against its own longest segment.
+
 ---
 
 ## What a workload costs

@@ -9,6 +9,16 @@ export function parsePositiveInt(raw: string | undefined, fallback: number): num
 }
 
 /**
+ * Parse a boolean from the environment, falling back when the variable is
+ * absent. Only `true`, case-insensitively, is true; any other set value is
+ * false, so a typo reads as the safer value rather than as an unexpected on.
+ */
+export function parseBoolean(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined) return fallback;
+  return raw.trim().toLowerCase() === "true";
+}
+
+/**
  * Parse a comma-separated list from the environment, falling back when the
  * variable is absent or holds nothing but separators.
  *
@@ -40,6 +50,20 @@ export function parseList(raw: string | undefined, fallback: string[]): string[]
 export function parseUnitInterval(raw: string | undefined, fallback: number): number {
   const parsed = Number.parseFloat(raw ?? "");
   return Number.isNaN(parsed) || parsed < 0 || parsed > 1 ? fallback : parsed;
+}
+
+/**
+ * Parse a pitch or formant shift, in semitones, from the environment.
+ *
+ * Values outside ±24 are clamped rather than refused: that is the range the
+ * conversion service accepts, and a value it would clip silently would let the
+ * audible voice differ from what the deployment's configuration says. An absent
+ * or unparseable value falls back, as the other parsers do.
+ */
+export function parseSemitones(raw: string | undefined, fallback: number): number {
+  const parsed = Number.parseFloat(raw ?? "");
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(-24, Math.min(24, parsed));
 }
 
 /**

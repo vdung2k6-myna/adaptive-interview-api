@@ -27,8 +27,6 @@ import {
   synthesizeSpeechWithFallback,
   synthesizeLongText,
   concatWavBuffers,
-  resolveVoice,
-  resolveEngineForLanguage,
   resolveSttLanguage,
   SentenceStream,
   SentenceExtractor,

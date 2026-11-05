@@ -1,7 +1,8 @@
 import "dotenv/config";
 
 import { createApp } from "./app";
-import { unavailableConfiguredVoices } from "./lib/audio/voice-catalog";
+import { voiceConversion } from "./lib/audio/client";
+import { ensureVoiceConversionModel, unavailableConfiguredVoices } from "./lib/audio/voice-catalog";
 import { libraryComplaint } from "./lib/music";
 import config from "./lib/config";
 
@@ -19,7 +20,51 @@ createApp().listen(PORT, HOST, () => {
   console.log(`Adaptive Interview API listening on port ${PORT}`);
   void reportUnavailableVoices();
   void reportMusicLibrary();
+  void ensureVoiceConversion();
 });
+
+/**
+ * Make the conversion service speak in this deployment's configured model, once,
+ * at boot.
+ *
+ * The service keeps its active model in memory, so every restart of the service
+ * comes back with none — and a conversion with no active model answers 200 with
+ * the input essentially unchanged. That is the failure this check exists to
+ * repair: when the service reports no model, or a different one, the runtime
+ * activates the configured one.
+ *
+ * Reported and not thrown, for the reason the voice-catalog check is: the audio
+ * tier is not on this API's boot path, and a conversion service being down is
+ * not a reason to refuse to serve interviews. Each way it can fail — unreachable,
+ * no model named to activate, activation refused, activation not taking effect —
+ * is reported distinctly because each needs a different fix, and each would
+ * otherwise surface only as a turn in the wrong voice. A deployment that names
+ * no service has nothing to report.
+ */
+async function ensureVoiceConversion(): Promise<void> {
+  if (config.audio.ovc.url === "") return;
+
+  try {
+    const complaint = await ensureVoiceConversionModel(
+      config.audio.ovc.model,
+      voiceConversion,
+      config.audio.ovc.voiceAgent.f0Method
+    );
+    if (complaint === null) {
+      console.log(
+        `[Voice Conversion] ${config.audio.ovc.model || "the service's active model"} is ready.`
+      );
+      return;
+    }
+
+    console.warn(
+      `[Voice Conversion] ${complaint}. Replies will fail to convert until it is fixed` +
+        (config.audio.ovc.required ? "; a required conversion fails the turn." : ".")
+    );
+  } catch (error) {
+    console.warn("[Voice Conversion] Startup check failed:", error);
+  }
+}
 
 /**
  * Report a music library this deployment cannot serve, once, at boot.

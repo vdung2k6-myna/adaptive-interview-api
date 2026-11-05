@@ -8,11 +8,19 @@ import { audioClient, audioGateway } from "./client";
 export {
   audioClient,
   audioGateway,
+  voiceConversion,
   AudioCppClient,
   AudioGatewayClient,
   type TranscriptionResult,
   type SynthesizeOptions,
+  type VoiceShaping,
 } from "./client";
+export {
+  parseVoiceConversionConfig,
+  effectiveVoiceConversion,
+  OFFLINE_F0_METHODS,
+  type VoiceConversionConfig,
+} from "./voice-conversion-config";
 export { transcribeAudio } from "./stt";
 export { synthesizeSpeech, synthesizeSentences } from "./tts";
 export {

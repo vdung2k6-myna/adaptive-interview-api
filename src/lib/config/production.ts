@@ -1,10 +1,20 @@
 import type { AppConfig } from "./index";
-import { parseList, parsePositiveInt, parseUnitInterval } from "./env";
+import {
+  parseBoolean,
+  parseList,
+  parsePositiveInt,
+  parseSemitones,
+  parseUnitInterval,
+} from "./env";
 import { parseProviderCatalog, parseProviderDefaults } from "@/lib/providers";
 
 // Read once, so the defaults are checked against the catalog they actually
 // belong to rather than against a second parse that could disagree.
 const providerCatalog = parseProviderCatalog(process.env.PROVIDER_CATALOG, "PROVIDER_CATALOG");
+
+// Read once, so `required` defaults from the same value the URL does rather than
+// from a second trim that could disagree.
+const ovcUrl = (process.env.OVC_URL ?? "").trim();
 
 export const productionConfig: AppConfig = {
   env: "production",
@@ -66,6 +76,26 @@ export const productionConfig: AppConfig = {
     // once. The gateway serializes, so more than this only lengthens the queue
     // it times out from (`docs/CAPACITY.md`).
     synthesisAdmission: parsePositiveInt(process.env.AUDIO_SYNTHESIS_ADMISSION, 4),
+    ovc: {
+      // Same as development, and deliberately not a second opinion: whether a
+      // deployment converts its voice is a fact about the deployment, not about
+      // which environment it runs in.
+      url: ovcUrl,
+      model: (process.env.OVC_MODEL ?? "").trim(),
+      timeoutMs: parsePositiveInt(process.env.OVC_TIMEOUT_MS, 30_000),
+      activationTimeoutMs: parsePositiveInt(
+        process.env.OVC_ACTIVATION_TIMEOUT_MS,
+        120_000
+      ),
+      required: parseBoolean(process.env.OVC_REQUIRED, ovcUrl !== ""),
+      voiceAgent: {
+        // Same as development: whether the voice agent is shaped, and how, is a
+        // fact about the deployment rather than about its environment.
+        pitchShift: parseSemitones(process.env.VOICE_AGENT_OVC_PITCH_SHIFT, 0),
+        formantShift: parseSemitones(process.env.VOICE_AGENT_OVC_FORMANT_SHIFT, 0),
+        f0Method: (process.env.VOICE_AGENT_OVC_F0_METHOD ?? "").trim().toLowerCase(),
+      },
+    },
     // 5 minutes — half development's, because what multiplies here is disk:
     // window times turns in flight. Still two orders of magnitude more than a
     // segment needs to survive being fetched, and a window set too short fails

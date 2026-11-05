@@ -331,6 +331,20 @@ describe("POST /api/voice/stream — a turn nobody spoke into", () => {
 });
 
 describe("POST /api/voice/speak-stream — the chunk contract", () => {
+  it("carries no voice-agent shaping", async () => {
+    const h = harness(() => Buffer.from("RIFF-test"));
+
+    await withServer(h.deps, async (api) => {
+      await speak(api, h, { text: "Hello there." });
+
+      assert.equal(
+        h.options[0]?.conversion,
+        undefined,
+        "the voice agent is the only surface the deployment shapes"
+      );
+    });
+  });
+
   it("numbers chunks from 0 with no gap, and speaks the text it was given", async () => {
     const h = harness((chunk) => Buffer.from(`wav:${chunk}`));
 

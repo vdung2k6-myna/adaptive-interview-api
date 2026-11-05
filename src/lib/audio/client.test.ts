@@ -6,7 +6,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
-import { AudioCppClient, AudioGatewayClient } from "./client";
+import { AudioCppClient, AudioGatewayClient, VoiceConversionClient } from "./client";
 import config from "@/lib/config";
 
 /**
@@ -269,7 +269,11 @@ describe("AudioGatewayClient.synthesize", () => {
 
     const { port } = gateway.address() as AddressInfo;
     config.audio.gatewayUrl = `http://127.0.0.1:${port}`;
-    client = new AudioGatewayClient();
+    // Pinned unconfigured: these tests are about the synthesis request, and a
+    // shell that exported OVC_URL must not put a conversion between them.
+    client = new AudioGatewayClient({
+      conversion: new VoiceConversionClient({ baseUrl: "" }),
+    });
   });
 
   after(async () => {

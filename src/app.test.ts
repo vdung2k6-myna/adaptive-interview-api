@@ -3,9 +3,12 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Server } from "node:http";
+import { createServer, type Server } from "node:http";
+import { once } from "node:events";
+import type { AddressInfo } from "node:net";
 
 import { createApp } from "./app";
+import config from "./lib/config";
 
 /** The token this suite arms auth with. Deliberately not the developer's: the
  * assertions below are about which requests auth answers, and an unset
@@ -174,13 +177,69 @@ describe("composition root: which middleware answers a request", () => {
 
   it("leaves the public health check reachable", async () => {
     await withApp(async (urls) => {
-      const res = await fetch(urls.health);
+      const previous = config.audio.ovc.url;
+      config.audio.ovc.url = "";
+      try {
+        const res = await fetch(urls.health);
 
-      assert.equal(res.status, 200);
-      assert.deepEqual(await res.json(), {
-        status: "ok",
-        service: "adaptive-interview-api",
+        assert.equal(res.status, 200);
+        assert.deepEqual(await res.json(), {
+          status: "ok",
+          service: "adaptive-interview-api",
+          voiceConversion: { configured: false, reachable: false, activeModel: null },
+        });
+      } finally {
+        config.audio.ovc.url = previous;
+      }
+    });
+  });
+
+  it("names the conversion service and the model it reports active", async () => {
+    const stub = createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ active: true, name: "voice.pth" }));
+    });
+    stub.listen(0, "127.0.0.1");
+    await once(stub, "listening");
+    const previous = config.audio.ovc.url;
+    config.audio.ovc.url = `http://127.0.0.1:${(stub.address() as AddressInfo).port}`;
+
+    try {
+      await withApp(async (urls) => {
+        const res = await fetch(urls.health);
+
+        assert.equal(res.status, 200);
+        assert.deepEqual((await res.json()).voiceConversion, {
+          configured: true,
+          reachable: true,
+          activeModel: "voice.pth",
+        });
       });
+    } finally {
+      config.audio.ovc.url = previous;
+      stub.closeAllConnections();
+      await new Promise<void>((resolve) => stub.close(() => resolve()));
+    }
+  });
+
+  it("reports the conversion service as unreachable without failing health", async () => {
+    await withApp(async (urls) => {
+      const previous = config.audio.ovc.url;
+      // Nothing listens on port 1: the connection is refused rather than
+      // waited on, which is the case a probe sees when the service is down.
+      config.audio.ovc.url = "http://127.0.0.1:1";
+      try {
+        const res = await fetch(urls.health);
+
+        assert.equal(res.status, 200, "a missing cosmetic voice is not the service being unhealthy");
+        assert.deepEqual((await res.json()).voiceConversion, {
+          configured: true,
+          reachable: false,
+          activeModel: null,
+        });
+      } finally {
+        config.audio.ovc.url = previous;
+      }
     });
   });
 });

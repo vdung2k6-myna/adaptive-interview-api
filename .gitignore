@@ -22,6 +22,11 @@ kokoro-service/models/
 # docs/AUDIO_TIER.md), never baked into an image or committed.
 audio-models/
 
+# The voice-conversion service's model and HuBERT/RMVPE assets. A voice model is
+# a voiceprint derived from a recording of a real person; see
+# docs/LICENSE_AUDIT.md H3. Never committed, never baked into an image.
+ovc-models/
+
 # Voice style files. These are learned tensors, not configuration: a cloned
 # voice is derived from a recording of a real person, and its metadata names
 # the source recording. The repository does not distribute them - install

@@ -19,6 +19,8 @@ import providersRoutes from "./routes/providers";
 import mcpRoutes from "./routes/mcp";
 
 import { audioMediaType } from "./lib/audio/storage";
+import { voiceConversion } from "./lib/audio/client";
+import config from "./lib/config";
 
 /**
  * The composition root: every mount and the order they are registered in.
@@ -62,8 +64,30 @@ export function createApp(): express.Express {
   app.use(express.json());
 
   // Health check — must be BEFORE auth middleware
-  app.get("/health", (_req, res) => {
-    res.json({ status: "ok", service: "adaptive-interview-api" });
+  // The health check answers without a token, and stays a 200 while the
+  // deployment's optional conversion service is down: a missing cosmetic voice
+  // is not this service being unhealthy, but the caller can see it.
+  app.get("/health", async (_req, res) => {
+    const voiceConversionStatus: {
+      configured: boolean;
+      reachable: boolean;
+      activeModel: string | null;
+    } = {
+      configured: config.audio.ovc.url !== "",
+      reachable: false,
+      activeModel: null,
+    };
+    if (voiceConversionStatus.configured) {
+      const status = await voiceConversion.status();
+      voiceConversionStatus.reachable = status.reachable;
+      voiceConversionStatus.activeModel = status.activeModel;
+    }
+
+    res.json({
+      status: "ok",
+      service: "adaptive-interview-api",
+      voiceConversion: voiceConversionStatus,
+    });
   });
 
   // Audio static files — **behind the same credential as the API**, at the same path.

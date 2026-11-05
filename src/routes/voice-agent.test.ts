@@ -2560,3 +2560,117 @@ describe("POST /api/voice-agent/stream — a deployment with no audio service", 
     }
   });
 });
+
+describe("POST /api/voice-agent/stream — conversion shaping", () => {
+  const ORIGINAL = { ...config.audio.ovc.voiceAgent };
+
+  after(() => {
+    Object.assign(config.audio.ovc.voiceAgent, ORIGINAL);
+  });
+
+  it("carries the deployment's shaping on a voice-agent turn", async () => {
+    Object.assign(config.audio.ovc.voiceAgent, {
+      pitchShift: 12,
+      formantShift: 10,
+      f0Method: "rmvpe",
+    });
+    const h = harness({ ok: true, chunks: [] }, { stream: ["Hello there."] });
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, { text: "hi" });
+    });
+
+    assert.deepEqual(h.synthOptions[0]?.conversion, {
+      pitchShift: 12,
+      formantShift: 10,
+      f0Method: "rmvpe",
+    });
+  });
+
+  it("carries none when the deployment configures none", async () => {
+    Object.assign(config.audio.ovc.voiceAgent, {
+      pitchShift: 0,
+      formantShift: 0,
+      f0Method: "",
+    });
+    const h = harness({ ok: true, chunks: [] }, { stream: ["Hello there."] });
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, { text: "hi" });
+    });
+
+    assert.equal(
+      h.synthOptions[0]?.conversion,
+      undefined,
+      "an unconfigured deployment sends no shaping part"
+    );
+  });
+
+  it("lets an agent opt out even when the deployment shapes the voice", async () => {
+    Object.assign(config.audio.ovc.voiceAgent, {
+      pitchShift: 12,
+      formantShift: 10,
+      f0Method: "rmvpe",
+    });
+    const h = harness({ ok: true, chunks: [] }, { stream: ["Hello there."] });
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, { text: "hi", ovc: { enabled: false } });
+    });
+
+    assert.equal(
+      h.synthOptions[0]?.conversion,
+      false,
+      "the turn's opt-out wins over the deployment's shaping"
+    );
+  });
+
+  it("merges an agent's custom values over the deployment's", async () => {
+    Object.assign(config.audio.ovc.voiceAgent, {
+      pitchShift: 0,
+      formantShift: 0,
+      f0Method: "",
+    });
+    const h = harness({ ok: true, chunks: [] }, { stream: ["Hello there."] });
+
+    await withServer(h.deps, async (api) => {
+      await sendTurn(api.stream, h, {
+        text: "hi",
+        ovc: { pitchShift: 12, formantShift: 10, f0Method: "rmvpe", indexRate: 0.5 },
+      });
+    });
+
+    assert.deepEqual(h.synthOptions[0]?.conversion, {
+      pitchShift: 12,
+      formantShift: 10,
+      f0Method: "rmvpe",
+      indexRate: 0.5,
+    });
+  });
+
+  it("refuses a malformed config before speaking", async () => {
+    const h = harness();
+    let sse = "";
+
+    await withServer(h.deps, async (api) => {
+      sse = await sendTurn(api.stream, h, { text: "hi", ovc: "not json" });
+    });
+
+    assert.match(sse, /event: error/);
+    assert.match(sse, /ovc must be valid JSON/);
+    assert.equal(h.synthOptions.length, 0, "nothing is synthesized for a refused config");
+  });
+
+  it("refuses an F0 method the service does not advertise", async () => {
+    const h = harness();
+    let sse = "";
+
+    await withServer(h.deps, async (api) => {
+      sse = await sendTurn(api.stream, h, { text: "hi", ovc: { f0Method: "bogus" } });
+    });
+
+    assert.match(sse, /event: error/);
+    assert.match(sse, /not one the conversion service advertises/);
+    assert.equal(h.synthOptions.length, 0);
+  });
+});

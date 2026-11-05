@@ -1,0 +1,57 @@
+# The voice-conversion service, on the app host beside the API.
+#
+#   docker compose -f docker-compose.ovc.yml up -d --build
+#
+# It publishes one endpoint, and only on loopback: the API on this host reaches
+# it at OVC_URL, and nothing outside the host does. The service has no
+# authentication of its own, so the bind address is the security boundary.
+#
+# Environment (all optional):
+#   OVC_MODELS_DIR        host directory holding the model and its assets
+#                         (default ./ovc-models)
+#   OVC_BIND_ADDR         address the endpoint binds to (default 127.0.0.1;
+#                         set the private IP only when the API is on another host)
+#   OVC_PUBLISHED_PORT    host port (default 8085)
+#   OVC_TAG               image tag built from this repository (default dev)
+
+name: interview-ovc
+
+services:
+  ovc:
+    build:
+      context: ./ovc-service
+      args:
+        OVC_COMMIT: ${OVC_COMMIT:-8e6a00c628eafc0fd1d68c6bc13f2c17b8a46ea1}
+    image: interview-ovc/ovc:${OVC_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      OVC_HOST: 0.0.0.0
+      OVC_PORT: "8000"
+      OVC_MODELS_DIR: /models
+      # The encoder and pitch assets live on the mounted volume, not at the
+      # upstream defaults (`models/assets/...` relative to the image's /app).
+      OVC_HUBERT_PATH: /models/assets/hubert_base.pt
+      OVC_RMVPE_ROOT: /models/assets/rmvpe
+      OVC_RMVPE_ONNX_PATH: /models/assets/rmvpe/rmvpe.onnx
+      OVC_CREPE_ONNX_FULL_PATH: /models/assets/crepe/full.onnx
+      OVC_CREPE_ONNX_TINY_PATH: /models/assets/crepe/tiny.onnx
+      # A hosted tier never updates itself: an install endpoint that writes to
+      # the container is a supply-chain surface, not a feature here.
+      OVC_UPDATE_CHECK_ENABLED: "false"
+      # Nothing browser-facing calls this service; the API does, server-side.
+      OVC_ALLOW_ANY_ORIGIN: "false"
+      OVC_CORS_ORIGINS: "[]"
+    volumes:
+      - ${OVC_MODELS_DIR:-./ovc-models}:/models
+    ports:
+      - "${OVC_BIND_ADDR:-127.0.0.1}:${OVC_PUBLISHED_PORT:-8085}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 120s

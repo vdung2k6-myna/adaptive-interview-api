@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { developmentConfig } from "./development";
 import { productionConfig } from "./production";
-import { parsePositiveInt } from "./env";
+import { parseBoolean, parsePositiveInt, parseSemitones } from "./env";
 
 /**
  * These assertions are about each environment's *defaults* — the value the
@@ -174,6 +174,69 @@ describe("the audio defaults an unconfigured deployment runs on", () => {
         `${name}: ${envNote("PIPER_VOICE_ENGLISH")}`
       );
     }
+  });
+});
+
+describe("the voice-conversion defaults an unconfigured deployment runs on", () => {
+  it("names no conversion service and therefore requires nothing", () => {
+    for (const [name, config] of ENVIRONMENTS) {
+      assert.equal(config.audio.ovc.url, "", `${name}: ${envNote("OVC_URL")}`);
+      assert.equal(config.audio.ovc.model, "", `${name}: ${envNote("OVC_MODEL")}`);
+      assert.equal(
+        config.audio.ovc.required,
+        false,
+        `${name}: ${envNote("OVC_REQUIRED")} — nothing is required when no service is named`
+      );
+      assert.equal(config.audio.ovc.timeoutMs, 30_000, `${name}: ${envNote("OVC_TIMEOUT_MS")}`);
+      assert.equal(
+        config.audio.ovc.activationTimeoutMs,
+        120_000,
+        `${name}: ${envNote("OVC_ACTIVATION_TIMEOUT_MS")} — a cold activation loads and warms the model`
+      );
+    }
+  });
+
+  it("requires conversion by default only once a service is named", () => {
+    assert.equal(parseBoolean(undefined, false), false, "no URL leaves conversion unrequired");
+    assert.equal(
+      parseBoolean(undefined, true),
+      true,
+      "naming a service makes its voice expected, so a failure is an error by default"
+    );
+    assert.equal(parseBoolean("false", true), false, "an explicit false opts into the cosmetic layer");
+    assert.equal(parseBoolean("true", false), true, "an explicit true is honoured");
+    assert.equal(parseBoolean("yes", true), false, "anything that is not true reads as the safer value");
+  });
+});
+
+describe("the voice-agent conversion shaping", () => {
+  it("defaults to no shaping in every environment", () => {
+    for (const [name, config] of ENVIRONMENTS) {
+      assert.equal(
+        config.audio.ovc.voiceAgent.pitchShift,
+        0,
+        `${name}: ${envNote("VOICE_AGENT_OVC_PITCH_SHIFT")}`
+      );
+      assert.equal(
+        config.audio.ovc.voiceAgent.formantShift,
+        0,
+        `${name}: ${envNote("VOICE_AGENT_OVC_FORMANT_SHIFT")}`
+      );
+      assert.equal(
+        config.audio.ovc.voiceAgent.f0Method,
+        "",
+        `${name}: ${envNote("VOICE_AGENT_OVC_F0_METHOD")} — empty means the service's default`
+      );
+    }
+  });
+
+  it("clamps a shift to the range the conversion service accepts", () => {
+    assert.equal(parseSemitones(undefined, 0), 0, "absent is the fallback");
+    assert.equal(parseSemitones("12", 0), 12, "a value in range is kept");
+    assert.equal(parseSemitones("-9.5", 0), -9.5, "fractional shifts are honoured");
+    assert.equal(parseSemitones("99", 0), 24, "above the service's range is clamped");
+    assert.equal(parseSemitones("-99", 0), -24, "below the service's range is clamped");
+    assert.equal(parseSemitones("nope", 7), 7, "unparseable is the fallback");
   });
 });
 

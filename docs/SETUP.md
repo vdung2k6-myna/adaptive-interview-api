@@ -247,6 +247,69 @@ Per-service READMEs cover the HTTP contracts and the pins:
 - [`kokoro-service/README.md`](../kokoro-service/README.md)
 - [`piper-service/README.md`](../piper-service/README.md)
 - [`supertonic-service/README.md`](../supertonic-service/README.md)
+- [`ovc-service/README.md`](../ovc-service/README.md) — optional voice conversion, below
+
+### Voice conversion (optional)
+
+A deployment may speak every synthesized reply in one voice by routing each WAV
+through [`sioaeko/OpenVoiceChanger`](https://github.com/sioaeko/OpenVoiceChanger),
+a CPU-capable voice-conversion service. It is **not** a TTS engine: the API
+synthesizes the segment with the chosen engine or TTS profile, then converts it
+before delivery. The engine or profile still selects the voice that is converted.
+
+| Service | Port | Directory | Purpose |
+|---------|------|-----------|---------|
+| **OpenVoiceChanger** | 8085 (loopback) | `ovc-service/` | Converts synthesized audio to the service's active model's voice |
+
+```bash
+docker compose -f docker-compose.ovc.yml up -d --build   # on the app host
+```
+
+Then set `OVC_URL=http://127.0.0.1:8085` and `OVC_MODEL=<the model file name>`
+in the API's environment. Unset is off, which is the default. `OVC_REQUIRED`
+defaults to true when a URL is set, so a failed conversion fails the turn; set
+it false to deliver the unconverted audio and report the failure instead.
+
+The service holds the active model in memory only, so a restarted service comes
+back with none and conversion would return the input effectively unchanged. At
+boot the API reads `/api/models/active` and activates `OVC_MODEL` when the
+service reports no model or a different one; `OVC_ACTIVATION_TIMEOUT_MS`
+(default 120000) bounds that activation, which loads and warms the model before
+answering.
+
+A deployment may also shape the voice **only for the voice agent**, leaving
+interview sessions and the transcript-replay route on the service defaults:
+
+```ini
+VOICE_AGENT_OVC_PITCH_SHIFT=12      # semitones, clamped to ±24
+VOICE_AGENT_OVC_FORMANT_SHIFT=10    # semitones, clamped to ±24
+VOICE_AGENT_OVC_F0_METHOD=rmvpe     # a method the active model advertises
+```
+
+Unset or zero is no shaping, which is the default. The F0 method is checked
+against the methods `/api/models/active` advertises when the API starts; one it
+does not advertise is reported at boot rather than quietly substituted. Because
+conversion is required by default, a turn whose method the service refuses fails
+rather than speaking in another voice.
+
+A voice-agent turn may also carry a per-turn `ovc` config, which a gadget
+console's agent sends through the bridge. `{"enabled":false}` skips conversion
+and delivers the TTS provider's audio unchanged; an object overrides the
+deployment shaping field by field, and an option it omits inherits. Deploy the
+runtime before the console and bridge that send it: an older runtime would treat
+the opt-out as a config with no values. Rolling back the bridge's `ovc` field
+returns every agent to the deployment default. See `docs/API.md` for the field.
+
+- **One voice at a time.** The service has one active model, so enabling it makes
+  the audible voice uniform across engines and profiles; it cannot offer several
+  conversion voices at once. Activate a different model to change the voice for
+  every turn.
+- **Private only.** The service has no authentication. It binds loopback by
+  default and must stay on the private network; never publish it. The compose file
+  disables its self-update.
+- **The model is not MIT.** The code is MIT; the voice model is operator-supplied
+  and is a voiceprint of a real person. Its licence and the speaker's consent are
+  the deployment's responsibility — see `docs/LICENSE_AUDIT.md` H1 and H3.
 
 > ⚠️ **Licensing is not uniform across this stack.** The application code is
 > MIT, but the TTS models are not: Supertonic's weights are BigScience Open
