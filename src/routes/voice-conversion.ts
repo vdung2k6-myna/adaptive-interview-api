@@ -1,6 +1,15 @@
 import { Router } from "express";
 import config from "@/lib/config";
+import {
+  audioGateway,
+  effectiveVoiceConversion,
+  parseVoiceConversionConfig,
+  type SynthesizeOptions,
+} from "@/lib/audio";
 import { voiceConversion, type VoiceConversionClient } from "@/lib/audio/client";
+
+/** The sentence an audition speaks when the caller names none. */
+const AUDITION_TEXT = "Hello, this is how this voice sounds.";
 
 /**
  * What this deployment does to a converted reply, for a console that wants to
@@ -18,7 +27,9 @@ import { voiceConversion, type VoiceConversionClient } from "@/lib/audio/client"
  * "nothing until it is fixed" is an answer.
  */
 export function createVoiceConversionRouter(
-  client: Pick<VoiceConversionClient, "status"> = voiceConversion
+  client: Pick<VoiceConversionClient, "status"> = voiceConversion,
+  synthesize: (text: string, options: SynthesizeOptions) => Promise<Buffer> = (text, options) =>
+    audioGateway.synthesize(text, options)
 ): Router {
   const router = Router();
 
@@ -43,6 +54,70 @@ export function createVoiceConversionRouter(
         f0Method: ovc.voiceAgent.f0Method,
       },
     });
+  });
+
+  /**
+   * Speak one sample through a chosen TTS provider and the requested conversion.
+   *
+   * The console's audition is the same two stages a turn takes — synthesize, then
+   * convert — but with a fixed short sentence and the provider the agent's TTS
+   * profile names. `ovc` absent inherits the deployment's voice-agent shaping;
+   * `{"enabled":false}` returns the provider's own voice.
+   */
+  router.post("/audition", async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const text = (value: unknown): string => (typeof value === "string" ? value.trim() : "");
+
+    const baseUrl = text(body.ttsBaseUrl);
+    const model = text(body.ttsModel);
+    const voice = text(body.ttsVoice);
+    const apiKey = text(body.ttsApiKey);
+    const missing =
+      baseUrl === ""
+        ? "ttsBaseUrl"
+        : model === ""
+          ? "ttsModel"
+          : voice === ""
+            ? "ttsVoice"
+            : null;
+    if (missing !== null) {
+      res.status(400).json({ error: `${missing} is required` });
+      return;
+    }
+
+    const parsed = parseVoiceConversionConfig(
+      body.ovc,
+      voiceConversion.advertisedF0Methods.length > 0
+        ? voiceConversion.advertisedF0Methods
+        : undefined
+    );
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    const conversion = effectiveVoiceConversion(parsed.value, config.audio.ovc.voiceAgent);
+
+    const sample =
+      typeof body.text === "string" && body.text.trim() !== ""
+        ? body.text.trim().slice(0, 200)
+        : AUDITION_TEXT;
+
+    try {
+      const wav = await synthesize(sample, {
+        baseUrl,
+        model,
+        voice,
+        ...(apiKey === "" ? {} : { apiKey }),
+        conversion,
+      });
+      res.setHeader("Content-Type", "audio/wav");
+      res.setHeader("Content-Length", String(wav.length));
+      res.send(wav);
+    } catch (error) {
+      res.status(502).json({
+        error: error instanceof Error ? error.message : "the voice could not be synthesized",
+      });
+    }
   });
 
   return router;

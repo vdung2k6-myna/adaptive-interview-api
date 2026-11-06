@@ -939,6 +939,53 @@ It sends 24 queries — 8 naming a story in the speakable set, 8 asking vaguely,
 - `200` — Always, including when nothing was held
 - `401` — Missing or invalid auth token, when `API_AUTH_TOKEN` is set
 
+### `GET /api/voice-conversion`
+
+**The deployment's voice-conversion settings.** A console reads this to show what a turn will do without knowing the runtime's environment.
+
+**Response:**
+
+```json
+{
+  "configured": true,
+  "reachable": true,
+  "activeModel": "vctk-p225.pth",
+  "model": "vctk-p225.pth",
+  "required": false,
+  "timeoutMs": 60000,
+  "f0Methods": ["pm", "rmvpe"],
+  "voiceAgent": { "pitchShift": 12, "formantShift": 10, "f0Method": "rmvpe" }
+}
+```
+
+A deployment with no conversion service answers `configured: false` and `reachable: false` without calling the service. A named but unreachable service answers `reachable: false` rather than failing the read.
+
+### `POST /api/voice-conversion/audition`
+
+**Speak a short sample through a chosen TTS provider and the requested conversion.** This is the same two stages a turn takes — synthesize, then convert — so a console can let an operator hear the settings it is showing. The sample is not persisted.
+
+**Request:** `application/json`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ttsBaseUrl` | `string` | Yes | The provider's endpoint, exactly as a turn's provider profile names it. |
+| `ttsModel` | `string` | Yes | The provider's model/engine. |
+| `ttsVoice` | `string` | Yes | The provider's voice. |
+| `ttsApiKey` | `string` | No | The provider's key, when it has one. Never returned or logged. |
+| `ovc` | `JSON string` \| object | No | Same semantics as a turn: absent inherits the deployment's voice-agent shaping, `{"enabled":false}` returns the provider's own voice, an object shapes it. |
+| `text` | `string` | No | The sentence to speak, trimmed and capped at 200 characters. Default: `"Hello, this is how this voice sounds."` |
+
+**Response:** `audio/wav`
+
+**Status Codes:**
+
+- `200` — WAV audio, converted as requested (or unconverted for `{"enabled":false}`, or when the deployment names no service)
+- `400` — A missing provider field or an unparseable/unadvertised conversion value, named in `error`
+- `401` — Missing or invalid auth token, when `API_AUTH_TOKEN` is set
+- `502` — Synthesis or conversion failed; `error` says why
+
+A console should call this from its own server, which holds the TTS profile's key and the runtime's token, rather than from the browser.
+
 ---
 
 ## Music
