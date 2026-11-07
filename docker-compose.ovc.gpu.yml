@@ -1,0 +1,25 @@
+# GPU acceleration for the voice-conversion service — an opt-in override.
+#
+#   docker compose -f docker-compose.ovc.yml -f docker-compose.ovc.gpu.yml up -d
+#
+# The base file stays CPU-only, so a host without an NVIDIA GPU (or without the
+# NVIDIA container toolkit) keeps working unchanged. This override grants the
+# device and nothing else: the service selects CUDA itself and reports it at
+# `GET /api/config` (`runtime.torch.device`). The active model is held in memory
+# only, so activate `OVC_MODEL` again after any recreate.
+#
+# On a GPU shared with the audio tier's audiocpp, both fit on a 4 GB card with
+# almost no headroom, and transcription slows while conversion runs. Read
+# ovc-service/README.md and docs/DEPLOYMENT.md before enabling this in service.
+
+name: interview-ovc
+
+services:
+  ovc:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

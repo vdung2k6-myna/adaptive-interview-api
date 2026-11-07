@@ -295,6 +295,40 @@ roughly 3× headroom before the timeout. `rmvpe` with these shifts converted the
 short-segment figure (2.2 s) before its first sound. A deployment that shortens the timeout, or
 that routinely speaks longer sentences, should re-measure against its own longest segment.
 
+### GPU conversion (2026-11-06)
+
+The same host and model, with the converter granted the GPU through
+`docker-compose.ovc.gpu.yml`. Input is piper `bryce` at 22.05 kHz; shaping is pitch 12,
+formant 10, rmvpe; the active model is `vctk-p225.pth` (RVC v2, 32 kHz target). The same
+4 s sentence as above unless stated.
+
+| setup | conversion | first audio (TTS + OVC) |
+| --- | --- | --- |
+| CPU (previous section) | 3.09 s | 3.27 s |
+| GPU, audiocpp stopped | 0.33 s | 0.52 s |
+| GPU, audiocpp resident (not supported) | 0.11–0.21 s when it succeeds; intermittently OOMs | — |
+
+By sentence length on GPU, steady state: 1.2 s of audio in 0.12 s; 4.0 s in 0.15 s; 9.5 s
+in 0.18 s. Activation after a recreate took 13–15 s, once.
+
+Through the runtime's audition route (`POST /api/voice-conversion/audition`, which
+includes synthesis and HTTP), the same 4 s sentence answered in 3.38–3.81 s on CPU and
+0.57–0.71 s on GPU with audiocpp stopped.
+
+**Coexistence on a 4 GB card.** audiocpp holds ~3044 MiB and the converter 618–676 MiB;
+with both resident `nvidia-smi` reported 3721–3747 MiB of 3770 MiB usable. That margin is
+not reliable: ordinary conversions intermittently fail with `CUDA out of memory` (a 38 MiB
+allocation against 25 MiB free), both on `/api/convert/` and through the API's audition
+route, and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` did not remove it. Some
+conversions succeed — a 9.5 s clip transcribed at rtf 0.148 (~6.8× realtime) while
+conversion ran — so the throughput cost is real, but a deployment that needs conversion to
+succeed SHALL NOT share a 4 GB card between the two services. Run the converter with
+audiocpp stopped, or provision 8–12 GB or more.
+
+On a GPU of 4 GB or less the service uses half precision and a reduced conversion context
+(`x_pad=1, x_query=5, x_center=30, x_max=32`), so conversion quality must be checked by
+listening before it is enabled.
+
 ---
 
 ## What a workload costs

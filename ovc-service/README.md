@@ -52,6 +52,42 @@ boundary. Keep it on loopback, or on the private interface when the API runs on
 another host, and never publish it publicly. The compose file disables the
 service's self-update.
 
+## GPU acceleration (optional)
+
+Conversion takes seconds per sentence on a CPU and a fraction of a second on a GPU. The
+image already carries a CUDA-enabled PyTorch and selects CUDA itself when a device is
+present, so enabling it is a device grant, not a setting.
+
+The host needs the NVIDIA container toolkit. Prove it before starting:
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.9.0-base-ubuntu24.04 nvidia-smi
+```
+
+Start with the override beside the base file:
+
+```bash
+docker compose -f docker-compose.ovc.yml -f docker-compose.ovc.gpu.yml up -d --build
+```
+
+Confirm the device the service chose:
+
+```bash
+curl http://127.0.0.1:8085/api/config   # runtime.torch.device should be "cuda:0"
+```
+
+Activation is in memory only, so activate `OVC_MODEL` again after any recreate; the API
+does this at boot. The base file alone stays CPU-only and needs no GPU.
+
+Two limits. On a card of 4 GB or less the service runs in half precision with a reduced
+conversion context, so listen to the result before relying on it. And shared with the audio
+tier's audiocpp, the two do not reliably coexist on a 4 GB card — conversion intermittently
+fails with CUDA out of memory, and transcription slows while conversion runs — so run the
+converter with audiocpp stopped or on a larger card; see
+[`../docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md) §5.3 and §6. ONNX voice models remain on
+CPU regardless: the image's onnxruntime has no CUDA provider, so acceleration applies to
+RVC models.
+
 ## Provision the model and its assets
 
 The service converts with one **active model at a time**. Models are
