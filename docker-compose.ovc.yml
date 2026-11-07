@@ -13,6 +13,9 @@
 #                         set the private IP only when the API is on another host)
 #   OVC_PUBLISHED_PORT    host port (default 8085)
 #   OVC_TAG               image tag built from this repository (default dev)
+#   OVC_MODEL             model the activation sidecar keeps active; unset
+#                         means no activation is attempted
+#   OVC_ACTIVATE_INTERVAL seconds between activation checks (default 15)
 
 name: interview-ovc
 
@@ -55,3 +58,41 @@ services:
       timeout: 5s
       retries: 5
       start_period: 120s
+
+  # The active model lives in the service's memory only. A restart — the host's
+  # or the container's — leaves the service healthy but unable to convert, so a
+  # sidecar keeps asking and re-activates when the answer is no. It is a loop
+  # rather than a one-shot because the restart it must survive can happen long
+  # after boot. With OVC_MODEL unset it idles and changes nothing.
+  activate:
+    image: alpine:3.20
+    restart: unless-stopped
+    depends_on:
+      - ovc
+    environment:
+      OVC_MODEL: ${OVC_MODEL:-}
+      OVC_ACTIVATE_INTERVAL: ${OVC_ACTIVATE_INTERVAL:-15}
+    command:
+      - sh
+      - -c
+      - |
+        set -u
+        if [ -z "$${OVC_MODEL:-}" ]; then
+          echo "activate: OVC_MODEL is unset; no model will be activated"
+          while :; do sleep 3600; done
+        fi
+        while :; do
+          if wget -q -O /dev/null "http://ovc:8000/health"; then
+            state=$(wget -q -O - "http://ovc:8000/api/models/active" 2>/dev/null || true)
+            case "$$state" in
+              *'"active":true'*) ;;
+              *)
+                echo "activate: activating $${OVC_MODEL}"
+                wget -q -O - --post-data='' \
+                  "http://ovc:8000/api/models/$${OVC_MODEL}/activate" \
+                  || echo "activate: request failed; will retry"
+                ;;
+            esac
+          fi
+          sleep "$${OVC_ACTIVATE_INTERVAL:-15}"
+        done
