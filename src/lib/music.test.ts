@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AUDIO_ROOT } from "./audio/storage";
-import { libraryComplaint, readLibrary } from "./music";
+import { libraryComplaint, readLibrary, searchTracks } from "./music";
 
 /**
  * The library, over directories this suite makes rather than over a deployment's.
@@ -117,6 +117,76 @@ describe("the tracks a directory holds", () => {
 
     assert.equal(library.ok, false);
     assert.match(library.ok === false ? library.detail : "", /could not be listed/);
+  });
+});
+
+describe("searching the library", () => {
+  it("matches every word of a query across a title", async () => {
+    const dir = await dirUnder(AUDIO_ROOT);
+    await track(join(dir, "BALLADE POUR ADELINE.mp3"));
+    await track(join(dir, "Other Song.mp3"));
+
+    const library = await readLibrary(dir);
+    assert.ok(library.ok);
+
+    const { matches, total } = searchTracks(library.tracks, "ballade adeline");
+
+    assert.deepEqual(
+      matches.map((t) => t.title),
+      ["BALLADE POUR ADELINE"],
+      "words may be separated by other words in the title; a contiguous run would miss this"
+    );
+    assert.equal(total, 1);
+  });
+
+  it("folds case, accents and the Vietnamese đ", async () => {
+    const dir = await dirUnder(AUDIO_ROOT);
+    await track(join(dir, "Mùa thu đã về.mp3"));
+
+    const library = await readLibrary(dir);
+    assert.ok(library.ok);
+
+    const { matches } = searchTracks(library.tracks, "mua thu da ve");
+
+    assert.deepEqual(matches.map((t) => t.title), ["Mùa thu đã về"]);
+  });
+
+  it("matches the folder a track is filed under", async () => {
+    const dir = await dirUnder(AUDIO_ROOT);
+    await mkdir(join(dir, "Guitar"));
+    await track(join(dir, "Guitar", "Ballade.mp3"));
+
+    const library = await readLibrary(dir);
+    assert.ok(library.ok);
+
+    const { matches } = searchTracks(library.tracks, "guitar");
+
+    assert.deepEqual(matches.map((t) => t.title), ["Ballade"]);
+  });
+
+  it("caps the answer but reports how many matched", async () => {
+    const dir = await dirUnder(AUDIO_ROOT);
+    for (const name of ["One Match.mp3", "Two Match.mp3", "Three Match.mp3"]) {
+      await track(join(dir, name));
+    }
+
+    const library = await readLibrary(dir);
+    assert.ok(library.ok);
+
+    const { matches, total } = searchTracks(library.tracks, "match", 2);
+
+    assert.equal(matches.length, 2, "the answer is capped");
+    assert.equal(total, 3, "and the total lets the model refine the query");
+  });
+
+  it("answers a query with no words with no matches", async () => {
+    const dir = await dirUnder(AUDIO_ROOT);
+    await track(join(dir, "Anything.mp3"));
+
+    const library = await readLibrary(dir);
+    assert.ok(library.ok);
+
+    assert.deepEqual(searchTracks(library.tracks, "   "), { matches: [], total: 0 });
   });
 });
 

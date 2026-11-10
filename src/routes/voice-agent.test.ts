@@ -2060,6 +2060,14 @@ describe("POST /api/voice-agent/stream — the platform's own music", () => {
   const asksForShelf = (): OllamaToolCall[][] => [
     [{ function: { name: "platform.list_music", arguments: {} } }],
   ];
+  /** A model that narrows the shelf with words, before picking a number from the answer. */
+  const asksForSearch = (query: string): OllamaToolCall[][] => [
+    [{ function: { name: "platform.search_music", arguments: { query } } }],
+  ];
+  const searchThenTrack = (query: string, index: number | string): OllamaToolCall[][] => [
+    ...asksForSearch(query),
+    ...asksForTrack(index),
+  ];
   /**
    * The one request a track takes, as the two calls it is answered in: the shelf, and then a number
    * on it. A model that makes only the second call has a number nothing can answer (design D4).
@@ -2072,13 +2080,13 @@ describe("POST /api/voice-agent/stream — the platform's own music", () => {
   const withLibrary = (h: Harness, fn: (api: Endpoints) => Promise<void>): Promise<void> =>
     withServer({ ...h.deps, libraryDir: library }, fn);
 
-  it("offers its own two tools, and offers nothing at all where no library is configured", async () => {
+  it("offers its own three tools, and offers nothing at all where no library is configured", async () => {
     const h = harness();
     await withLibrary(h, async (api) => {
       await readTurn(api.stream, h, { text: "cho toi nghe nhac" }, () => {});
       assert.deepEqual(
         (h.toolSets[0] ?? []).map((tool) => tool.function.name),
-        ["platform.list_music", "platform.play_music"],
+        ["platform.list_music", "platform.search_music", "platform.play_music"],
         "the platform's own, named so that a reader can see which party answers them"
       );
 
@@ -2095,6 +2103,20 @@ describe("POST /api/voice-agent/stream — the platform's own music", () => {
         "a number on the shelf, and not a name — a name is what the model believes it knows"
       );
       assert.deepEqual(schema.required, ["index"], "and it is the only thing a track is asked for by");
+
+      const search = (h.toolSets[0] ?? []).find(
+        (tool) => tool.function.name === "platform.search_music"
+      );
+      const searchSchema = search?.function.parameters as {
+        properties?: Record<string, unknown>;
+        required?: string[];
+      };
+      assert.deepEqual(
+        Object.keys(searchSchema.properties ?? {}),
+        ["query"],
+        "words to look for, and nothing else"
+      );
+      assert.deepEqual(searchSchema.required, ["query"], "and a query is required");
     });
 
     // The deployment before this existed: nothing configured, nothing offered, and a turn asked
@@ -2187,6 +2209,71 @@ describe("POST /api/voice-agent/stream — the platform's own music", () => {
         !/\.(mp3|flac|opus)/.test(h.prompts[1] ?? ""),
         "the names and not the file names: this service invents no name of its own"
       );
+    });
+  });
+
+  it("searches the shelf, and plays a match by the number on that answer", async () => {
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [[], [], ["Đang phát nhé."]],
+      toolCallRounds: searchThenTrack("black", 1),
+    });
+
+    await withLibrary(h, async (api) => {
+      const seen: string[] = [];
+      await readTurn(api.stream, h, { text: "mo bai Back in Black" }, (event) => {
+        seen.push(event);
+      });
+
+      assert.match(h.prompts[1] ?? "", /matches for "black", by number:/, "the search answer is a shelf");
+      assert.match(h.prompts[1] ?? "", /^1\. Back in Black$/m, "the matching track, numbered from one");
+      assert.doesNotMatch(
+        h.prompts[1] ?? "",
+        /Diem Xua/,
+        "and only the match, not the whole library the model asked to narrow"
+      );
+      assert.match(h.prompts[2] ?? "", /playing Back in Black/, "the number was read against the matches");
+      assert.ok(seen.includes("music"), "and the track reached the client");
+    });
+  });
+
+  it("reports a number past the search matches, rather than reaching into the full library", async () => {
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [[], [], ["Mình không có bài đó."]],
+      toolCallRounds: searchThenTrack("diem", 2),
+    });
+
+    await withLibrary(h, async (api) => {
+      const seen: string[] = [];
+      await readTurn(api.stream, h, { text: "mo bai Diem Xua" }, (event) => {
+        seen.push(event);
+      });
+
+      assert.match(h.prompts[1] ?? "", /^1\. Diem Xua$/m, "the search found one match");
+      assert.match(h.prompts[2] ?? "", /the shelf holds 1 track\(s\)/, "and the second number is refused");
+      assert.ok(!seen.includes("music"), "nothing is played");
+    });
+  });
+
+  it("leaves the shelf it already had when a search matches nothing", async () => {
+    const h = harness({ ok: true, chunks: [] }, {
+      streamRounds: [[], [], [], ["Đang phát nhé."]],
+      toolCallRounds: [
+        ...asksForShelf(),
+        ...asksForSearch("khong co bai nay"),
+        ...asksForTrack(1),
+      ],
+    });
+
+    await withLibrary(h, async (api) => {
+      const seen: string[] = [];
+      await readTurn(api.stream, h, { text: "mo bai dau tien" }, (event) => {
+        seen.push(event);
+      });
+
+      assert.match(h.prompts[1] ?? "", /the tracks this platform holds/, "the full shelf was taken");
+      assert.match(h.prompts[2] ?? "", /no track in this library matches/, "the search missed");
+      assert.match(h.prompts[3] ?? "", /playing /, "and the full shelf was still there to choose from");
+      assert.ok(seen.includes("music"), "so a track still played");
     });
   });
 

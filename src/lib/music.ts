@@ -36,6 +36,60 @@ export interface Track {
 
 export type Library = { ok: true; tracks: readonly Track[] } | { ok: false; detail: string };
 
+/** How many tracks a search answers with when the caller names no limit. */
+export const SEARCH_LIMIT = 20;
+
+/**
+ * Fold a title, a folder or a query to one form for matching: case, accents and the
+ * Vietnamese đ are differences in spelling rather than in the track.
+ */
+export function foldForSearch(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/đ/g, "d");
+}
+
+/** What a search answered: the tracks to offer, and how many matched before the limit. */
+export interface SearchResult {
+  matches: readonly Track[];
+  total: number;
+}
+
+/**
+ * The tracks whose title or folder contains every word of `query`.
+ *
+ * The folder is part of the haystack because that is how a deployment files its music: a person
+ * asking for "guitar" is asking about a folder, not a word in the file's name. Every word must
+ * appear rather than the whole query as one run — "ballade adeline" is how a person asks for
+ * "BALLADE POUR ADELINE", and a contiguous comparison would miss it.
+ *
+ * The reading of the directory is unchanged: this selects from tracks already read, and the model
+ * still chooses one of them.
+ */
+export function searchTracks(
+  tracks: readonly Track[],
+  query: string,
+  limit = SEARCH_LIMIT
+): SearchResult {
+  const words = foldForSearch(query).split(/\s+/).filter(Boolean);
+  if (words.length === 0) return { matches: [], total: 0 };
+
+  const matches = tracks.filter((track) => {
+    let haystack = track.title;
+    try {
+      haystack = `${track.title} ${decodeURIComponent(track.url)}`;
+    } catch {
+      // A URL that cannot be decoded is still searchable by its title.
+    }
+    const folded = foldForSearch(haystack);
+    return words.every((word) => folded.includes(word));
+  });
+
+  return { matches: matches.slice(0, limit), total: matches.length };
+}
+
 /**
  * Every track the configured directory holds, in the order the filesystem gives them.
  *

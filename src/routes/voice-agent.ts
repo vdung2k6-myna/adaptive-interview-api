@@ -24,7 +24,7 @@ import { createPrefetchStore, DEFAULT_PREFETCH_TOP_K, type PrefetchStore } from 
 import { createSessionKnowledge, type SessionKnowledge } from "@/lib/session-knowledge";
 import { createToolCallStore, type ToolCallOutcome, type ToolCallStore } from "@/lib/tool-calls";
 import { resolveCollections } from "@/lib/topics";
-import { readLibrary, type Track } from "@/lib/music";
+import { readLibrary, searchTracks, type Track } from "@/lib/music";
 import { defaultProviderFor, findProvider, type ProviderKind } from "@/lib/providers";
 import config from "@/lib/config";
 import {
@@ -54,6 +54,7 @@ const upload = audioUpload;
  * `bridge.*` the bridge's, and these are the server's own.
  */
 const LIST_MUSIC_TOOL = "platform.list_music";
+const SEARCH_MUSIC_TOOL = "platform.search_music";
 const PLAY_MUSIC_TOOL = "platform.play_music";
 
 /**
@@ -67,6 +68,25 @@ function shelfAnswer(tracks: readonly Track[]): string {
   return (
     "the tracks this platform holds, by number:\n" +
     tracks.map((track, at) => `${at + 1}. ${track.title}`).join("\n")
+  );
+}
+
+/**
+ * The matches a search offers, numbered from one.
+ *
+ * The numbers mean the matches, not positions on the whole library: the search result is the shelf
+ * the next round plays from. The answer says so, and names the full shelf as the fallback when the
+ * query did not settle the request.
+ */
+function searchAnswer(matches: readonly Track[], total: number, query: string): string {
+  const lines = matches.map((track, at) => `${at + 1}. ${track.title}`).join("\n");
+  const scope =
+    total > matches.length
+      ? `showing the first ${matches.length} of ${total} matches; refine the query to narrow it`
+      : `${total} match${total === 1 ? "" : "es"}`;
+  return (
+    `matches for ${JSON.stringify(query)}, by number:\n${lines}\n(${scope})\n` +
+    `the numbers are for ${PLAY_MUSIC_TOOL}; take ${LIST_MUSIC_TOOL} for the full shelf`
   );
 }
 
@@ -487,11 +507,33 @@ async function handleStream(
               function: {
                 name: LIST_MUSIC_TOOL,
                 description:
-                  "List the tracks this platform can play, each with the number it is asked for " +
-                  "by. Take it whenever the person asked for a track — a title spoken inside " +
-                  "another language, or a name the transcriber heard wrongly, is settled by " +
-                  `choosing from what this answers — and then play one with ${PLAY_MUSIC_TOOL}.`,
+                  "List every track this platform can play, each with the number it is asked for " +
+                  "by. Take it when you need the whole shelf, or after a search did not settle the " +
+                  `request; when the person named a track, prefer ${SEARCH_MUSIC_TOOL}.`,
                 parameters: { type: "object", properties: {} },
+              },
+            },
+            {
+              type: "function",
+              function: {
+                name: SEARCH_MUSIC_TOOL,
+                description:
+                  "Find tracks in this platform's library by words from a title or folder, each " +
+                  "with the number it is asked for by on the result. Prefer it when the person " +
+                  "named a track: it answers with the matching tracks numbered from one, and you " +
+                  `play one with ${PLAY_MUSIC_TOOL}. If nothing matches, try different words or ` +
+                  `take ${LIST_MUSIC_TOOL} for the full shelf.`,
+                parameters: {
+                  type: "object",
+                  properties: {
+                    query: {
+                      type: "string",
+                      description:
+                        "Words from the track's title or folder, in any language the person used.",
+                    },
+                  },
+                  required: ["query"],
+                },
               },
             },
             {
@@ -500,15 +542,17 @@ async function handleStream(
                 name: PLAY_MUSIC_TOOL,
                 description:
                   "Play one track from this platform's library through the person's own client. " +
-                  "A track is named by its number on the shelf, and the number must be one " +
-                  `${LIST_MUSIC_TOOL} answered with: take that shelf first if you have not, and ` +
-                  "never invent a number or pass a track's name.",
+                  "A track is named by its number on the most recent shelf — the matches " +
+                  `${SEARCH_MUSIC_TOOL} returned, or the full list ${LIST_MUSIC_TOOL} returned. ` +
+                  "The number must be one that shelf carries: take a shelf first if you have not, " +
+                  "and never invent a number or pass a track's name.",
                 parameters: {
                   type: "object",
                   properties: {
                     index: {
                       type: "integer",
-                      description: `The track's number on the shelf ${LIST_MUSIC_TOOL} answered with.`,
+                      description:
+                        `The track's number on the most recent shelf, from ${SEARCH_MUSIC_TOOL} or ${LIST_MUSIC_TOOL}.`,
                     },
                   },
                   required: ["index"],
@@ -972,7 +1016,36 @@ async function handleStream(
           shelf: readonly Track[] | null
         ): Promise<ToolCallOutcome | null> {
           const name = call.function.name;
-          if (name !== LIST_MUSIC_TOOL && name !== PLAY_MUSIC_TOOL) return null;
+          if (
+            name !== LIST_MUSIC_TOOL &&
+            name !== SEARCH_MUSIC_TOOL &&
+            name !== PLAY_MUSIC_TOOL
+          ) {
+            return null;
+          }
+
+          if (name === SEARCH_MUSIC_TOOL) {
+            const asked = call.function.arguments["query"];
+            if (typeof asked !== "string" || asked.trim() === "") {
+              return { ok: false, message: `${SEARCH_MUSIC_TOOL} needs words to look for` };
+            }
+            const library = await readLibrary(deps.libraryDir);
+            if (!library.ok) return { ok: false, message: library.detail };
+            const { matches, total } = searchTracks(library.tracks, asked);
+            if (matches.length === 0) {
+              return {
+                ok: false,
+                message:
+                  `no track in this library matches ${JSON.stringify(asked)} — try different ` +
+                  `words, or take ${LIST_MUSIC_TOOL} for the full shelf`,
+              };
+            }
+            // The matches are the shelf the next round plays from. Replacing the shelf is what
+            // makes a number from this answer mean a track, and is why the model must take the
+            // search before it asks for a number (design option 1).
+            offered.tracks = matches;
+            return { ok: true, text: searchAnswer(matches, total, asked) };
+          }
 
           if (name === LIST_MUSIC_TOOL) {
             const library = await readLibrary(deps.libraryDir);
@@ -990,8 +1063,9 @@ async function handleStream(
             return {
               ok: false,
               message:
-                `no shelf of this library has been taken in this turn — ask ${LIST_MUSIC_TOOL} for ` +
-                `one, then ask for a track by a number it gives`,
+                `no shelf of this library has been taken in this turn — ask ${LIST_MUSIC_TOOL} ` +
+                `for the full shelf or ${SEARCH_MUSIC_TOOL} for matches, then ask for a track by ` +
+                `a number either gave`,
             };
           }
 
@@ -1010,7 +1084,7 @@ async function handleStream(
               ok: false,
               message:
                 `the shelf holds ${shelf.length} track(s), so ${JSON.stringify(asked)} is not one of ` +
-                `them — answer with a number ${LIST_MUSIC_TOOL} gave`,
+                `them — answer with a number the last shelf gave`,
             };
           }
 

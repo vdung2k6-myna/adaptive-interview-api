@@ -40,13 +40,15 @@ moved without a migration, so the mount wears the middleware itself. `/health` i
 that answers without a credential.
 
 A turn may also be answered with music. Where `MUSIC_LIBRARY_DIR` names a directory inside
-`AUDIO_STORAGE_DIR`, **and the turn carries no device's own tools**, the route offers the model two
-tools of its own — `platform.list_music` and `platform.play_music` — and answers them **itself** rather
-than pushing them out to whoever is on the connection: the library is this service's, so there is
-nobody else to answer for it. `list_music` answers with the tracks as a numbered shelf, and
-`play_music` takes the number a track carries there, read against the shelf that turn offered and never
-against a fresh reading of the directory. A track is asked for by a **number** and not by its name: the
-names are the library's own file names, and a model asked to reproduce one will answer with the title
+`AUDIO_STORAGE_DIR`, **and the turn carries no device's own tools**, the route offers the model three
+tools of its own — `platform.list_music`, `platform.search_music` and `platform.play_music` — and
+answers them **itself** rather than pushing them out to whoever is on the connection: the library is
+this service's, so there is nobody else to answer for it. `list_music` answers with the tracks as a
+full numbered shelf; `search_music` narrows it by words from a title or folder and answers the matches
+numbered from one; `play_music` takes a number from the most recent shelf, read against the shelf that
+turn offered and never against a fresh reading of the directory. A track is asked for by a **number**
+and not by its name: the names are the library's own file names, and a model asked to reproduce one
+will answer with the title
 it knows instead. A chosen track is announced to the client as a `music` event (its URL, its name, and
 the index one past the reply's last sentence) after that reply's sentences and before `done`, and the
 client plays it from the same mount, with the same credential, as any other recording.
