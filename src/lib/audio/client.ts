@@ -173,7 +173,9 @@ export function wavSeconds(buffer: Buffer): number | undefined {
     if (id === "fmt " && size >= 16 && offset + 24 <= buffer.length) {
       byteRate = buffer.readUInt32LE(offset + 16);
     } else if (id === "data") {
-      dataBytes = Math.min(size, buffer.length - (offset + 8));
+      // The declared size, not what this buffer holds: a header-only read is how
+      // an uploaded file's duration is measured.
+      dataBytes = size;
       break;
     }
     offset += 8 + size + (size % 2);
