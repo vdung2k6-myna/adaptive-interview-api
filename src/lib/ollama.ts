@@ -1,4 +1,7 @@
+import { randomUUID } from "node:crypto";
+
 import { ModelProviderError, OllamaError } from "./errors";
+import type { AdapterCallListener, AdapterCallStatus } from "./adapter-usage";
 import config from "./config";
 import { createSemaphore, type ReleaseSlot } from "./semaphore";
 
@@ -276,6 +279,28 @@ export interface LlmTarget {
   model: string;
   /** null means the provider's own default; the field is then not sent. */
   temperature: number | null;
+  /**
+   * Set when the answering model is a registered adapter rather than an
+   * OpenAI-compatible endpoint. The adapter contract's own path is taken then,
+   * and the endpoint, model and key above are empty and unused: the adapter
+   * holds the provider key.
+   */
+  adapter?: LlmAdapterTarget;
+  /**
+   * The ordered adapter candidates for this turn. The first is tried, and a
+   * failure before any content falls to the next. `adapter` is a chain of one.
+   */
+  adapters?: LlmAdapterTarget[];
+}
+
+/** The connection a registered adapter's LLM path needs. */
+export interface LlmAdapterTarget {
+  adapterId: string;
+  endpoint: string;
+  token: string;
+  tenantId: string;
+  /** The opaque config the adapter's manifest declares, or null for none. */
+  config: Record<string, unknown> | null;
 }
 
 export interface OllamaGenerateOptions {
@@ -288,6 +313,8 @@ export interface OllamaGenerateOptions {
   tools?: OllamaTool[];
   /** The account's model. Absent selects this deployment's own Ollama. */
   llm?: LlmTarget;
+  /** What each adapter call observed, for the turn's usage record. */
+  onAdapterCall?: AdapterCallListener;
 }
 
 export interface GenerateStreamResult {
@@ -504,6 +531,12 @@ export interface ChatResult {
 export async function generateChatResponseFull(
   options: OllamaGenerateOptions
 ): Promise<ChatResult> {
+  if (
+    options.llm !== undefined &&
+    (options.llm.adapter !== undefined || (options.llm.adapters?.length ?? 0) > 0)
+  ) {
+    return generateAdapterResponse(options, options.llm);
+  }
   if (options.llm !== undefined) return generateOpenAiResponse(options, options.llm);
   return generateNativeResponse(options);
 }
@@ -611,6 +644,12 @@ async function generateNativeResponse(
 export function generateChatResponseStream(
   options: OllamaGenerateOptions
 ): GenerateStreamResult {
+  if (
+    options.llm !== undefined &&
+    (options.llm.adapter !== undefined || (options.llm.adapters?.length ?? 0) > 0)
+  ) {
+    return generateAdapterStream(options, options.llm);
+  }
   if (options.llm !== undefined) return generateOpenAiStream(options, options.llm);
   const baseUrl = process.env.OLLAMA_BASE_URL || config.ollama.baseUrl;
   const model = options.model || process.env.OLLAMA_MODEL || config.ollama.chatModel;
@@ -1124,4 +1163,413 @@ function generateOpenAiStream(
     getFullText: () => fullText,
     getToolCalls: () => toolCalls,
   };
+}
+
+/* ── The adapter contract's LLM path ─────────────────────────────── */
+
+/**
+ * A registered adapter's own LLM contract (contract v1).
+ *
+ * It is deliberately not the OpenAI dialect: the adapter normalizes its
+ * provider's stream into `text`, `tool_call`, `usage` and `done` events, and the
+ * platform sends the provider's key only to the adapter, never onward. This path
+ * exists beside the OpenAI-compatible one; a profile that names no adapter keeps
+ * using that one, byte-for-byte.
+ */
+
+function adapterChatUrl(endpoint: string): string {
+  return `${endpoint.replace(/\/+$/, "")}/llm/chat`;
+}
+
+function adapterHeaders(adapter: LlmAdapterTarget): Record<string, string> {
+  return {
+    accept: "text/event-stream",
+    "content-type": "application/json",
+    authorization: `Bearer ${adapter.token}`,
+    "x-adapter-id": adapter.adapterId,
+    "x-tenant-id": adapter.tenantId,
+    "x-contract-version": "1",
+    "x-request-id": randomUUID(),
+  };
+}
+
+/** The contract's message shape: `toolCalls` on an assistant turn, and the call
+ *  a `tool` message answers named by id and by name. */
+function adapterMessages(messages: OllamaMessage[]): unknown[] {
+  return messages.map((message) => ({
+    role: message.role,
+    content: message.content,
+    ...(message.tool_calls === undefined || message.tool_calls.length === 0
+      ? {}
+      : {
+          toolCalls: message.tool_calls.map((call) => ({
+            ...(call.id === undefined ? {} : { id: call.id }),
+            name: call.function.name,
+            arguments: call.function.arguments,
+            ...(call.extra_content === undefined ? {} : { metadata: call.extra_content }),
+          })),
+        }),
+    ...(message.role === "tool"
+      ? {
+          ...(message.tool_call_id === undefined ? {} : { toolCallId: message.tool_call_id }),
+          ...(message.tool_name === undefined ? {} : { name: message.tool_name }),
+        }
+      : {}),
+  }));
+}
+
+function adapterBody(
+  options: OllamaGenerateOptions,
+  llm: LlmTarget,
+  adapter: LlmAdapterTarget
+): string {
+  return JSON.stringify({
+    stream: true,
+    messages: adapterMessages(options.messages),
+    ...(options.tools === undefined || options.tools.length === 0
+      ? {}
+      : {
+          tools: options.tools.map((tool) => ({
+            name: tool.function.name,
+            description: tool.function.description,
+            inputSchema: tool.function.parameters,
+          })),
+        }),
+    ...(llm.temperature === null ? {} : { temperature: llm.temperature }),
+    ...(adapter.config === null ? {} : { config: adapter.config }),
+  });
+}
+
+type AdapterLlmEvent =
+  | { type: "text"; text: string }
+  | {
+      type: "tool_call";
+      id?: string;
+      name: string;
+      arguments: unknown;
+      metadata?: unknown;
+    }
+  | { type: "usage"; inputTokens?: number; outputTokens?: number }
+  | { type: "done" };
+
+/**
+ * One `data:` payload of the adapter's stream, read whole or refused whole.
+ *
+ * The event name on the `event:` line is the same as `type`; the payload's own
+ * value wins when both are present. An event the contract does not define is a
+ * failure rather than something to skip: a stream this platform cannot read is
+ * not an answer.
+ */
+function readAdapterEvent(raw: string, eventName = ""): AdapterLlmEvent {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    throw new ModelProviderError("the adapter stream carried invalid JSON", 502);
+  }
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    throw new ModelProviderError("the adapter stream carried an event that is not an object", 502);
+  }
+  const value = payload as Record<string, unknown>;
+  // The `event:` line and the payload's own `type` name the same thing; a
+  // payload that states it wins.
+  const type = typeof value.type === "string" ? value.type : eventName;
+
+  if (type === "text") {
+    if (typeof value.text !== "string") {
+      throw new ModelProviderError("the adapter's text event carried no text", 502);
+    }
+    return { type: "text", text: value.text };
+  }
+  if (type === "tool_call") {
+    if (typeof value.name !== "string" || value.name === "") {
+      throw new ModelProviderError("the adapter's tool call named no tool", 502);
+    }
+    return {
+      type: "tool_call",
+      ...(typeof value.id === "string" && value.id !== "" ? { id: value.id } : {}),
+      name: value.name,
+      arguments: value.arguments,
+      ...(value.metadata === undefined ? {} : { metadata: value.metadata }),
+    };
+  }
+  if (type === "usage") {
+    return {
+      type: "usage",
+      ...(typeof value.inputTokens === "number" ? { inputTokens: value.inputTokens } : {}),
+      ...(typeof value.outputTokens === "number" ? { outputTokens: value.outputTokens } : {}),
+    };
+  }
+  if (type === "done") return { type: "done" };
+  throw new ModelProviderError(
+    `the adapter stream carried an event it does not define: ${type === "" ? "no type" : type}`,
+    502
+  );
+}
+
+function adapterToolCall(event: Extract<AdapterLlmEvent, { type: "tool_call" }>): OllamaToolCall {
+  const parsed = (objectOrUndefined(event.arguments) ?? {}) as Record<string, unknown>;
+  return {
+    ...(event.id === undefined ? {} : { id: event.id }),
+    ...(event.metadata === undefined ? {} : { extra_content: event.metadata }),
+    function: { name: event.name, arguments: parsed },
+  };
+}
+
+/**
+ * Read the adapter's SSE stream and enqueue its text as it arrives.
+ *
+ * The stream is read by lines and each event is dispatched when its blank line
+ * ends it, so a reply is spoken while it is still being generated. A stream that
+ * ends without `done`, or carries an event after it, is refused: the contract
+ * makes `done` the one unambiguous end.
+ */
+function adapterCandidates(llm: LlmTarget): LlmAdapterTarget[] {
+  if (llm.adapters !== undefined && llm.adapters.length > 0) return llm.adapters;
+  return llm.adapter === undefined ? [] : [llm.adapter];
+}
+
+/** Whether a failed candidate may be followed by the next one. */
+function adapterFallback(error: unknown): boolean {
+  if (!(error instanceof ModelProviderError)) return true; // network, idle, timeout
+  return error.statusCode === 429 || error.statusCode >= 500;
+}
+
+/** The usage status a failure is reported as. */
+function adapterStatus(error: unknown): AdapterCallStatus {
+  if (error instanceof ModelProviderError) {
+    if (error.statusCode === 429) return "rate_limit";
+    if (error.statusCode === 504) return "timeout";
+    if (error.statusCode >= 500) return "upstream";
+    if (error.statusCode === 401 || error.statusCode === 403) return "refused";
+    return "error";
+  }
+  if (error instanceof Error && error.name === "AbortError") return "timeout";
+  return "error";
+}
+
+function generateAdapterStream(
+  options: OllamaGenerateOptions,
+  llm: LlmTarget
+): GenerateStreamResult {
+  const candidates = adapterCandidates(llm);
+  let fullText = "";
+  const toolCalls: OllamaToolCall[] = [];
+  let cancelled = false;
+  let active: {
+    controller: AbortController;
+    timeout: NodeJS.Timeout;
+    release?: ReleaseSlot;
+  } | null = null;
+
+  async function runCandidate(
+    adapter: LlmAdapterTarget,
+    enqueue: (text: string) => void
+  ): Promise<void> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), config.ollama.chatTimeoutMs);
+    active = { controller, timeout };
+    const startedAt = Date.now();
+    let usage: { inputTokens?: number; outputTokens?: number } = {};
+    try {
+      const { res, release } = await requestModel(
+        adapterChatUrl(adapter.endpoint),
+        {
+          method: "POST",
+          redirect: "error",
+          headers: adapterHeaders(adapter),
+          body: adapterBody(options, llm, adapter),
+        },
+        controller.signal
+      );
+      active.release = release;
+      clearTimeout(timeout);
+
+      if (!res.ok) {
+        throw new ModelProviderError(
+          `the adapter at ${adapterChatUrl(adapter.endpoint)} returned ${res.status}`,
+          res.status
+        );
+      }
+      if (!res.body) {
+        throw new ModelProviderError("the adapter returned an empty body", 502);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let eventName = "";
+      let data: string[] = [];
+      let done = false;
+
+      const flush = (): boolean => {
+        if (data.length === 0 && eventName === "") return false;
+        const raw = data.join("\n").trim();
+        const name = eventName;
+        eventName = "";
+        data = [];
+        if (raw === "") return false;
+
+        const event = readAdapterEvent(raw, name);
+        if (event.type === "text") {
+          fullText += event.text;
+          enqueue(event.text);
+          return false;
+        }
+        if (event.type === "tool_call") {
+          toolCalls.push(adapterToolCall(event));
+          return false;
+        }
+        if (event.type === "usage") {
+          usage = {
+            ...(event.inputTokens === undefined ? {} : { inputTokens: event.inputTokens }),
+            ...(event.outputTokens === undefined ? {} : { outputTokens: event.outputTokens }),
+          };
+          logTokenCounts(adapter.adapterId, {
+            prompt_eval_count: event.inputTokens,
+            eval_count: event.outputTokens,
+          });
+          return false;
+        }
+        return true;
+      };
+
+      while (!done) {
+        const read = await reader.read();
+        if (read.done) break;
+        buffer += decoder.decode(read.value, { stream: true });
+
+        let newline = buffer.indexOf("\n");
+        while (newline >= 0 && !done) {
+          const line = buffer.slice(0, newline).replace(/\r$/, "");
+          buffer = buffer.slice(newline + 1);
+          if (line === "") {
+            done = flush();
+          } else if (line.startsWith(":")) {
+            // The contract's heartbeat comment; it carries nothing.
+          } else if (line.startsWith("event:")) {
+            eventName = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            data.push(line.slice(5).trimStart());
+          }
+          newline = buffer.indexOf("\n");
+        }
+      }
+
+      const tail = buffer.trim();
+      if (!done && tail !== "") {
+        if (tail.startsWith("data:")) data.push(tail.slice(5).trimStart());
+        done = flush();
+      }
+      if (!done) {
+        throw new ModelProviderError("the adapter stream ended before done", 502);
+      }
+      await reader.cancel().catch(() => {});
+      options.onAdapterCall?.({
+        kind: "llm",
+        adapterId: adapter.adapterId,
+        status: "ok",
+        latencyMs: Date.now() - startedAt,
+        ...usage,
+      });
+    } catch (error) {
+      options.onAdapterCall?.({
+        kind: "llm",
+        adapterId: adapter.adapterId,
+        status: adapterStatus(error),
+        latencyMs: Date.now() - startedAt,
+      });
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+      active?.release?.();
+      active = null;
+    }
+  }
+
+  const stream = new ReadableStream<string>({
+    async start(streamController) {
+      let lastError: unknown;
+      for (let index = 0; index < candidates.length; index += 1) {
+        const beforeText = fullText.length;
+        const beforeCalls = toolCalls.length;
+        try {
+          await runCandidate(candidates[index]!, (text) => streamController.enqueue(text));
+          streamController.close();
+          return;
+        } catch (error) {
+          lastError = error;
+          const emitted = fullText.length > beforeText || toolCalls.length > beforeCalls;
+          // Falling back after content has streamed would speak the reply twice;
+          // a cancelled turn is not continued; and a refusal about the request
+          // itself would be refused by every candidate.
+          if (
+            cancelled ||
+            emitted ||
+            index + 1 >= candidates.length ||
+            !adapterFallback(error)
+          ) {
+            break;
+          }
+        }
+      }
+
+      if (lastError instanceof Error && lastError.name === "AbortError") {
+        streamController.error(
+          new ModelProviderError(
+            `the adapter timed out after ${config.ollama.chatTimeoutMs / 1000}s`,
+            504
+          )
+        );
+        return;
+      }
+      streamController.error(
+        lastError instanceof ModelProviderError
+          ? lastError
+          : new ModelProviderError(
+              `the adapter could not be reached: ` +
+                `${lastError instanceof Error ? lastError.message : String(lastError)}`,
+              502
+            )
+      );
+    },
+
+    cancel() {
+      cancelled = true;
+      active?.controller.abort();
+      if (active !== null) {
+        clearTimeout(active.timeout);
+        active.release?.();
+        active = null;
+      }
+    },
+  });
+
+  return {
+    stream,
+    getFullText: () => fullText,
+    getToolCalls: () => toolCalls,
+  };
+}
+
+/**
+ * A non-streaming answer from the adapter, for the turn's fallback when the
+ * streamed reply carried nothing. Contract v1 has one streaming endpoint, so the
+ * same stream is read to its `done` and kept whole.
+ */
+async function generateAdapterResponse(
+  options: OllamaGenerateOptions,
+  llm: LlmTarget
+): Promise<ChatResult> {
+  const result = generateAdapterStream(options, llm);
+  const reader = result.stream.getReader();
+  try {
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return { text: result.getFullText(), toolCalls: result.getToolCalls() };
 }

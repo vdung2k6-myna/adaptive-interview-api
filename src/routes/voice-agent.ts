@@ -17,6 +17,7 @@ import {
   type OllamaToolCall,
 } from "@/lib/ollama";
 import { OllamaError } from "@/lib/errors";
+import type { AdapterCallEvent } from "@/lib/adapter-usage";
 import { searchKnowledge, type KnowledgeChunk, type KnowledgeSearch, type KnowledgeSearchOutcome } from "@/lib/knowledge";
 import { MATERIAL_LOCATOR_TOP_K, resolveMaterialReply, selectMaterialHit } from "@/lib/material";
 import { resolveAnswerMode, type AnswerMode } from "@/lib/personas";
@@ -39,7 +40,10 @@ import {
   voiceConversion,
   parseVoiceConversionConfig,
   effectiveVoiceConversion,
+  type ProviderAdapterTarget,
   type SynthesizeOptions,
+  wavSeconds,
+  wavSecondsFromFile,
 } from "@/lib/audio";
 
 // The body is written to disk as it arrives; see `lib/upload.ts` for why, and
@@ -220,16 +224,157 @@ function readLlmTarget(body: Record<string, unknown>): LlmTarget | undefined | n
   const model = typeof body.llmModel === "string" ? body.llmModel.trim() : "";
   const apiKey = typeof body.llmApiKey === "string" ? body.llmApiKey : "";
   const hasTemperature = body.llmTemperature !== undefined && body.llmTemperature !== "";
-
-  if (baseUrl === "" && model === "" && apiKey === "" && !hasTemperature) return undefined;
-  if (baseUrl === "" || model === "" || apiKey === "") return null;
+  const adapter = readProviderAdapter(body, "llm");
+  if (adapter === null) return null;
 
   let temperature: number | null = null;
   if (hasTemperature) {
     temperature = Number(body.llmTemperature);
     if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) return null;
   }
+
+  // An adapter-backed profile names one path, not both: a turn that carries an
+  // adapter and an OpenAI-compatible endpoint has no way to say which one answers.
+  if (adapter !== undefined) {
+    if (baseUrl !== "" || model !== "" || apiKey !== "") return null;
+    return { baseUrl: "", apiKey: "", model: "", temperature, adapter };
+  }
+
+  if (baseUrl === "" && model === "" && apiKey === "" && !hasTemperature) return undefined;
+  if (baseUrl === "" || model === "" || apiKey === "") return null;
   return { baseUrl, apiKey, model, temperature };
+}
+
+/** An absolute http(s) URL; the adapter's own registry refuses anything weaker. */
+function isHttpEndpoint(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") && url.host !== "";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The registered adapter a turn names for one kind, read whole or refused whole.
+ *
+ * The bridge carries the fields the console resolved from the profile: the
+ * adapter, its endpoint, the platform-issued token and the tenant it was issued
+ * for. The config is the adapter's opaque config, as JSON — a multipart turn
+ * carries it as a string, a JSON turn may send the object itself.
+ */
+function readProviderAdapter(
+  body: Record<string, unknown>,
+  kind: ProviderKind
+): ProviderAdapterTarget | undefined | null {
+  const adapterId = fieldText(body, `${kind}AdapterId`);
+  const endpoint = fieldText(body, `${kind}AdapterEndpoint`);
+  const token =
+    typeof body[`${kind}AdapterToken`] === "string"
+      ? (body[`${kind}AdapterToken`] as string).trim()
+      : "";
+  const tenantId = fieldText(body, `${kind}AdapterTenantId`);
+  const rawConfig = body[`${kind}Config`];
+  const hasConfig =
+    rawConfig !== undefined && rawConfig !== null && rawConfig !== "";
+  const hasAny =
+    adapterId !== "" || endpoint !== "" || token !== "" || tenantId !== "" || hasConfig;
+  if (!hasAny) return undefined;
+  if (adapterId === "" || endpoint === "" || token === "" || tenantId === "") return null;
+  if (!isHttpEndpoint(endpoint)) return null;
+
+  let config: Record<string, unknown> | null = null;
+  if (hasConfig) {
+    let parsed: unknown = rawConfig;
+    if (typeof rawConfig === "string") {
+      try {
+        parsed = JSON.parse(rawConfig);
+      } catch {
+        return null;
+      }
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+    config = parsed as Record<string, unknown>;
+  }
+  return { adapterId, endpoint, token, tenantId, config };
+}
+
+/** The ordered adapter candidates per kind, as the console selected them. */
+interface ProviderChain {
+  llm: ProviderAdapterTarget[];
+  stt: ProviderAdapterTarget[];
+  tts: ProviderAdapterTarget[];
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Read one chain candidate whole or refuse it.
+ *
+ * A candidate with no adapter, endpoint, token or tenant is half a call; the
+ * token is not logged anywhere on this path.
+ */
+function readChainCandidate(value: unknown): ProviderAdapterTarget | null {
+  if (!isPlainObject(value)) return null;
+  const adapterId = fieldText(value, "adapterId");
+  const endpoint = fieldText(value, "endpoint");
+  const token = typeof value.token === "string" ? value.token.trim() : "";
+  const tenantId = fieldText(value, "tenantId");
+  if (adapterId === "" || endpoint === "" || token === "" || tenantId === "") return null;
+  if (!isHttpEndpoint(endpoint)) return null;
+
+  let config: Record<string, unknown> | null = null;
+  if (value.config !== undefined && value.config !== null) {
+    if (!isPlainObject(value.config)) return null;
+    config = value.config;
+  }
+  const voice = typeof value.voice === "string" ? value.voice.trim() : "";
+  return {
+    adapterId,
+    endpoint,
+    token,
+    tenantId,
+    config,
+    ...(voice === "" ? {} : { voice }),
+  };
+}
+
+/**
+ * The ordered adapter chain carried by the turn, or undefined when it carries
+ * none. A multipart turn sends it as JSON; a JSON turn may send the object.
+ */
+function readProviderChain(raw: unknown): ProviderChain | undefined | null {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  let value: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  if (!isPlainObject(value)) return null;
+
+  const kind = (name: "llm" | "stt" | "tts"): ProviderAdapterTarget[] | null => {
+    const list = value[name];
+    if (list === undefined || list === null) return [];
+    if (!Array.isArray(list) || list.length > 10) return null;
+    const candidates: ProviderAdapterTarget[] = [];
+    for (const entry of list) {
+      const candidate = readChainCandidate(entry);
+      if (candidate === null) return null;
+      candidates.push(candidate);
+    }
+    return candidates;
+  };
+
+  const llm = kind("llm");
+  const stt = kind("stt");
+  const tts = kind("tts");
+  if (llm === null || stt === null || tts === null) return null;
+  return { llm, stt, tts };
 }
 
 /** A provider a turn names, resolved from a profile id, its fields, or the default. */
@@ -238,6 +383,8 @@ interface TurnProvider {
   model: string;
   voice?: string;
   apiKey?: string;
+  /** Set for an adapter-backed profile; the adapter's contract answers the turn. */
+  adapter?: ProviderAdapterTarget;
 }
 
 function fieldText(body: Record<string, unknown>, name: string): string {
@@ -270,6 +417,27 @@ function readTurnProvider(
         model: profile.model,
         ...(profile.voice === undefined ? {} : { voice: profile.voice }),
         ...(profile.apiKey === undefined ? {} : { apiKey: profile.apiKey }),
+      },
+    };
+  }
+
+  const adapter = readProviderAdapter(body, kind);
+  if (adapter === null) return { error: `${kind} adapter fields are incomplete` };
+  if (adapter !== undefined) {
+    const baseUrl = fieldText(body, `${kind}BaseUrl`);
+    if (baseUrl !== "") {
+      return { error: `${kind} names either an adapter or a base URL, not both` };
+    }
+    const voice = fieldText(body, `${kind}Voice`);
+    if (kind === "tts" && voice === "") {
+      return { error: "ttsVoice is required with a tts adapter" };
+    }
+    return {
+      provider: {
+        baseUrl: "",
+        model: fieldText(body, `${kind}Model`),
+        ...(voice === "" ? {} : { voice }),
+        adapter,
       },
     };
   }
@@ -440,6 +608,18 @@ async function handleStream(
     // own service. A bad id refuses the turn here rather than being replaced by
     // the default.
     const body = req.body as Record<string, unknown>;
+    const chain = readProviderChain(body.providerChain);
+    if (chain === null) {
+      sendSseEvent(res, "error", { message: "the provider chain is malformed" });
+      res.end();
+      return;
+    }
+    // What each adapter call observed travels with the turn: the bridge forwards
+    // it and the console records it against the tenant. It names identifiers and
+    // sizes, never request text or audio.
+    const emitAdapterCall = (call: AdapterCallEvent) => {
+      if (!res.writableEnded) sendSseEvent(res, "adapter", call);
+    };
     const sttProvider = readTurnProvider(body, "stt");
     const ttsProvider = readTurnProvider(body, "tts");
     const llmProvider = readTurnProvider(body, "llm");
@@ -461,7 +641,18 @@ async function handleStream(
       llmBody.llmModel = llmProvider.provider.model;
       llmBody.llmApiKey = llmProvider.provider.apiKey ?? "";
     }
-    const llm = readLlmTarget(llmBody);
+    // A chain the console selected answers this turn; otherwise the inline
+    // fields (or the deployment's own model) do, exactly as before.
+    const llm =
+      chain !== undefined && chain.llm.length > 0
+        ? {
+            baseUrl: "",
+            apiKey: "",
+            model: "",
+            temperature: null,
+            adapters: chain.llm,
+          }
+        : readLlmTarget(llmBody);
     if (llm === null) {
       res.status(400).json({ error: "the llm fields must name a base URL, a model and a key together" });
       return;
@@ -659,20 +850,44 @@ async function handleStream(
       // it answers short Vietnamese in Chinese, and the persona then corrects
       // the person for words they never said. See resolveSttLanguage.
       const stt = sttProvider.provider;
-      if (stt === undefined && config.audio.sttUrl === "") {
+      const sttChain = chain?.stt ?? [];
+      if (stt === undefined && sttChain.length === 0 && config.audio.sttUrl === "") {
         sendSseEvent(res, "error", {
           message: "no transcription provider is configured for this turn",
         });
         res.end();
         return;
       }
+      const sttStartedAt = Date.now();
       const sttResult = await deps.transcribeAudio(
         audioFile.path,
         stt?.model,
         resolveSttLanguage(language),
-        stt === undefined ? undefined : { baseUrl: stt.baseUrl, apiKey: stt.apiKey },
+        sttChain.length > 0
+          ? { baseUrl: "", apiKey: "", adapters: sttChain, onAdapterCall: emitAdapterCall }
+          : stt === undefined
+            ? undefined
+            : {
+                baseUrl: stt.baseUrl,
+                apiKey: stt.apiKey,
+                ...(stt.adapter === undefined ? {} : { adapter: stt.adapter }),
+                onAdapterCall: emitAdapterCall,
+              },
         abortController.signal
       );
+      // Platform speech is metered too, but it is not an adapter call: no
+      // adapter id travels, and the usage record attributes the seconds to the
+      // tenant's own speech path.
+      if (sttChain.length === 0) {
+        const audioSeconds = await wavSecondsFromFile(audioFile.path);
+        emitAdapterCall({
+          kind: "stt",
+          adapterId: null,
+          status: "ok",
+          latencyMs: Date.now() - sttStartedAt,
+          ...(audioSeconds === undefined ? {} : { audioSeconds }),
+        });
+      }
       userText = sttResult.text;
     } else if (textInput) {
       userText = textInput;
@@ -823,13 +1038,26 @@ async function handleStream(
     // the deployment's engine path exactly as it was, including the voice the
     // engine and language resolve to.
     const tts = ttsProvider.provider;
+    const ttsChain = chain?.tts ?? [];
     let ttsOptions: SynthesizeOptions;
-    if (tts !== undefined) {
+    if (ttsChain.length > 0) {
+      ttsOptions = {
+        voice: ttsChain[0]!.voice ?? tts?.voice ?? config.audio.defaultVoice,
+        adapters: ttsChain,
+        language: resolveSttLanguage(language),
+        onAdapterCall: emitAdapterCall,
+        signal: abortController.signal,
+      };
+    } else if (tts !== undefined) {
       ttsOptions = {
         baseUrl: tts.baseUrl,
         model: tts.model,
         voice: tts.voice ?? config.audio.defaultVoice,
         ...(tts.apiKey === undefined ? {} : { apiKey: tts.apiKey }),
+        ...(tts.adapter === undefined
+          ? {}
+          : { adapter: tts.adapter, language: resolveSttLanguage(language) }),
+        onAdapterCall: emitAdapterCall,
         signal: abortController.signal,
       };
     } else if (engine !== undefined) {
@@ -880,6 +1108,17 @@ async function handleStream(
       // both are preserved exactly as they were (D5).
       onChunk: ({ index, text, buffer }) => {
         if (abortController.signal.aborted) return;
+        if (ttsChain.length === 0 && buffer !== null) {
+          const audioSeconds = wavSeconds(buffer);
+          emitAdapterCall({
+            kind: "tts",
+            adapterId: null,
+            status: "ok",
+            latencyMs: 0,
+            bytes: buffer.length,
+            ...(audioSeconds === undefined ? {} : { audioSeconds }),
+          });
+        }
         sendSseEvent(res, "sentence", {
           index,
           text,
@@ -1107,6 +1346,7 @@ async function handleStream(
             // none, so a browser turn — and every turn before this existed — asks as it did.
             ...(mayCall ? { tools } : {}),
             ...(llm ? { llm } : {}),
+            onAdapterCall: emitAdapterCall,
           });
 
         const reader = llmStream.getReader();
@@ -1164,6 +1404,7 @@ async function handleStream(
               repeat_penalty: 1.2,
               tools,
               ...(llm ? { llm } : {}),
+              onAdapterCall: emitAdapterCall,
             });
             finalText = fallback.text;
             fallback.toolCalls.forEach((call, index) => {
@@ -1175,6 +1416,7 @@ async function handleStream(
               temperature: 0.7,
               repeat_penalty: 1.2,
               ...(llm ? { llm } : {}),
+              onAdapterCall: emitAdapterCall,
             });
           }
         }

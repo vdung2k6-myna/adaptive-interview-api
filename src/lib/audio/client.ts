@@ -9,7 +9,24 @@
  */
 
 import { openAsBlob } from "node:fs";
+import { open } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import config from "@/lib/config";
+import { ModelProviderError } from "@/lib/errors";
+import type { AdapterCallListener, AdapterCallStatus } from "@/lib/adapter-usage";
+
+/** The usage status a failure is reported as. */
+function adapterStatus(error: unknown): AdapterCallStatus {
+  if (error instanceof ModelProviderError) {
+    if (error.statusCode === 429) return "rate_limit";
+    if (error.statusCode === 504) return "timeout";
+    if (error.statusCode >= 500) return "upstream";
+    if (error.statusCode === 401 || error.statusCode === 403) return "refused";
+    return "error";
+  }
+  if (error instanceof Error && error.name === "AbortError") return "timeout";
+  return "error";
+}
 import { createSemaphore } from "@/lib/semaphore";
 
 export interface TranscriptionResult {
@@ -55,6 +72,14 @@ export interface SynthesizeOptions {
   baseUrl?: string;
   /** The profile's key, when it has one. Never logged. */
   apiKey?: string;
+  /** A registered adapter, when the profile names one instead of an endpoint. */
+  adapter?: ProviderAdapterTarget;
+  /** Ordered adapter candidates; the first that answers speaks the turn. */
+  adapters?: ProviderAdapterTarget[];
+  /** What each adapter call observed, for the turn's usage record. */
+  onAdapterCall?: AdapterCallListener;
+  /** The language this text is in, for an adapter that wants it. */
+  language?: string;
   /**
    * The model the provider synthesizes with. The OpenAI contract names the
    * engine here, so the deployment gateway receives its engine as `model`.
@@ -79,9 +104,29 @@ export interface SynthesizeOptions {
  * Absent fields mean the deployment's own service: the audio.cpp URL and no
  * key. A profile supplies its own endpoint, and a key only when it has one.
  */
+export interface ProviderAdapterTarget {
+  adapterId: string;
+  endpoint: string;
+  token: string;
+  tenantId: string;
+  config: Record<string, unknown> | null;
+  /** The voice a TTS candidate speaks in, when the profile names one. */
+  voice?: string;
+}
+
 export interface ProviderTarget {
   baseUrl?: string;
   apiKey?: string;
+  /**
+   * A registered adapter. When present the adapter's own contract is called
+   * instead of the OpenAI-compatible one, and `baseUrl`/`apiKey` are unused: the
+   * adapter holds the provider key.
+   */
+  adapter?: ProviderAdapterTarget;
+  /** Ordered adapter candidates; the first that answers serves the turn. */
+  adapters?: ProviderAdapterTarget[];
+  /** What each adapter call observed, for the turn's usage record. */
+  onAdapterCall?: AdapterCallListener;
 }
 
 /**
@@ -114,6 +159,42 @@ function isWav(buffer: Buffer): boolean {
     buffer.toString("ascii", 0, 4) === "RIFF" &&
     buffer.toString("ascii", 8, 12) === "WAVE"
   );
+}
+
+/** The duration a WAV header states, for the platform's own metering. */
+export function wavSeconds(buffer: Buffer): number | undefined {
+  if (!isWav(buffer) || buffer.length < 44) return undefined;
+  let byteRate = 0;
+  let dataBytes: number | undefined;
+  let offset = 12;
+  while (offset + 8 <= buffer.length) {
+    const id = buffer.toString("ascii", offset, offset + 4);
+    const size = buffer.readUInt32LE(offset + 4);
+    if (id === "fmt " && size >= 16 && offset + 24 <= buffer.length) {
+      byteRate = buffer.readUInt32LE(offset + 16);
+    } else if (id === "data") {
+      dataBytes = Math.min(size, buffer.length - (offset + 8));
+      break;
+    }
+    offset += 8 + size + (size % 2);
+  }
+  return byteRate > 0 && dataBytes !== undefined ? dataBytes / byteRate : undefined;
+}
+
+/** The duration of an uploaded WAV, read from its header alone. */
+export async function wavSecondsFromFile(path: string): Promise<number | undefined> {
+  try {
+    const handle = await open(path, "r");
+    try {
+      const head = Buffer.alloc(64);
+      const { bytesRead } = await handle.read(head, 0, head.length, 0);
+      return wavSeconds(head.subarray(0, bytesRead));
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -172,6 +253,44 @@ export class AudioCppClient {
     target?: ProviderTarget,
     signal?: AbortSignal
   ): Promise<TranscriptionResult> {
+    const candidates =
+      target?.adapters ?? (target?.adapter === undefined ? [] : [target.adapter]);
+    if (candidates.length > 0) {
+      const audioSeconds = await wavSecondsFromFile(audioPath);
+      let last: unknown;
+      for (let index = 0; index < candidates.length; index += 1) {
+        const candidate = candidates[index]!;
+        const startedAt = Date.now();
+        try {
+          const result = await this.transcribeWithAdapter(
+            audioPath,
+            model,
+            language,
+            candidate,
+            signal
+          );
+          target?.onAdapterCall?.({
+            kind: "stt",
+            adapterId: candidate.adapterId,
+            status: "ok",
+            latencyMs: Date.now() - startedAt,
+            ...(audioSeconds === undefined ? {} : { audioSeconds }),
+          });
+          return result;
+        } catch (error) {
+          target?.onAdapterCall?.({
+            kind: "stt",
+            adapterId: candidate.adapterId,
+            status: adapterStatus(error),
+            latencyMs: Date.now() - startedAt,
+          });
+          last = error;
+          if (index + 1 >= candidates.length) throw error;
+        }
+      }
+      throw last;
+    }
+
     const baseUrl = (target?.baseUrl ?? this.baseUrl).replace(/\/$/, "");
     if (baseUrl === "") {
       // Named rather than attempted: a relative URL would fail as a parse error
@@ -227,6 +346,82 @@ export class AudioCppClient {
         text: (data.text ?? "").trim(),
         confidence: data.confidence,
       };
+    } catch (err) {
+      clearTimeout(timeout);
+      throw err;
+    }
+  }
+
+  /**
+   * Transcribe through a registered adapter's own contract.
+   *
+   * The adapter gets `audio`, `language`, `model` and its opaque `config`, and
+   * answers the contract's transcription object. A `422` is the adapter saying
+   * the recording is unsupported; it is reported as such rather than retried,
+   * because the same bytes would be refused again.
+   */
+  private async transcribeWithAdapter(
+    audioPath: string,
+    model: string | undefined,
+    language: string | undefined,
+    adapter: ProviderAdapterTarget,
+    signal: AbortSignal | undefined
+  ): Promise<TranscriptionResult> {
+    const endpoint = `${adapter.endpoint.replace(/\/+$/, "")}/stt/transcribe`;
+    const formData = new FormData();
+    const file = await openAsBlob(audioPath, { type: "audio/wav" });
+    formData.append("audio", file, "audio.wav");
+    if (language) formData.append("language", language);
+    if (model) formData.append("model", model);
+    if (adapter.config !== null) formData.append("config", JSON.stringify(adapter.config));
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    const requestSignal =
+      signal === undefined ? controller.signal : AbortSignal.any([controller.signal, signal]);
+
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        redirect: "error",
+        headers: {
+          accept: "application/json",
+          authorization: `Bearer ${adapter.token}`,
+          "x-adapter-id": adapter.adapterId,
+          "x-tenant-id": adapter.tenantId,
+          "x-contract-version": "1",
+          "x-request-id": randomUUID(),
+        },
+        body: formData,
+        signal: requestSignal,
+      });
+      clearTimeout(timeout);
+
+      if (res.status === 422) {
+        throw new ModelProviderError("the STT adapter refused the recording as unsupported", 422);
+      }
+      if (!res.ok) {
+        const text = await res.text().catch(() => "Unknown error");
+        throw new ModelProviderError(`STT adapter failed (${res.status}): ${text}`, res.status);
+      }
+
+      let data: { text?: unknown; confidence?: unknown };
+      try {
+        data = (await res.json()) as { text?: unknown; confidence?: unknown };
+      } catch {
+        throw new ModelProviderError("the STT adapter returned invalid JSON", 502);
+      }
+      if (typeof data.text !== "string") {
+        throw new ModelProviderError("the STT adapter returned no text", 502);
+      }
+      const confidence =
+        typeof data.confidence === "number" &&
+        Number.isFinite(data.confidence) &&
+        data.confidence >= 0 &&
+        data.confidence <= 1
+          ? data.confidence
+          : undefined;
+      return { text: data.text.trim(), confidence };
     } catch (err) {
       clearTimeout(timeout);
       throw err;
@@ -330,6 +525,46 @@ export class AudioGatewayClient {
    * @returns Audio buffer (WAV format).
    */
   async synthesize(text: string, options?: SynthesizeOptions): Promise<Buffer> {
+    const candidates =
+      options?.adapters ?? (options?.adapter === undefined ? [] : [options.adapter]);
+    if (candidates.length > 0) {
+      let last: unknown;
+      for (let index = 0; index < candidates.length; index += 1) {
+        const candidate = candidates[index]!;
+        const startedAt = Date.now();
+        try {
+          const audio = await this.synthesizeWithAdapter(
+            text,
+            {
+              ...(options ?? { voice: config.audio.defaultVoice }),
+              voice: candidate.voice ?? options?.voice ?? config.audio.defaultVoice,
+            },
+            candidate
+          );
+          const audioSeconds = wavSeconds(audio);
+          options?.onAdapterCall?.({
+            kind: "tts",
+            adapterId: candidate.adapterId,
+            status: "ok",
+            latencyMs: Date.now() - startedAt,
+            bytes: audio.length,
+            ...(audioSeconds === undefined ? {} : { audioSeconds }),
+          });
+          return audio;
+        } catch (error) {
+          options?.onAdapterCall?.({
+            kind: "tts",
+            adapterId: candidate.adapterId,
+            status: adapterStatus(error),
+            latencyMs: Date.now() - startedAt,
+          });
+          last = error;
+          if (index + 1 >= candidates.length) throw error;
+        }
+      }
+      throw last;
+    }
+
     const engine = options?.engine ?? config.audio.defaultEngine;
     const baseUrl = (options?.baseUrl ?? this.baseUrl).replace(/\/$/, "");
     if (baseUrl === "") {
@@ -405,6 +640,77 @@ export class AudioGatewayClient {
         // applying a volume of its own would be a second, uninformed opinion.
         console.log(`[AudioGateway] synthesize returned ${answered.length} bytes content-type=${contentType}`);
         return answered;
+      } catch (err) {
+        clearTimeout(timeout);
+        throw err;
+      }
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Synthesize through a registered adapter's own contract.
+   *
+   * v1 returns one complete WAV per request. The adapter's own audio is
+   * delivered as it is: voice conversion belongs to the deployment's platform
+   * voice, and a reseller's adapter returns the voice it was asked for.
+   */
+  private async synthesizeWithAdapter(
+    text: string,
+    options: SynthesizeOptions,
+    adapter: ProviderAdapterTarget
+  ): Promise<Buffer> {
+    const release = await synthesisSlots.acquire(options.signal);
+    try {
+      const timeoutController = new AbortController();
+      const timeout = setTimeout(() => timeoutController.abort(), this.timeoutMs);
+      const signals = [timeoutController.signal];
+      if (options.signal) signals.push(options.signal);
+      const signal = AbortSignal.any(signals);
+
+      try {
+        const res = await fetch(`${adapter.endpoint.replace(/\/+$/, "")}/tts/synthesize`, {
+          method: "POST",
+          redirect: "error",
+          headers: {
+            accept: "audio/wav, audio/*",
+            "content-type": "application/json",
+            authorization: `Bearer ${adapter.token}`,
+            "x-adapter-id": adapter.adapterId,
+            "x-tenant-id": adapter.tenantId,
+            "x-contract-version": "1",
+            "x-request-id": randomUUID(),
+          },
+          body: JSON.stringify({
+            text,
+            voice: options.voice,
+            ...(options.language === undefined || options.language === ""
+              ? {}
+              : { language: options.language }),
+            format: "wav",
+            ...(adapter.config === null ? {} : { config: adapter.config }),
+          }),
+          signal,
+        });
+        clearTimeout(timeout);
+
+        if (res.status === 422) {
+          throw new ModelProviderError("the TTS adapter refused the text as unsupported", 422);
+        }
+        if (!res.ok) {
+          const detail = await res.text().catch(() => "Unknown error");
+          throw new ModelProviderError(`TTS adapter failed (${res.status}): ${detail}`, res.status);
+        }
+
+        const buffer = Buffer.from(await res.arrayBuffer());
+        // The bridge can only play WAV, so a different container is refused here
+        // rather than delivered as audio nobody can hear.
+        if (!isWav(buffer)) {
+          const contentType = res.headers.get("content-type") || "unknown";
+          throw new ModelProviderError(`TTS adapter answered ${contentType}, not WAV`, 502);
+        }
+        return buffer;
       } catch (err) {
         clearTimeout(timeout);
         throw err;

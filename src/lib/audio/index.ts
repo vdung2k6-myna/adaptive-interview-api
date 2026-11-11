@@ -12,7 +12,10 @@ export {
   AudioCppClient,
   AudioGatewayClient,
   type TranscriptionResult,
+  type ProviderAdapterTarget,
   type SynthesizeOptions,
+  wavSeconds,
+  wavSecondsFromFile,
   type VoiceShaping,
 } from "./client";
 export {

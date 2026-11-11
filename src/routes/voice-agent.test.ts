@@ -1,6 +1,8 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import type { Server } from "node:http";
+import { createServer, type IncomingMessage, type Server } from "node:http";
+import { once } from "node:events";
+import type { AddressInfo } from "node:net";
 import express from "express";
 import { createVoiceAgentRouter, type VoiceAgentDeps } from "./voice-agent";
 import type { OllamaMessage, OllamaTool, OllamaToolCall } from "../lib/ollama";
@@ -9,6 +11,7 @@ import type { KnowledgeChunk, KnowledgeSearchOutcome, SearchOptions } from "../l
 import { SentenceExtractor } from "../lib/audio/sentence-extractor";
 import type { SynthesizeOptions } from "../lib/audio";
 import { AUDIO_ROOT } from "../lib/audio/storage";
+import { synthesizeSpeechWithFallback } from "@/lib/audio";
 import config from "@/lib/config";
 import { turnTranscripts } from "../lib/turn-transcript";
 import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
@@ -968,7 +971,9 @@ describe("POST /api/voice-agent/stream — request validation", () => {
 
     await withServer(h.deps, async (api) => {
       const sse = await sendAudioTurn(api.stream, h, { history: LATER_TURN });
-      const events = parseSse(sse);
+      // The usage event for the platform's transcription is not a turn event;
+      // this asserts what the person is told.
+      const events = parseSse(sse).filter((event) => event.event !== "adapter");
 
       assert.deepEqual(
         events.map((event) => event.event),
@@ -1751,7 +1756,9 @@ describe("POST /api/voice-agent/stream — the material turn", () => {
       assert.ok(names.has("sentence"), `a material reply is spoken as sentences, got ${[...names]}`);
       assert.ok(names.has("done"), `a material turn closes like any other, got ${[...names]}`);
       assert.deepEqual(
-        [...names].filter((name) => !["user", "text", "sentence", "done"].includes(name)),
+        [...names].filter(
+          (name) => !["user", "text", "sentence", "done", "adapter"].includes(name)
+        ),
         [],
         "the transcript builds a material reply from the same events a generated one uses"
       );
@@ -2543,11 +2550,16 @@ describe("POST /api/voice-agent/stream — provider profiles", () => {
         sttApiKey: "sk-stt",
       });
 
-      assert.deepEqual(h.transcribeCalls[0], {
-        language: "en",
-        model: "whisper-1",
-        target: { baseUrl: "https://stt.example/v1", apiKey: "sk-stt" },
-      });
+      const transcription = h.transcribeCalls[0]!;
+      assert.equal(transcription.language, "en");
+      assert.equal(transcription.model, "whisper-1");
+      assert.equal(transcription.target?.baseUrl, "https://stt.example/v1");
+      assert.equal(transcription.target?.apiKey, "sk-stt");
+      assert.equal(
+        typeof (transcription.target as { onAdapterCall?: unknown }).onAdapterCall,
+        "function",
+        "the target reports what the call observed"
+      );
       assert.equal(h.synthOptions[0]?.baseUrl, "https://tts.example/v1");
       assert.equal(h.synthOptions[0]?.model, "tts-1");
       assert.equal(h.synthOptions[0]?.voice, "alloy");
@@ -2759,5 +2771,463 @@ describe("POST /api/voice-agent/stream — conversion shaping", () => {
     assert.match(sse, /event: error/);
     assert.match(sse, /not one the conversion service advertises/);
     assert.equal(h.synthOptions.length, 0);
+  });
+});
+
+describe("a turn through an adapter-backed LLM profile", () => {
+  let adapter: Server;
+  let adapterUrl: string;
+  const calls: Array<{
+    url: string;
+    headers: IncomingMessage["headers"];
+    body: Record<string, unknown>;
+  }> = [];
+
+  before(async () => {
+    adapter = createServer((req: IncomingMessage, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        calls.push({
+          url: req.url ?? "",
+          headers: req.headers,
+          body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>,
+        });
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(
+          [
+            'event: text\ndata: {"type":"text","text":"Xin chào"}',
+            'event: usage\ndata: {"type":"usage","inputTokens":5,"outputTokens":3}',
+            'event: done\ndata: {"type":"done","reason":"stop"}',
+            "",
+          ].join("\n\n")
+        );
+      });
+    });
+    adapter.listen(0, "127.0.0.1");
+    await once(adapter, "listening");
+    adapterUrl = `http://127.0.0.1:${(adapter.address() as AddressInfo).port}/v1`;
+  });
+
+  after(async () => {
+    adapter.closeAllConnections();
+    await new Promise<void>((resolve) => adapter.close(() => resolve()));
+  });
+
+  it("sends the turn to the stub adapter and speaks its text", async () => {
+    calls.length = 0;
+    const logs: string[] = [];
+
+    await withServer(
+      {
+        // Only the collaborators the turn needs are replaced; generation is the
+        // real path, which is what makes this a test of the adapter resolution.
+        searchKnowledge: async () => ({ ok: true, chunks: [] }),
+        transcribeAudio: async () => ({ text: "", confidence: 0 }),
+        synthesizeSpeechWithFallback: async () => Buffer.alloc(0),
+      },
+      async (api) => {
+        const sse = await sendTurn(api.stream, { logs } as unknown as Harness, {
+          text: "hello",
+          speak: "0",
+          llmAdapterId: "adapter-1",
+          llmAdapterEndpoint: adapterUrl,
+          llmAdapterToken: "adp_test",
+          llmAdapterTenantId: "tenant-1",
+          llmConfig: JSON.stringify({ model: "gemini-3-flash" }),
+          llmTemperature: 0.3,
+        });
+
+        assert.match(sse, /Xin chào/, "the adapter's text reaches the turn");
+        assert.match(sse, /event: done/, "the turn ends after the adapter's done");
+      }
+    );
+
+    assert.equal(calls.length, 1, "the adapter answered the turn");
+    const call = calls[0]!;
+    assert.equal(call.url, "/v1/llm/chat");
+    assert.equal(call.headers.authorization, "Bearer adp_test");
+    assert.equal(call.headers["x-adapter-id"], "adapter-1");
+    assert.equal(call.headers["x-tenant-id"], "tenant-1");
+    assert.equal(call.headers["x-contract-version"], "1");
+    assert.equal(typeof call.headers["x-request-id"], "string");
+    assert.equal(call.body.stream, true);
+    assert.equal(call.body.temperature, 0.3);
+    assert.deepEqual(call.body.config, { model: "gemini-3-flash" });
+    const messages = call.body.messages as Array<{ role: string; content: string }>;
+    assert.equal(messages.at(-1)?.role, "user");
+    assert.equal(messages.at(-1)?.content, "hello");
+  });
+});
+
+describe("a turn through an adapter-backed STT profile", () => {
+  let adapter: Server;
+  let adapterUrl: string;
+  const calls: Array<{
+    url: string;
+    headers: IncomingMessage["headers"];
+    form: FormData;
+  }> = [];
+
+  before(async () => {
+    adapter = createServer((req: IncomingMessage, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", async () => {
+        const form = await new Request("http://stub.test", {
+          method: "POST",
+          headers: { "content-type": req.headers["content-type"] ?? "" },
+          body: Buffer.concat(chunks),
+        }).formData();
+        calls.push({ url: req.url ?? "", headers: req.headers, form });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            text: "transcribed through adapter",
+            language: "en",
+            confidence: 0.9,
+          })
+        );
+      });
+    });
+    adapter.listen(0, "127.0.0.1");
+    await once(adapter, "listening");
+    adapterUrl = `http://127.0.0.1:${(adapter.address() as AddressInfo).port}/v1`;
+  });
+
+  after(async () => {
+    adapter.closeAllConnections();
+    await new Promise<void>((resolve) => adapter.close(() => resolve()));
+  });
+
+  it("transcribes the turn through the stub adapter", async () => {
+    calls.length = 0;
+    const logs: string[] = [];
+
+    await withServer(
+      {
+        searchKnowledge: async () => ({ ok: true, chunks: [] }),
+        synthesizeSpeechWithFallback: async () => Buffer.alloc(0),
+      },
+      async (api) => {
+        const sse = await sendAudioTurn(api.stream, { logs } as unknown as Harness, {
+          sttAdapterId: "stt-1",
+          sttAdapterEndpoint: adapterUrl,
+          sttAdapterToken: "adp_stt",
+          sttAdapterTenantId: "tenant-1",
+          sttConfig: JSON.stringify({ model: "whisper-v3" }),
+        });
+
+        assert.match(sse, /transcribed through adapter/, "the adapter's transcript is the turn's input");
+      }
+    );
+
+    assert.equal(calls.length, 1, "the adapter answered the transcription");
+    const call = calls[0]!;
+    assert.equal(call.url, "/v1/stt/transcribe");
+    assert.equal(call.headers.authorization, "Bearer adp_stt");
+    assert.equal(call.headers["x-adapter-id"], "stt-1");
+    assert.equal(call.headers["x-tenant-id"], "tenant-1");
+    assert.equal(call.headers["x-contract-version"], "1");
+    assert.equal(call.form.get("language"), "en");
+    assert.equal(call.form.get("config"), JSON.stringify({ model: "whisper-v3" }));
+    const audio = call.form.get("audio");
+    assert.ok(audio instanceof File);
+    assert.equal(audio.name, "audio.wav");
+  });
+});
+
+describe("a turn through an adapter-backed TTS profile", () => {
+  let adapter: Server;
+  let adapterUrl: string;
+  const calls: Array<{
+    url: string;
+    headers: IncomingMessage["headers"];
+    body: Record<string, unknown>;
+  }> = [];
+
+  function stubWav(): Buffer {
+    const buffer = Buffer.alloc(44 + 320);
+    buffer.write("RIFF", 0, "ascii");
+    buffer.writeUInt32LE(36 + 320, 4);
+    buffer.write("WAVE", 8, "ascii");
+    buffer.write("fmt ", 12, "ascii");
+    buffer.writeUInt32LE(16, 16);
+    buffer.writeUInt16LE(1, 20);
+    buffer.writeUInt16LE(1, 22);
+    buffer.writeUInt32LE(24_000, 24);
+    buffer.writeUInt32LE(48_000, 28);
+    buffer.writeUInt16LE(2, 32);
+    buffer.writeUInt16LE(16, 34);
+    buffer.write("data", 36, "ascii");
+    buffer.writeUInt32LE(320, 40);
+    return buffer;
+  }
+
+  before(async () => {
+    adapter = createServer((req: IncomingMessage, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        calls.push({
+          url: req.url ?? "",
+          headers: req.headers,
+          body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>,
+        });
+        res.writeHead(200, { "content-type": "audio/wav", "x-audio-format": "wav" });
+        res.end(stubWav());
+      });
+    });
+    adapter.listen(0, "127.0.0.1");
+    await once(adapter, "listening");
+    adapterUrl = `http://127.0.0.1:${(adapter.address() as AddressInfo).port}/v1`;
+  });
+
+  after(async () => {
+    adapter.closeAllConnections();
+    await new Promise<void>((resolve) => adapter.close(() => resolve()));
+  });
+
+  it("speaks the reply through the stub adapter", async () => {
+    calls.length = 0;
+    const logs: string[] = [];
+
+    await withServer(
+      {
+        searchKnowledge: async () => ({ ok: true, chunks: [] }),
+        transcribeAudio: async () => ({ text: "", confidence: 0 }),
+        generateChatResponseStream: () => ({
+          stream: new ReadableStream<string>({
+            start(controller) {
+              controller.enqueue("Xin chào.");
+              controller.close();
+            },
+          }),
+          getFullText: () => "Xin chào.",
+          getToolCalls: () => [],
+        }),
+        generateChatResponse: async () => "",
+        generateChatResponseFull: async () => ({ text: "", toolCalls: [] }),
+        // The real synthesis path, so the adapter is what answers.
+        synthesizeSpeechWithFallback,
+      },
+      async (api) => {
+        const sse = await sendTurn(api.stream, { logs } as unknown as Harness, {
+          text: "hi",
+          language: "vietnamese",
+          ttsAdapterId: "tts-1",
+          ttsAdapterEndpoint: adapterUrl,
+          ttsAdapterToken: "adp_tts",
+          ttsAdapterTenantId: "tenant-1",
+          ttsConfig: JSON.stringify({ model: "tts-vi" }),
+          ttsVoice: "vi-female-1",
+        });
+
+        assert.match(sse, /event: sentence/, "the turn speaks a sentence");
+        assert.match(sse, /"audioData":"[^"]+"/, "the sentence carries audio");
+      }
+    );
+
+    assert.equal(calls.length, 1, "the adapter synthesized the reply");
+    const call = calls[0]!;
+    assert.equal(call.url, "/v1/tts/synthesize");
+    assert.equal(call.headers.authorization, "Bearer adp_tts");
+    assert.equal(call.headers["x-adapter-id"], "tts-1");
+    assert.equal(call.headers["x-tenant-id"], "tenant-1");
+    assert.equal(call.body.text, "Xin chào.");
+    assert.equal(call.body.voice, "vi-female-1");
+    assert.equal(call.body.language, "vi");
+    assert.equal(call.body.format, "wav");
+    assert.deepEqual(call.body.config, { model: "tts-vi" });
+  });
+});
+
+describe("a turn falls back along the adapter chain", () => {
+  type Answer = { status: number; body: Buffer | string; contentType: string };
+  let adapter: Server;
+  let adapterUrl: string;
+  let answers: Record<string, Answer[]>;
+  const paths: string[] = [];
+
+  function stubWav(): Buffer {
+    const buffer = Buffer.alloc(44 + 320);
+    buffer.write("RIFF", 0, "ascii");
+    buffer.writeUInt32LE(36 + 320, 4);
+    buffer.write("WAVE", 8, "ascii");
+    buffer.write("fmt ", 12, "ascii");
+    buffer.writeUInt32LE(16, 16);
+    buffer.writeUInt16LE(1, 20);
+    buffer.writeUInt16LE(1, 22);
+    buffer.writeUInt32LE(24_000, 24);
+    buffer.writeUInt32LE(48_000, 28);
+    buffer.writeUInt16LE(2, 32);
+    buffer.writeUInt16LE(16, 34);
+    buffer.write("data", 36, "ascii");
+    buffer.writeUInt32LE(320, 40);
+    return buffer;
+  }
+
+  before(async () => {
+    adapter = createServer((req: IncomingMessage, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        const path = req.url ?? "";
+        paths.push(path);
+        const key = path.endsWith("/llm/chat")
+          ? "llm"
+          : path.endsWith("/stt/transcribe")
+            ? "stt"
+            : "tts";
+        const answer =
+          answers[key]?.shift() ?? { status: 500, body: "no answer", contentType: "text/plain" };
+        res.writeHead(answer.status, { "content-type": answer.contentType });
+        res.end(answer.body);
+      });
+    });
+    adapter.listen(0, "127.0.0.1");
+    await once(adapter, "listening");
+    adapterUrl = `http://127.0.0.1:${(adapter.address() as AddressInfo).port}/v1`;
+  });
+
+  after(async () => {
+    adapter.closeAllConnections();
+    await new Promise<void>((resolve) => adapter.close(() => resolve()));
+  });
+
+  function candidate(id: string): Record<string, unknown> {
+    return {
+      adapterId: id,
+      endpoint: adapterUrl,
+      token: `adp_${id}`,
+      tenantId: "tenant-1",
+      config: null,
+      capabilities: null,
+      timeoutMs: 30_000,
+    };
+  }
+
+  function reset(): void {
+    answers = {};
+    paths.length = 0;
+  }
+
+  it("moves to the next LLM candidate after an upstream failure", async () => {
+    reset();
+    answers.llm = [
+      // 500 rather than 503: the request layer retries 503 before content, and
+      // this test is about the chain's own fallback, not that retry.
+      { status: 500, body: "down", contentType: "text/plain" },
+      {
+        status: 200,
+        contentType: "text/event-stream",
+        body:
+          'event: text\ndata: {"type":"text","text":"from the second adapter"}\n\n' +
+          'event: usage\ndata: {"type":"usage","inputTokens":1,"outputTokens":2}\n\n' +
+          'event: done\ndata: {"type":"done","reason":"stop"}\n\n',
+      },
+    ];
+    const logs: string[] = [];
+
+    await withServer(
+      {
+        searchKnowledge: async () => ({ ok: true, chunks: [] }),
+        transcribeAudio: async () => ({ text: "", confidence: 0 }),
+        synthesizeSpeechWithFallback: async () => Buffer.alloc(0),
+      },
+      async (api) => {
+        const sse = await sendTurn(api.stream, { logs } as unknown as Harness, {
+          text: "hi",
+          speak: "0",
+          providerChain: JSON.stringify({
+            llm: [candidate("first"), candidate("second")],
+            stt: [],
+            tts: [],
+          }),
+        });
+        assert.match(sse, /from the second adapter/);
+        assert.match(sse, /event: adapter/, "the turn reports what each adapter call observed");
+        assert.match(sse, /"adapterId":"first"/);
+        assert.match(sse, /"adapterId":"second"/);
+      }
+    );
+
+    assert.equal(paths.length, 2, "the first candidate was tried, then the second");
+    assert.ok(!logs.join("\n").includes("adp_"), "no token reaches a log line");
+  });
+
+  it("moves to the next STT candidate after an upstream failure", async () => {
+    reset();
+    answers.stt = [
+      { status: 500, body: "down", contentType: "text/plain" },
+      {
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ text: "heard by the second", confidence: 0.9 }),
+      },
+    ];
+    const logs: string[] = [];
+
+    await withServer(
+      {
+        searchKnowledge: async () => ({ ok: true, chunks: [] }),
+        synthesizeSpeechWithFallback: async () => Buffer.alloc(0),
+      },
+      async (api) => {
+        const sse = await sendAudioTurn(api.stream, { logs } as unknown as Harness, {
+          providerChain: JSON.stringify({
+            llm: [],
+            stt: [candidate("first"), candidate("second")],
+            tts: [],
+          }),
+        });
+        assert.match(sse, /heard by the second/);
+      }
+    );
+
+    assert.equal(paths.length, 2);
+  });
+
+  it("moves to the next TTS candidate after an upstream failure", async () => {
+    reset();
+    answers.tts = [
+      { status: 503, body: "down", contentType: "text/plain" },
+      { status: 200, body: stubWav(), contentType: "audio/wav" },
+    ];
+    const logs: string[] = [];
+
+    await withServer(
+      {
+        searchKnowledge: async () => ({ ok: true, chunks: [] }),
+        transcribeAudio: async () => ({ text: "", confidence: 0 }),
+        generateChatResponseStream: () => ({
+          stream: new ReadableStream<string>({
+            start(controller) {
+              controller.enqueue("Xin chào.");
+              controller.close();
+            },
+          }),
+          getFullText: () => "Xin chào.",
+          getToolCalls: () => [],
+        }),
+        generateChatResponse: async () => "",
+        generateChatResponseFull: async () => ({ text: "", toolCalls: [] }),
+        synthesizeSpeechWithFallback,
+      },
+      async (api) => {
+        const sse = await sendTurn(api.stream, { logs } as unknown as Harness, {
+          text: "hi",
+          language: "vietnamese",
+          providerChain: JSON.stringify({
+            llm: [],
+            stt: [],
+            tts: [{ ...candidate("first"), voice: "vi-female-1" }, { ...candidate("second"), voice: "vi-female-1" }],
+          }),
+        });
+        assert.match(sse, /"audioData":"[^"]+"/);
+      }
+    );
+
+    assert.equal(paths.length, 2);
   });
 });
